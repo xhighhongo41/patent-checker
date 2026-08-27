@@ -53,6 +53,16 @@ class OpsBiblio:
 
 
 @dataclass(frozen=True)
+class OpsSearchBiblioPage:
+    """One page of a biblio-constituent search: full biblio per hit."""
+
+    total_count: int
+    begin: int
+    end: int
+    docs: tuple[OpsBiblio, ...]
+
+
+@dataclass(frozen=True)
 class OpsLegalEvent:
     """One INPADOC legal event."""
 
@@ -144,7 +154,38 @@ def parse_biblio_xml(xml: bytes) -> OpsBiblio:
     exchange_document = root.find(f".//{_ex('exchange-document')}")
     if exchange_document is None:
         raise ValueError("not a biblio response: missing exchange-document")
+    return _parse_exchange_document(exchange_document)
 
+
+def parse_search_biblio_xml(xml: bytes) -> OpsSearchBiblioPage:
+    """Parse a ``published-data/search/biblio`` (biblio constituent) response.
+
+    ``total_count`` / ``begin`` / ``end`` come from ``ops:biblio-search`` and
+    ``ops:range`` as in :func:`parse_search_xml`; each hit is one
+    ``exchange-document`` parsed like :func:`parse_biblio_xml`.
+
+    Raises:
+        ValueError: If the document is not a search response.
+    """
+    root = etree.fromstring(xml)
+    biblio_search = root.find(_ops("biblio-search"))
+    if biblio_search is None:
+        raise ValueError("not a published-data search response: missing ops:biblio-search")
+
+    total_count = int(biblio_search.get("total-result-count", "0"))
+    range_elem = biblio_search.find(_ops("range"))
+    begin = int(range_elem.get("begin", "0")) if range_elem is not None else 0
+    end = int(range_elem.get("end", "0")) if range_elem is not None else 0
+
+    docs = tuple(
+        _parse_exchange_document(elem)
+        for elem in biblio_search.findall(f".//{_ex('exchange-document')}")
+    )
+    return OpsSearchBiblioPage(total_count=total_count, begin=begin, end=end, docs=docs)
+
+
+def _parse_exchange_document(exchange_document: etree._Element) -> OpsBiblio:
+    """Parse one ``exchange-document`` element into an :class:`OpsBiblio`."""
     pub = PubNumber(
         country=exchange_document.get("country", ""),
         number=exchange_document.get("doc-number", ""),

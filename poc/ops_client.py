@@ -151,6 +151,17 @@ class OpsClient:
             ident=ident,
         )
 
+    def search_biblio(self, cql: str, *, begin: int = 1, end: int = 25) -> tuple[bytes, Path]:
+        """Run a CQL search with the biblio constituent (hits include biblio+abstract)."""
+        ident = hashlib.sha1(cql.encode()).hexdigest()[:10] + f"_{begin}-{end}"
+        query = httpx.QueryParams({"q": cql, "Range": f"{begin}-{end}"})
+        return self._get(
+            f"published-data/search/biblio?{query}",
+            service="search",
+            kind="searchbib",
+            ident=ident,
+        )
+
     def biblio(self, pub: str) -> tuple[bytes, Path]:
         """Fetch bibliographic data (docdb reference); returns raw XML and path."""
         ref = parse_pubnum(pub).docdb()
