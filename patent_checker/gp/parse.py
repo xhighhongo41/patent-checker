@@ -12,23 +12,9 @@ from dataclasses import dataclass
 
 from bs4 import BeautifulSoup, Tag
 
+from patent_checker.models import Claim
 
-@dataclass(frozen=True)
-class Claim:
-    """One claim: its number, flattened text, and dependency targets.
-
-    Attributes:
-        number: Claim number (1-based, from the ``num`` attribute).
-        text: Whitespace-normalized full text of the claim (leading
-            "N." numbering kept as printed).
-        depends_on: Claim numbers referenced via ``<claim-ref>`` inside this
-            claim, in order of first appearance, deduplicated. Empty for
-            independent claims.
-    """
-
-    number: int
-    text: str
-    depends_on: tuple[int, ...] = ()
+__all__ = ["Claim", "GPatentDoc", "parse_patent_html"]
 
 
 @dataclass(frozen=True)
