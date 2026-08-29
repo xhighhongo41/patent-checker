@@ -1,4 +1,7 @@
-"""EPO OPS connectivity check (completion requirement R1).
+"""EPO OPS connectivity check.
+
+This is a manual smoke test: it performs real network access and is not part
+of the unit test suite (run explicitly with ``uv run python tools/smoke.py``).
 
 Obtains an OAuth2 access token with the client-credentials flow and runs one
 trivial published-data search, printing the HTTP status, the total result
@@ -13,7 +16,8 @@ import sys
 import xml.etree.ElementTree as ET
 
 import httpx
-from config import ConfigError, ops_credentials
+
+from patent_checker.config import ConfigError, ops_credentials
 
 OPS_BASE = "https://ops.epo.org/3.2"
 TOKEN_URL = f"{OPS_BASE}/auth/accesstoken"

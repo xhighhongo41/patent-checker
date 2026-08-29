@@ -1,93 +1,21 @@
-"""Google Patents fetcher for the v0.1 PoC.
+"""Google Patents HTML parsing (pure functions, fixture-testable).
 
-Downloads ``https://patents.google.com/patent/<PUB>/en`` pages with a local
-file cache and a minimum interval between network requests (Google Patents
-has no API; we keep the access pattern at human scale and never re-fetch a
-cached document). Structured extraction lives in this module too and is
-added on top of the saved HTML.
-
-Command line usage::
-
-    uv run python poc/gp_fetch.py US11468338B2 [PUB ...]
+Structured extraction of claims, bibliographic fields, and reference lists
+from a saved Google Patents ``/patent/`` page. This module never touches the
+network; document retrieval lives in :mod:`patent_checker.gp.fetch`.
 """
 
 from __future__ import annotations
 
 import re
-import sys
-import time
-from dataclasses import dataclass
-from pathlib import Path
+from dataclasses import dataclass, replace
 
-import httpx
 from bs4 import BeautifulSoup, Tag
-from config import data_dir
-from pubnum import parse_pubnum
 
-GP_URL_TEMPLATE = "https://patents.google.com/patent/{pub}/en"
+from patent_checker.claimref import extract_claim_refs_from_text
+from patent_checker.models import Claim
 
-# Courtesy interval between actual network requests (seconds).
-MIN_INTERVAL_SECONDS = 2.0
-
-_last_request_at: float | None = None
-
-
-def _wait_for_interval() -> None:
-    """Sleep until MIN_INTERVAL_SECONDS have passed since the last request."""
-    global _last_request_at
-    now = time.monotonic()
-    if _last_request_at is not None:
-        remaining = MIN_INTERVAL_SECONDS - (now - _last_request_at)
-        if remaining > 0:
-            time.sleep(remaining)
-    _last_request_at = time.monotonic()
-
-
-def cache_path(pub: str) -> Path:
-    """Return the cache file path for a publication number (Google spelling)."""
-    normalized = parse_pubnum(pub).google()
-    return data_dir("gp") / f"{normalized}.html"
-
-
-def fetch_patent_html(pub: str, *, force: bool = False) -> Path:
-    """Fetch the Google Patents page for ``pub`` and return the cached path.
-
-    The document is downloaded at most once: if the cache file exists and
-    ``force`` is false, no network request is made.
-
-    Raises:
-        httpx.HTTPStatusError: If Google Patents answers with an error status.
-        ValueError: If ``pub`` is not a parseable publication number.
-    """
-    path = cache_path(pub)
-    if path.exists() and not force:
-        return path
-
-    _wait_for_interval()
-    url = GP_URL_TEMPLATE.format(pub=parse_pubnum(pub).google())
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        resp = client.get(url)
-        resp.raise_for_status()
-    path.write_text(resp.text, encoding="utf-8")
-    return path
-
-
-@dataclass(frozen=True)
-class Claim:
-    """One claim: its number, flattened text, and dependency targets.
-
-    Attributes:
-        number: Claim number (1-based, from the ``num`` attribute).
-        text: Whitespace-normalized full text of the claim (leading
-            "N." numbering kept as printed).
-        depends_on: Claim numbers referenced via ``<claim-ref>`` inside this
-            claim, in order of first appearance, deduplicated. Empty for
-            independent claims.
-    """
-
-    number: int
-    text: str
-    depends_on: tuple[int, ...] = ()
+__all__ = ["Claim", "GPatentDoc", "parse_patent_html"]
 
 
 @dataclass(frozen=True)
@@ -97,6 +25,10 @@ class GPatentDoc:
     ``status_display`` and ``expiration`` reproduce what the page shows and
     are reference values only; authoritative legal status comes from EPO OPS
     (completion requirement R8).
+
+    ``claims_fallback_text`` holds the whole claims section as flat text and
+    is only non-empty when ``claims`` is empty because the page carries no
+    numbered claim markup; the two fields are therefore never both populated.
     """
 
     pub_number: str
@@ -112,6 +44,7 @@ class GPatentDoc:
     backward_refs: tuple[str, ...]
     forward_refs: tuple[str, ...]
     similar: tuple[str, ...]
+    claims_fallback_text: str = ""
 
 
 # Leaf-level CPC codes, e.g. "G06N3/02" (section-only codes like "G06N" are skipped).
@@ -181,6 +114,34 @@ def _extract_claims(claims_sections: list[Tag]) -> tuple[Claim, ...]:
     return tuple(claims)
 
 
+def _claims_section_fallback_text(claims_sections: list[Tag]) -> str:
+    """Return the whitespace-normalized text of ``claims_sections`` (fallback 1).
+
+    Used when the markup carries no ``num`` attributes, so no claim can be
+    numbered; the raw wording is still worth keeping for the caller.
+    Multiple sections are joined in document order.
+    """
+    texts = [_normalize_whitespace(section.get_text()) for section in claims_sections]
+    return _normalize_whitespace(" ".join(text for text in texts if text))
+
+
+def _recover_dependencies_from_text(claims: tuple[Claim, ...]) -> tuple[Claim, ...]:
+    """Return ``claims`` with text-derived dependencies filled in (fallback 2).
+
+    Only claims left without dependencies by the ``claim-ref`` markup are
+    reconsidered, so structured values always win over wording; claims that
+    stay empty are genuinely independent.
+    """
+    recovered: list[Claim] = []
+    for claim in claims:
+        if claim.depends_on:
+            recovered.append(claim)
+            continue
+        depends_on = extract_claim_refs_from_text(claim.text, claim_number=claim.number)
+        recovered.append(replace(claim, depends_on=depends_on) if depends_on else claim)
+    return tuple(recovered)
+
+
 def _extract_cpc_codes(soup: BeautifulSoup) -> tuple[str, ...]:
     """Return leaf CPC codes in document order, deduplicated."""
     codes: list[str] = []
@@ -216,7 +177,12 @@ def parse_patent_html(html: str) -> GPatentDoc:
       section is absent).
     - Claims: ``div.claim[num]`` inside ``section[itemprop=claims]``; claim
       text is the whitespace-normalized text of the div; dependencies come
-      from ``claim-ref`` elements (``idref="CLM-00001"`` -> 1).
+      from ``claim-ref`` elements (``idref="CLM-00001"`` -> 1). Two markup
+      gaps observed across the saved pages are absorbed: pages without
+      ``num`` attributes (older CN/KR/WO documents) produce ``claims=()``
+      plus ``claims_fallback_text``, and claims left dependency-less by
+      missing ``claim-ref`` markup (CN/EP/GB/older US) get their
+      dependencies re-read from the claim text.
     - CPC codes: ``span[itemprop=Code]`` values that look like leaf codes
       (``^[A-Z]\\d{2}[A-Z]\\d+/\\d+$``), deduplicated, document order.
     - Status/expiration: ``span[itemprop=status]`` and
@@ -230,7 +196,8 @@ def parse_patent_html(html: str) -> GPatentDoc:
 
     Raises:
         ValueError: If the page has no publication number or no claims
-            section (not a patent detail page).
+            section (not a patent detail page). A claims section that yields
+            no numbered claim is not an error; see ``claims_fallback_text``.
         TypeError: If ``html`` is not a string.
     """
     if not isinstance(html, str):
@@ -247,6 +214,10 @@ def parse_patent_html(html: str) -> GPatentDoc:
     if not claims_sections:
         raise ValueError("page has no claims section (not a patent detail page)")
     claims = _extract_claims(claims_sections)
+    # Fallback (1): no numbered claim at all -> keep the section wording.
+    # Fallback (2): numbered claims without claim-ref markup -> read the text.
+    claims_fallback_text = "" if claims else _claims_section_fallback_text(claims_sections)
+    claims = _recover_dependencies_from_text(claims)
 
     title_tag = _first_outside_reference_rows(soup, "span[itemprop=title]")
     title = title_tag.get_text().strip() if title_tag is not None else ""
@@ -293,24 +264,5 @@ def parse_patent_html(html: str) -> GPatentDoc:
         backward_refs=backward_refs,
         forward_refs=forward_refs,
         similar=similar,
+        claims_fallback_text=claims_fallback_text,
     )
-
-
-def main(argv: list[str]) -> int:
-    """Fetch each publication number given on the command line."""
-    if not argv:
-        print("usage: gp_fetch.py PUB [PUB ...]", file=sys.stderr)
-        return 2
-    for pub in argv:
-        try:
-            path = fetch_patent_html(pub)
-        except (ValueError, httpx.HTTPError) as exc:
-            print(f"{pub}: FAILED: {exc}", file=sys.stderr)
-            return 1
-        size = path.stat().st_size
-        print(f"{pub}: {path} ({size} bytes)")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))

@@ -1,19 +1,37 @@
 """Parsers for EPO OPS XML responses (pure functions, fixture-testable).
 
 Response bodies come from :mod:`ops_client`; these functions never touch the
-network. XML namespaces: default (exchange) ``http://www.epo.org/exchange``
-and ``ops`` ``http://ops.epo.org``.
+network. XML namespaces: default (exchange) ``http://www.epo.org/exchange``,
+``ops`` ``http://ops.epo.org`` and, for full-text claims,
+``http://www.epo.org/fulltext``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from lxml import etree
-from pubnum import PubNumber
+
+from patent_checker.claimref import extract_claim_refs_from_text
+from patent_checker.models import Claim
+from patent_checker.pubnum import PubNumber
 
 _EXCHANGE_NS = "http://www.epo.org/exchange"
 _OPS_NS = "http://ops.epo.org"
+_FULLTEXT_NS = "http://www.epo.org/fulltext"
+
+# Fault code OPS returns (with HTTP 404) for a search that matched nothing.
+_ENTITY_NOT_FOUND = "SERVER.EntityNotFound"
+
+# A claim starts with its printed number at the beginning of a line ...
+_CLAIM_START_LINE_RE = re.compile(r"^[ \t]*(\d{1,4})\.[ \t]", re.MULTILINE)
+# ... or right after the full stop that ends the previous claim, when the OPS
+# text layer glued two claims together ("... padded input tensor.6. The
+# computing system of ..." is real WO full text). That full stop must follow a
+# letter or a closing bracket, so decimals such as "1.2." are not mistaken for
+# a claim start.
+_CLAIM_START_INLINE_RE = re.compile(r"(?:(?<=[^\W\d_])|(?<=[)\]]))\.(\d{1,4})\.[ \t]")
 
 
 @dataclass(frozen=True)
@@ -91,10 +109,18 @@ def parse_search_xml(xml: bytes) -> OpsSearchPage:
       country / doc-number / kind, rendered in docdb spelling via
       :class:`pubnum.PubNumber`).
 
+    A search that matches nothing is answered by OPS with HTTP 404 and a
+    ``SERVER.EntityNotFound`` fault body instead of an empty result set; that
+    body is normalized here into a page with zero hits.
+
     Raises:
-        ValueError: If the document is not a search response.
+        ValueError: If the document is not a search response, or if it is an
+            OPS fault other than ``SERVER.EntityNotFound``.
     """
     root = etree.fromstring(xml)
+    if _is_zero_hit_fault(root):
+        return OpsSearchPage(total_count=0, query="", begin=0, end=0, hits=())
+
     biblio_search = root.find(_ops("biblio-search"))
     if biblio_search is None:
         raise ValueError("not a published-data search response: missing ops:biblio-search")
@@ -162,12 +188,18 @@ def parse_search_biblio_xml(xml: bytes) -> OpsSearchBiblioPage:
 
     ``total_count`` / ``begin`` / ``end`` come from ``ops:biblio-search`` and
     ``ops:range`` as in :func:`parse_search_xml`; each hit is one
-    ``exchange-document`` parsed like :func:`parse_biblio_xml`.
+    ``exchange-document`` parsed like :func:`parse_biblio_xml`. A zero-hit
+    ``SERVER.EntityNotFound`` fault is normalized into an empty page, as in
+    :func:`parse_search_xml`.
 
     Raises:
-        ValueError: If the document is not a search response.
+        ValueError: If the document is not a search response, or if it is an
+            OPS fault other than ``SERVER.EntityNotFound``.
     """
     root = etree.fromstring(xml)
+    if _is_zero_hit_fault(root):
+        return OpsSearchBiblioPage(total_count=0, begin=0, end=0, docs=())
+
     biblio_search = root.find(_ops("biblio-search"))
     if biblio_search is None:
         raise ValueError("not a published-data search response: missing ops:biblio-search")
@@ -265,6 +297,55 @@ def parse_legal_xml(xml: bytes) -> tuple[OpsLegalEvent, ...]:
     return tuple(events)
 
 
+def parse_claims_xml(xml: bytes) -> tuple[Claim, ...]:
+    """Parse a ``published-data/.../claims`` (full-text) response.
+
+    OPS full text carries no structured claim markup: every claim of a
+    document sits in a ``claims`` element as plain ``claim-text`` runs, the
+    claim number exists only as the printed ``"N."`` prefix, and dependencies
+    are plain prose ("The apparatus of claim 1 or 2"). One claim may be split
+    over several ``claim-text`` elements and several claims may share one, so
+    the whole claim set is flattened first and then split on claim numbering.
+
+    The ``claims`` element with ``lang="EN"`` is preferred, falling back to
+    the first one present. A ``"N."`` marker starts a new claim when it opens
+    a line or directly follows the previous claim's full stop, and only when
+    ``N`` is larger than the number of the claim opened last; that keeps
+    enumerations inside a claim body (which restart at low numbers) from
+    splitting it. Numbering is taken as printed, so claim sets that do not
+    start at 1 or skip numbers are accepted as they are.
+
+    Returns:
+        The claims in document order, each with its printed number, its
+        whitespace-normalized text (the ``"N."`` prefix is kept) and the claim
+        numbers it references (see
+        :func:`patent_checker.claimref.extract_claim_refs_from_text`).
+
+    Raises:
+        ValueError: If the document has no ``claims`` element, or if no
+            numbered claim can be cut out of it.
+    """
+    root = etree.fromstring(xml)
+    claims_elems = root.findall(f".//{_ft('claims')}")
+    if not claims_elems:
+        raise ValueError("not a claims response: no fulltext claims element present")
+
+    chosen = _preferred_claims_element(claims_elems)
+    body = _claims_plain_text(chosen)
+
+    marks = _claim_start_marks(body)
+    if not marks:
+        raise ValueError("claims element contains no numbered claim text")
+
+    claims = []
+    for index, (start, number) in enumerate(marks):
+        end = marks[index + 1][0] if index + 1 < len(marks) else len(body)
+        text = _normalize_ws(body[start:end])
+        depends_on = extract_claim_refs_from_text(text, claim_number=number)
+        claims.append(Claim(number=number, text=text, depends_on=depends_on))
+    return tuple(claims)
+
+
 def parse_family_xml(xml: bytes) -> OpsFamily:
     """Parse a ``family/publication`` response.
 
@@ -310,6 +391,21 @@ def _ex(tag: str) -> str:
 def _ops(tag: str) -> str:
     """Build a Clark-notation qualified tag name in the ops namespace."""
     return f"{{{_OPS_NS}}}{tag}"
+
+
+def _is_zero_hit_fault(root: etree._Element) -> bool:
+    """Return True if *root* is the OPS fault that stands for "no hits".
+
+    Raises:
+        ValueError: If *root* is an OPS fault reporting anything else.
+    """
+    if root.tag != _ops("fault"):
+        return False
+    code = (root.findtext(_ops("code")) or "").strip()
+    if code == _ENTITY_NOT_FOUND:
+        return True
+    message = (root.findtext(_ops("message")) or "").strip()
+    raise ValueError(f"OPS fault: {code or '<no code>'} ({message or 'no message'})")
 
 
 def _find_docdb_document_id(container: etree._Element, context: str) -> etree._Element:
@@ -455,3 +551,56 @@ def _extract_citations(bibliographic_data: etree._Element) -> tuple[tuple[str, .
 
     npl_citation_count = len(references.findall(f".//{_ex('nplcit')}"))
     return tuple(cited_patents), npl_citation_count
+
+
+def _ft(tag: str) -> str:
+    """Build a Clark-notation qualified tag name in the fulltext namespace."""
+    return f"{{{_FULLTEXT_NS}}}{tag}"
+
+
+def _preferred_claims_element(claims_elems: list[etree._Element]) -> etree._Element:
+    """Return the English ``claims`` element, or the first one when absent."""
+    for claims_elem in claims_elems:
+        if (claims_elem.get("lang") or "").upper() == "EN":
+            return claims_elem
+    return claims_elems[0]
+
+
+def _claims_plain_text(claims_elem: etree._Element) -> str:
+    """Flatten the ``claim-text`` runs of one claim set into a single string.
+
+    Runs are joined with newlines so that a claim continued in the next
+    ``claim-text`` element keeps a line break in front of its number. Nested
+    ``claim-text`` elements are covered by their outermost ancestor and are
+    therefore skipped.
+    """
+    claim_text_tag = _ft("claim-text")
+    parts = []
+    for claim_text in claims_elem.iter(claim_text_tag):
+        if any(ancestor.tag == claim_text_tag for ancestor in claim_text.iterancestors()):
+            continue
+        parts.append("".join(claim_text.itertext()))
+    return "\n".join(parts)
+
+
+def _claim_start_marks(body: str) -> list[tuple[int, int]]:
+    """Return ``(offset, claim number)`` for every claim start in *body*.
+
+    Candidates are collected from both claim-start patterns, ordered by
+    offset, and kept only while the numbering increases; a repeated or
+    decreasing number belongs to the claim body (an enumerated list, or the
+    stray "Claims" heading some WO documents print) rather than to a new
+    claim.
+    """
+    candidates: list[tuple[int, int]] = []
+    for pattern in (_CLAIM_START_LINE_RE, _CLAIM_START_INLINE_RE):
+        for match in pattern.finditer(body):
+            candidates.append((match.start(1), int(match.group(1))))
+    candidates.sort()
+
+    marks: list[tuple[int, int]] = []
+    for offset, number in candidates:
+        if marks and number <= marks[-1][1]:
+            continue
+        marks.append((offset, number))
+    return marks

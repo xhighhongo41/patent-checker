@@ -1,11 +1,27 @@
-"""Publication-number normalization for the v0.1 PoC.
+"""Publication-number normalization.
 
 Converts between the three publication-number spellings used by our data
 sources, keeping the parts (country / number / kind) explicit:
 
 - docdb:  ``US.11468338.B2`` (dot-separated, used by OPS docdb endpoints)
 - epodoc: ``US11468338B2``   (concatenated, used by OPS epodoc endpoints)
-- Google Patents: ``US11468338B2`` (concatenated, used in ``/patent/`` URLs)
+- Google Patents: ``US20240111636A1`` (concatenated, used in ``/patent/`` URLs)
+
+docdb/epodoc numbers observed from OPS mix two lengths for the digit run:
+10 digits (4-digit year + 6-digit serial) and 11 digits (4-digit year +
+7-digit serial), depending on office and document kind. Google Patents,
+however, always spells *US published applications* with an 11-digit run,
+padding a 10-digit docdb/epodoc number by inserting a ``0`` right after the
+4-digit year (e.g. docdb ``US.2024111636.A1`` -> Google
+``US20240111636A1``). ``google()`` applies this padding only for that case;
+docdb() and epodoc() are never padded, and non-US offices and US granted
+patents (whose serial is not year-prefixed) are passed through unchanged.
+
+This padding is one-directional: ``parse_pubnum`` does not shrink an
+11-digit Google-style number back down to the 10-digit docdb form, so
+round-tripping a Google Patents US published-application number through
+``parse_pubnum(...).docdb()`` keeps the 11-digit run rather than restoring
+the original docdb spelling.
 
 JP-specific quirks (era-based numbering etc.) are out of scope for v0.1:
 whatever OPS returns is carried around as-is, and inputs this module cannot
@@ -50,7 +66,20 @@ class PubNumber:
         return f"{self.country}{self.number}{self.kind}"
 
     def google(self) -> str:
-        """Return the spelling used in Google Patents ``/patent/`` URLs."""
+        """Return the spelling used in Google Patents ``/patent/`` URLs.
+
+        US published applications are spelled with an 11-digit number on
+        Google Patents (4-digit year + 7-digit serial), while docdb/epodoc
+        may carry the same publication as a 10-digit number (4-digit year +
+        6-digit serial). When that 10-digit, year-prefixed shape is
+        detected, a ``0`` is inserted right after the year to produce the
+        11-digit Google Patents spelling. All other cases (11-digit numbers,
+        US granted patents, non-US offices, and 10-digit numbers that are
+        not year-prefixed) are passed through as-is.
+        """
+        if self.country == "US" and len(self.number) == 10 and self.number[:2] in ("19", "20"):
+            padded_number = f"{self.number[:4]}0{self.number[4:]}"
+            return f"{self.country}{padded_number}{self.kind}"
         return self.epodoc()
 
 

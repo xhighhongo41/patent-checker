@@ -222,3 +222,7 @@ __marimo__/
 # プロジェクト固有
 PROJECT.md
 開発資料/
+
+# Patent Checker artifacts and local test fixtures (never tracked)
+.patent-checker/
+tests/fixtures/
