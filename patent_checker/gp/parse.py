@@ -8,10 +8,11 @@ network; document retrieval lives in :mod:`patent_checker.gp.fetch`.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from bs4 import BeautifulSoup, Tag
 
+from patent_checker.claimref import extract_claim_refs_from_text
 from patent_checker.models import Claim
 
 __all__ = ["Claim", "GPatentDoc", "parse_patent_html"]
@@ -24,6 +25,10 @@ class GPatentDoc:
     ``status_display`` and ``expiration`` reproduce what the page shows and
     are reference values only; authoritative legal status comes from EPO OPS
     (completion requirement R8).
+
+    ``claims_fallback_text`` holds the whole claims section as flat text and
+    is only non-empty when ``claims`` is empty because the page carries no
+    numbered claim markup; the two fields are therefore never both populated.
     """
 
     pub_number: str
@@ -39,6 +44,7 @@ class GPatentDoc:
     backward_refs: tuple[str, ...]
     forward_refs: tuple[str, ...]
     similar: tuple[str, ...]
+    claims_fallback_text: str = ""
 
 
 # Leaf-level CPC codes, e.g. "G06N3/02" (section-only codes like "G06N" are skipped).
@@ -108,6 +114,34 @@ def _extract_claims(claims_sections: list[Tag]) -> tuple[Claim, ...]:
     return tuple(claims)
 
 
+def _claims_section_fallback_text(claims_sections: list[Tag]) -> str:
+    """Return the whitespace-normalized text of ``claims_sections`` (fallback 1).
+
+    Used when the markup carries no ``num`` attributes, so no claim can be
+    numbered; the raw wording is still worth keeping for the caller.
+    Multiple sections are joined in document order.
+    """
+    texts = [_normalize_whitespace(section.get_text()) for section in claims_sections]
+    return _normalize_whitespace(" ".join(text for text in texts if text))
+
+
+def _recover_dependencies_from_text(claims: tuple[Claim, ...]) -> tuple[Claim, ...]:
+    """Return ``claims`` with text-derived dependencies filled in (fallback 2).
+
+    Only claims left without dependencies by the ``claim-ref`` markup are
+    reconsidered, so structured values always win over wording; claims that
+    stay empty are genuinely independent.
+    """
+    recovered: list[Claim] = []
+    for claim in claims:
+        if claim.depends_on:
+            recovered.append(claim)
+            continue
+        depends_on = extract_claim_refs_from_text(claim.text, claim_number=claim.number)
+        recovered.append(replace(claim, depends_on=depends_on) if depends_on else claim)
+    return tuple(recovered)
+
+
 def _extract_cpc_codes(soup: BeautifulSoup) -> tuple[str, ...]:
     """Return leaf CPC codes in document order, deduplicated."""
     codes: list[str] = []
@@ -143,7 +177,12 @@ def parse_patent_html(html: str) -> GPatentDoc:
       section is absent).
     - Claims: ``div.claim[num]`` inside ``section[itemprop=claims]``; claim
       text is the whitespace-normalized text of the div; dependencies come
-      from ``claim-ref`` elements (``idref="CLM-00001"`` -> 1).
+      from ``claim-ref`` elements (``idref="CLM-00001"`` -> 1). Two markup
+      gaps observed across the saved pages are absorbed: pages without
+      ``num`` attributes (older CN/KR/WO documents) produce ``claims=()``
+      plus ``claims_fallback_text``, and claims left dependency-less by
+      missing ``claim-ref`` markup (CN/EP/GB/older US) get their
+      dependencies re-read from the claim text.
     - CPC codes: ``span[itemprop=Code]`` values that look like leaf codes
       (``^[A-Z]\\d{2}[A-Z]\\d+/\\d+$``), deduplicated, document order.
     - Status/expiration: ``span[itemprop=status]`` and
@@ -157,7 +196,8 @@ def parse_patent_html(html: str) -> GPatentDoc:
 
     Raises:
         ValueError: If the page has no publication number or no claims
-            section (not a patent detail page).
+            section (not a patent detail page). A claims section that yields
+            no numbered claim is not an error; see ``claims_fallback_text``.
         TypeError: If ``html`` is not a string.
     """
     if not isinstance(html, str):
@@ -174,6 +214,10 @@ def parse_patent_html(html: str) -> GPatentDoc:
     if not claims_sections:
         raise ValueError("page has no claims section (not a patent detail page)")
     claims = _extract_claims(claims_sections)
+    # Fallback (1): no numbered claim at all -> keep the section wording.
+    # Fallback (2): numbered claims without claim-ref markup -> read the text.
+    claims_fallback_text = "" if claims else _claims_section_fallback_text(claims_sections)
+    claims = _recover_dependencies_from_text(claims)
 
     title_tag = _first_outside_reference_rows(soup, "span[itemprop=title]")
     title = title_tag.get_text().strip() if title_tag is not None else ""
@@ -220,4 +264,5 @@ def parse_patent_html(html: str) -> GPatentDoc:
         backward_refs=backward_refs,
         forward_refs=forward_refs,
         similar=similar,
+        claims_fallback_text=claims_fallback_text,
     )

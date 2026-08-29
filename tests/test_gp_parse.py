@@ -210,3 +210,126 @@ def test_multiple_claims_sections_are_concatenated() -> None:
     assert len(doc.claims) == 2
     assert "Original language" in doc.claims[0].text
     assert "Machine-translated" in doc.claims[1].text
+
+
+# --- Fallback (1): claims section present, but no claim carries a ``num`` attribute.
+
+
+def test_claims_without_num_attribute_fall_back_to_section_text() -> None:
+    """Old-style pages without ``num`` attributes yield section text, not an error.
+
+    WO A2 / older CN / KR pages mark claims up without ``num`` attributes, so
+    no numbered claim can be recovered. The parser must keep the text instead
+    of rejecting the page.
+    """
+    html = """
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000005A1</dd>
+      <section itemprop="claims" itemscope>
+        <div class="claims ocr">
+          <div class="claim-text">CLAIMS What is claimed is:</div>
+          <div class="claim-text">1. A widget assembly comprising a frame.</div>
+          <div class="claim-text">2. The assembly of claim 1, wherein the frame is steel.</div>
+        </div>
+      </section>
+    </article></body></html>
+    """
+    doc = parse_patent_html(html)
+    assert doc.claims == ()
+    assert "What is claimed is:" in doc.claims_fallback_text
+    assert "wherein the frame is steel" in doc.claims_fallback_text
+    # Whitespace is normalized, so the raw newline/indent runs are gone.
+    assert "\n" not in doc.claims_fallback_text
+    assert "  " not in doc.claims_fallback_text
+
+
+def test_structured_claims_leave_fallback_text_empty() -> None:
+    """When numbered claims are extracted, no fallback text is produced."""
+    html = f"""
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000006A1</dd>
+      {_SYNTHETIC_CLAIM_SECTION}
+    </article></body></html>
+    """
+    doc = parse_patent_html(html)
+    assert len(doc.claims) == 1
+    assert doc.claims_fallback_text == ""
+
+
+# --- Fallback (2): numbered claims present, but no ``claim-ref`` markup.
+
+
+def _claim_div(number: int, text: str, *, ref: int | None = None) -> str:
+    """Return a synthetic ``div.claim[num]`` block, optionally with a claim-ref."""
+    body = text if ref is None else text.replace("claim", f'<claim-ref idref="CLM-{ref:05d}">claim')
+    if ref is not None:
+        body += "</claim-ref>"
+    return f'<div num="{number:05d}" class="claim"><div class="claim-text">{body}</div></div>'
+
+
+def test_dependencies_are_recovered_from_claim_text_without_claim_ref() -> None:
+    """Pages without ``claim-ref`` markup get dependencies from the claim text."""
+    html = f"""
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000007A1</dd>
+      <section itemprop="claims" itemscope>
+        <div class="claim">
+          {_claim_div(1, "1. A widget assembly.")}
+          {_claim_div(2, "2. The assembly of claim 1, wherein it is steel.")}
+          {_claim_div(3, "3. The assembly according to claim 2, further comprising a lid.")}
+          {_claim_div(4, "4. The assembly of any one of claims 1 to 3, painted red.")}
+        </div>
+      </section>
+    </article></body></html>
+    """
+    doc = parse_patent_html(html)
+    assert [claim.number for claim in doc.claims] == [1, 2, 3, 4]
+    assert doc.claims[0].depends_on == ()
+    assert doc.claims[1].depends_on == (1,)
+    assert doc.claims[2].depends_on == (2,)
+    assert doc.claims[3].depends_on == (1, 2, 3)
+
+
+def test_claim_ref_markup_wins_over_claim_text() -> None:
+    """Text recovery does not run for claims whose dependencies came from markup.
+
+    The synthetic claim 3 has a ``claim-ref`` pointing at claim 1 while its
+    text mentions claim 2; the structured value must survive untouched.
+    """
+    html = f"""
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000008A1</dd>
+      <section itemprop="claims" itemscope>
+        <div class="claim">
+          {_claim_div(1, "1. A widget assembly.")}
+          {_claim_div(2, "2. The assembly of claim 1, wherein it is steel.", ref=1)}
+          {_claim_div(3, "3. The assembly of claim 2, further comprising a lid.", ref=1)}
+        </div>
+      </section>
+    </article></body></html>
+    """
+    doc = parse_patent_html(html)
+    assert doc.claims[1].depends_on == (1,)
+    assert doc.claims[2].depends_on == (1,)
+
+
+# --- Cross-fixture smoke test over every saved page. ---
+
+
+def test_every_fixture_yields_claims_or_fallback_text() -> None:
+    """Every saved page parses and exposes claims either structured or as text.
+
+    This guards the two known Google Patents markup gaps (no ``num``
+    attributes, no ``claim-ref`` elements): whichever path is taken, callers
+    must never end up with an empty document.
+    """
+    paths = sorted(FIXTURE_DIR.glob("*.html"))
+    if not paths:
+        pytest.skip(f"fixtures not available: {FIXTURE_DIR}")
+
+    empty: list[str] = []
+    for path in paths:
+        doc = parse_patent_html(path.read_text(encoding="utf-8"))
+        if not doc.claims and not doc.claims_fallback_text:
+            empty.append(path.name)
+    assert not empty, f"no claims and no fallback text: {empty}"
