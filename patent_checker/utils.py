@@ -1,0 +1,412 @@
+"""Support utilities that mechanize the manual v0.1 review steps.
+
+These helpers formalize procedures that were carried out by hand during the
+v0.1 proof of concept (stage-1 screening prep, delegated-batch sign-off, and
+search-plan sizing; see the v0.1 handover notes) so that v0.2 can call them
+directly and v0.3 can expose them as MCP tools. Inputs and outputs are kept
+as plain ``dict``/``list`` values (no bespoke dataclasses) so an LLM can read
+and produce them as JSON without an extra translation layer.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from patent_checker.config import data_dir
+from patent_checker.ops.client import OpsClient, parse_throttling_header
+from patent_checker.ops.parse import parse_search_xml
+from patent_checker.pubnum import parse_pubnum
+
+# Representative-country priority used by dedup_families() when more than one
+# family member could serve as the representative record. This is the v0.2
+# default: it favors jurisdictions whose publications more often carry an
+# English-language abstract/body, which is what stage-1 screening reads.
+REPRESENTATIVE_COUNTRY_ORDER: tuple[str, ...] = (
+    "US",
+    "EP",
+    "WO",
+    "GB",
+    "CA",
+    "AU",
+    "KR",
+    "CN",
+    "JP",
+)
+
+
+def dedup_families(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse search hits into one record per patent family.
+
+    This mechanizes the stage-1 screening prep step: search results (which
+    may repeat the same family under several publications, possibly found by
+    several search queries) are merged into one record per family, keeping
+    every member publication and picking a single representative hit to
+    read.
+
+    Each *hit* must carry ``"pub"`` (a publication number understood by
+    :func:`patent_checker.pubnum.parse_pubnum`) and ``"family_id"``. The
+    optional keys ``"abstract"``, ``"publication_date"`` (``YYYYMMDD``) and
+    ``"query_id"`` (the id of the search query that produced the hit) are
+    used as described below; any other key is carried through unchanged on
+    whichever hit is chosen as the representative.
+
+    Hits with a missing or empty ``"family_id"`` are not merged together
+    under that empty value (which would wrongly group unrelated
+    publications); each such hit is instead keyed by its own ``"pub"``, so
+    two hits only merge this way when they name the very same publication.
+
+    The representative hit of a family is chosen, in order:
+
+    1. Hits with a non-empty ``"abstract"`` over hits without one.
+    2. :data:`REPRESENTATIVE_COUNTRY_ORDER` rank of the hit's publication
+       country (publications from a country outside that list are ranked
+       after all listed countries, and tied among each other).
+    3. The more recent ``"publication_date"`` (missing/unparsable dates rank
+       lowest).
+    4. Whichever hit appeared first in *hits*.
+
+    Returns:
+        One record per family, in the order each family first appears in
+        *hits*: ``{"family_id": str, "representative": dict (all keys of the
+        chosen hit), "members": [pub, ...] (input order), "query_ids": [str,
+        ...] (merged from every member, first-seen order, deduplicated)}``.
+
+    Raises:
+        KeyError: If a hit is missing the required ``"pub"`` key.
+    """
+    order: list[str] = []
+    groups: dict[str, list[int]] = {}
+    for index, hit in enumerate(hits):
+        pub = hit["pub"]
+        family_id = hit.get("family_id") or ""
+        # Empty/missing family_id: fall back to pub so unrelated hits are not
+        # accidentally merged under the shared key "".
+        key = family_id or pub
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(index)
+
+    families: list[dict[str, Any]] = []
+    for key in order:
+        indices = groups[key]
+        family_id_out = hits[indices[0]].get("family_id") or ""
+        members = [hits[i]["pub"] for i in indices]
+        raw_query_ids = (hits[i].get("query_id") for i in indices)
+        query_ids = _dedup_preserve_order(qid for qid in raw_query_ids if qid is not None)
+        representative = dict(_select_representative(indices, hits))
+        families.append(
+            {
+                "family_id": family_id_out,
+                "representative": representative,
+                "members": members,
+                "query_ids": query_ids,
+            }
+        )
+    return families
+
+
+def verify_batch(
+    input_pubs: Sequence[str],
+    output_records: Sequence[Mapping[str, Any] | str],
+) -> dict[str, Any]:
+    """Cross-check a delegated batch's output against its input publication list.
+
+    This mechanizes the delegated-batch sign-off step: in v0.1, silently
+    dropped items from an LLM-delegated batch were only caught by manually
+    diffing the input and output publication lists. Here the comparison is
+    done on the docdb-normalized form of each publication number
+    (:meth:`patent_checker.pubnum.PubNumber.docdb`), so spelling differences
+    such as ``US11468338B2`` vs. ``US.11468338.B2`` are treated as the same
+    publication. A publication number that cannot be parsed is compared
+    verbatim (not normalized) and is also listed under ``"unparseable"``.
+
+    Each element of *output_records* is either a publication-number string
+    or a mapping carrying one under the required key ``"pub"``.
+
+    Returns:
+        ``{"ok": bool, "input_count": int, "output_count": int, "missing":
+        [...] (in input, not in output), "unexpected": [...] (in output, not
+        in input), "duplicates": [...] (repeated within output),
+        "unparseable": [...] (raw text of every pub that failed to parse, on
+        either side, first-seen order, deduplicated)}``. ``missing``,
+        ``unexpected`` and ``duplicates`` list the normalized (or, when
+        unparseable, raw) form, each in first-seen order and deduplicated.
+        ``ok`` is True exactly when ``missing``, ``unexpected`` and
+        ``duplicates`` are all empty.
+
+    Raises:
+        KeyError: If a mapping element of *output_records* has no ``"pub"``
+            key.
+    """
+    unparseable: list[str] = []
+    seen_unparseable: set[str] = set()
+
+    def normalize(pub: str) -> str:
+        """Normalize *pub*, recording it under unparseable when it fails to parse."""
+        key, parsed = _normalize_or_raw(pub)
+        if not parsed and key not in seen_unparseable:
+            seen_unparseable.add(key)
+            unparseable.append(key)
+        return key
+
+    input_keys = [normalize(pub) for pub in input_pubs]
+    output_keys = [
+        normalize(record if isinstance(record, str) else record["pub"]) for record in output_records
+    ]
+
+    input_key_set = set(input_keys)
+    output_key_set = set(output_keys)
+    missing = [key for key in _dedup_preserve_order(input_keys) if key not in output_key_set]
+    unexpected = [key for key in _dedup_preserve_order(output_keys) if key not in input_key_set]
+    duplicates = [key for key, count in Counter(output_keys).items() if count > 1]
+
+    return {
+        "ok": not missing and not unexpected and not duplicates,
+        "input_count": len(input_pubs),
+        "output_count": len(output_records),
+        "missing": missing,
+        "unexpected": unexpected,
+        "duplicates": duplicates,
+        "unparseable": unparseable,
+    }
+
+
+def search_plan_check(
+    queries: Sequence[str],
+    *,
+    client: OpsClient | None = None,
+    max_total: int | None = None,
+) -> dict[str, Any]:
+    """Measure the hit count of every candidate CQL query in a search plan.
+
+    This mechanizes the search-plan sizing step: each query in *queries* is
+    run against OPS with ``Range=1-2`` (the minimum accepted range) purely to
+    read back its ``total-result-count``, without paging through any hits.
+
+    When *client* is omitted, an :class:`~patent_checker.ops.client.OpsClient`
+    is created for the call and closed afterwards. When *client* is given, it
+    is used as-is and left open (the caller owns its lifecycle).
+
+    A query that fails (``ValueError`` from OPS range validation, or any
+    :class:`httpx.HTTPError`) does not stop the plan: it is recorded as an
+    error entry and the remaining queries are still measured.
+
+    Returns:
+        ``{"results": [{"query": str, "total": int} or {"query": str,
+        "error": str}, ...], "total_sum": int (sum of "total" over the
+        queries that did not error), "exceeded": bool (True when *max_total*
+        is given and total_sum exceeds it), "max_total": int | None}``.
+    """
+    if client is not None:
+        return _run_search_plan_check(queries, client, max_total)
+    with OpsClient() as owned_client:
+        return _run_search_plan_check(queries, owned_client, max_total)
+
+
+def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
+    """Summarize an OPS request-header log (``headers.jsonl``).
+
+    Each line of the log is one JSON object appended by
+    :meth:`patent_checker.ops.client.OpsClient._log_headers`:
+    ``{"at": ISO8601 str, "kind": str, "url": str, "status": int,
+    "throttling": str}``. When *headers_path* is omitted, the log at
+    ``data_dir("ops") / "headers.jsonl"`` (the same path OpsClient writes to)
+    is used. A line that is not valid JSON is skipped and counted in
+    ``"skipped_lines"`` rather than raising.
+
+    Returns:
+        ``{"available": False, "path": str}`` when the log file does not
+        exist. Otherwise ``{"available": True, "path": str, "total_requests":
+        int, "by_kind": {kind: count}, "by_status": {str(status): count},
+        "non_green_events": int (lines whose throttling report mentions
+        "yellow"/"red"/"black"), "system_states": {"idle"/"busy"/"overloaded":
+        count}, "first_at": str, "last_at": str, "today": {"date":
+        "YYYY-MM-DD" (local), "total_requests": int, "by_kind": {...}},
+        "skipped_lines": int}``.
+    """
+    path = headers_path if headers_path is not None else data_dir("ops") / "headers.jsonl"
+    if not path.exists():
+        return {"available": False, "path": str(path)}
+
+    today = datetime.now().date()
+    total_requests = 0
+    by_kind: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    non_green_events = 0
+    system_states: dict[str, int] = {}
+    first_at: str | None = None
+    last_at: str | None = None
+    skipped_lines = 0
+    today_total = 0
+    today_by_kind: dict[str, int] = {}
+
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                skipped_lines += 1
+                continue
+
+            total_requests += 1
+            kind = record.get("kind", "")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+
+            status = str(record.get("status", ""))
+            by_status[status] = by_status.get(status, 0) + 1
+
+            throttling = record.get("throttling", "")
+            if any(colour in throttling for colour in ("yellow", "red", "black")):
+                non_green_events += 1
+
+            system, _services = parse_throttling_header(throttling)
+            if system in ("idle", "busy", "overloaded"):
+                system_states[system] = system_states.get(system, 0) + 1
+
+            at = record.get("at", "")
+            if first_at is None:
+                first_at = at
+            last_at = at
+            if at and _local_date(at) == today:
+                today_total += 1
+                today_by_kind[kind] = today_by_kind.get(kind, 0) + 1
+
+    return {
+        "available": True,
+        "path": str(path),
+        "total_requests": total_requests,
+        "by_kind": by_kind,
+        "by_status": by_status,
+        "non_green_events": non_green_events,
+        "system_states": system_states,
+        "first_at": first_at or "",
+        "last_at": last_at or "",
+        "today": {
+            "date": today.isoformat(),
+            "total_requests": today_total,
+            "by_kind": today_by_kind,
+        },
+        "skipped_lines": skipped_lines,
+    }
+
+
+# --- Private helpers ---------------------------------------------------
+
+
+def _dedup_preserve_order(items: Iterable[str]) -> list[str]:
+    """Return the elements of *items* in first-seen order, without duplicates."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def _abstract_rank(hit: Mapping[str, Any]) -> int:
+    """Return 0 when *hit* has a non-empty abstract, 1 otherwise (lower is preferred)."""
+    return 0 if hit.get("abstract") else 1
+
+
+def _country_rank(pub: str) -> int:
+    """Return the :data:`REPRESENTATIVE_COUNTRY_ORDER` rank of *pub*'s country.
+
+    Publications whose country is not in that list, or that fail to parse,
+    rank after every listed country.
+    """
+    try:
+        country = parse_pubnum(pub).country
+    except (TypeError, ValueError):
+        return len(REPRESENTATIVE_COUNTRY_ORDER)
+    try:
+        return REPRESENTATIVE_COUNTRY_ORDER.index(country)
+    except ValueError:
+        return len(REPRESENTATIVE_COUNTRY_ORDER)
+
+
+def _date_sort_value(hit: Mapping[str, Any]) -> int:
+    """Return a ``YYYYMMDD`` publication date as an int (0 when missing/unparsable)."""
+    raw = hit.get("publication_date") or ""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _select_representative(
+    indices: list[int], hits: Sequence[Mapping[str, Any]]
+) -> Mapping[str, Any]:
+    """Pick the representative hit of a family among *indices* into *hits*.
+
+    Ranking is abstract presence, then :func:`_country_rank`, then the more
+    recent publication date, then input order (see :func:`dedup_families`).
+    """
+
+    def sort_key(index: int) -> tuple[int, int, int, int]:
+        hit = hits[index]
+        return (
+            _abstract_rank(hit),
+            _country_rank(hit["pub"]),
+            -_date_sort_value(hit),
+            index,
+        )
+
+    best_index = min(indices, key=sort_key)
+    return hits[best_index]
+
+
+def _normalize_or_raw(pub: str) -> tuple[str, bool]:
+    """Normalize *pub* to its docdb spelling, falling back to the raw text.
+
+    Returns:
+        ``(key, True)`` when *pub* parses; ``(pub, False)`` otherwise, so an
+        unparsable pub can still be compared (verbatim) and listed.
+    """
+    try:
+        return parse_pubnum(pub).docdb(), True
+    except (TypeError, ValueError):
+        return pub, False
+
+
+def _run_search_plan_check(
+    queries: Sequence[str], client: OpsClient, max_total: int | None
+) -> dict[str, Any]:
+    """Probe every query in *queries* against *client* (see :func:`search_plan_check`)."""
+    results: list[dict[str, Any]] = []
+    total_sum = 0
+    for query in queries:
+        try:
+            xml, _path = client.search(query, begin=1, end=2)
+            total = parse_search_xml(xml).total_count
+        except (ValueError, httpx.HTTPError) as exc:
+            results.append({"query": query, "error": str(exc)})
+            continue
+        results.append({"query": query, "total": total})
+        total_sum += total
+
+    return {
+        "results": results,
+        "total_sum": total_sum,
+        "exceeded": max_total is not None and total_sum > max_total,
+        "max_total": max_total,
+    }
+
+
+def _local_date(at: str) -> Any:
+    """Return the local calendar date encoded in an ``"at"`` timestamp, or None."""
+    try:
+        return datetime.fromisoformat(at).date()
+    except ValueError:
+        return None
