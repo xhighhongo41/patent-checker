@@ -60,3 +60,31 @@ def test_report_template_keeps_the_mandatory_sections() -> None:
         "no verdict",
     ):
         assert marker.lower() in text.lower(), f"missing mandatory element: {marker}"
+
+
+def test_every_registered_tool_name_appears_in_the_skill() -> None:
+    """SKILL.md must mention every MCP tool the server registers (v0.3 R9)."""
+    from patent_checker.server.tools import TOOL_NAMES
+
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    missing = [name for name in TOOL_NAMES if f"`{name}`" not in text]
+    assert missing == [], f"tool names absent from SKILL.md: {missing}"
+
+
+def test_skill_keeps_consent_on_the_cli_and_names_the_error_prefixes() -> None:
+    """Step 0 stays a local CLI step; the three tool-error prefixes are documented."""
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    assert "`patent-checker consent status`" in text
+    assert "`patent-checker consent record --lang <lang>`" in text
+    for prefix in ("invalid_input:", "external_api_error:", "ops_not_configured:"):
+        assert f"`{prefix}`" in text, prefix
+    assert "server_status" in text
+
+
+@pytest.mark.parametrize("lang", ["en", "ja"])
+def test_operator_notice_files_carry_the_current_version(lang: str) -> None:
+    from patent_checker.server.settings import OPERATOR_NOTICE_VERSION, operator_notice_text
+
+    effective, text = operator_notice_text(lang)
+    assert effective == lang
+    assert OPERATOR_NOTICE_VERSION in text.splitlines()[0]
