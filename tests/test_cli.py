@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pytest
 
-from patent_checker import consent
+from patent_checker import consent, service
 from patent_checker.cli import main as cli_main
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
@@ -89,7 +89,7 @@ def test_search_success(
         end=25,
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
-    monkeypatch.setattr(cli_main, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
 
     rc, data = _invoke(["search", "ti=drone"], capsys)
 
@@ -158,7 +158,7 @@ def test_search_biblio_success(
         npl_citation_count=0,
     )
     monkeypatch.setattr(
-        cli_main,
+        service,
         "parse_search_biblio_xml",
         lambda xml: type(
             "Page", (), {"total_count": 1, "begin": 1, "end": 25, "docs": (biblio,)}
@@ -197,11 +197,14 @@ def test_plan_check_reads_queries_from_positional_args_and_file(
 
     captured: dict[str, Any] = {}
 
-    def fake_plan_check(queries: list[str], *, max_total: int | None = None) -> dict[str, Any]:
+    def fake_plan_check(
+        queries: list[str], *, client: Any = None, max_total: int | None = None
+    ) -> dict[str, Any]:
         captured["queries"] = queries
         return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
 
-    monkeypatch.setattr(cli_main, "search_plan_check", fake_plan_check)
+    monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient())
 
     rc, data = _invoke(
         ["plan-check", "extra=1", "--file", str(query_file), "--max-total", "100"], capsys
@@ -236,7 +239,7 @@ def test_biblio_success(
         cited_patents=(),
         npl_citation_count=0,
     )
-    monkeypatch.setattr(cli_main, "parse_biblio_xml", lambda xml: biblio)
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: biblio)
 
     rc, data = _invoke(["biblio", "US.1.A1"], capsys)
 
@@ -253,7 +256,7 @@ def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
         cli_main, "OpsClient", lambda: _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
     )
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
-    monkeypatch.setattr(cli_main, "parse_legal_xml", lambda xml: events)
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
 
     rc, data = _invoke(["legal", "US.1.A1"], capsys)
 
@@ -274,7 +277,7 @@ def test_family_success(
         cli_main, "OpsClient", lambda: _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
     )
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
-    monkeypatch.setattr(cli_main, "parse_family_xml", lambda xml: family)
+    monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
@@ -313,8 +316,8 @@ def test_claims_google_patents_route(
     """When Google Patents has the page, claims is read from it (source='gp')."""
     page_path = tmp_path / "US11468338B2.html"
     page_path.write_text("<html></html>", encoding="utf-8")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: page_path)
-    monkeypatch.setattr(cli_main, "parse_patent_html", lambda html: _sample_gp_doc())
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: page_path)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
     rc, data = _invoke(["claims", "US11468338B2"], capsys)
 
@@ -332,13 +335,13 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
 ) -> None:
     """A GP 404 for an EP/WO document, with OPS configured, tries OPS full text."""
     unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     monkeypatch.setattr(
         cli_main, "OpsClient", lambda: _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
     )
     monkeypatch.setattr(
-        cli_main,
+        service,
         "parse_claims_xml",
         lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
     )
@@ -359,7 +362,7 @@ def test_claims_unavailable_when_no_fallback_route(
     unavailable = GPUnavailable(
         pub="US20240111636A1", status_code=404, retry_after_hint="wait a bit"
     )
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
 
     rc, data = _invoke(["claims", "US20240111636A1"], capsys)
@@ -377,7 +380,7 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 ) -> None:
     """When OPS full text also 404s, the result is still the normal unavailable shape."""
     unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     not_found = httpx.HTTPStatusError(
         "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
@@ -475,7 +478,7 @@ def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """usage prints utils.usage_report()'s result verbatim."""
     fake = {"available": False, "path": "/tmp/headers.jsonl"}
-    monkeypatch.setattr(cli_main, "usage_report", lambda: fake)
+    monkeypatch.setattr(service, "usage_report", lambda: fake)
 
     rc, data = _invoke(["usage"], capsys)
 

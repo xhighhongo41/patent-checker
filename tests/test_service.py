@@ -1,0 +1,563 @@
+"""Tests for the service layer (patent_checker/service.py).
+
+Network-free: every outward call the service makes (``OpsClient`` methods,
+the ops/gp parse functions and the ``utils`` helpers) is monkeypatched with a
+canned stand-in, so these tests check the returned dict shapes and the route
+selection only -- the underlying logic is tested where it is implemented.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
+
+from patent_checker import service
+from patent_checker.config import ConfigError
+from patent_checker.gp.fetch import GPUnavailable
+from patent_checker.gp.parse import GPatentDoc
+from patent_checker.models import Claim
+from patent_checker.ops.parse import (
+    OpsBiblio,
+    OpsFamily,
+    OpsLegalEvent,
+    OpsSearchHit,
+    OpsSearchPage,
+)
+
+
+class _StubOpsClient:
+    """Minimal ``OpsClient`` stand-in: replays a canned return/exception per method name."""
+
+    def __init__(self, **method_results: Any) -> None:
+        self._results = method_results
+        self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+
+    def __enter__(self) -> _StubOpsClient:
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+    def __getattr__(self, name: str):
+        def method(*args: Any, **kwargs: Any) -> Any:
+            self.calls.append((name, args, kwargs))
+            result = self._results[name]
+            if isinstance(result, BaseException):
+                raise result
+
+            return result
+
+        return method
+
+
+def _explode(*args: Any, **kwargs: Any) -> Any:
+    """Stand-in for a call that must not happen in the test using it."""
+    raise AssertionError(f"unexpected call with args={args!r}, kwargs={kwargs!r}")
+
+
+def _as_json(result: dict[str, Any]) -> dict[str, Any]:
+    """Round-trip a service result through ``json.dumps``/``json.loads``.
+
+    The service returns whatever ``dataclasses.asdict`` produces, which keeps
+    tuple fields as tuples; the contract is that the *serialized* result has
+    the same shape as the v0.2 CLI output, so the shape tests compare that.
+    """
+    return json.loads(json.dumps(result, ensure_ascii=False))
+
+
+@pytest.fixture
+def no_outward_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace every parse/fetch/utils hook of the service with a failing stub.
+
+    Used by the "not configured" tests to prove that the ConfigError is
+    raised before anything is fetched or parsed.
+    """
+    for name in (
+        "parse_search_xml",
+        "parse_search_biblio_xml",
+        "parse_biblio_xml",
+        "parse_legal_xml",
+        "parse_family_xml",
+        "parse_claims_xml",
+        "search_plan_check",
+        "fetch_patent_html",
+        "parse_patent_html",
+        "dedup_families",
+        "verify_batch",
+        "usage_report",
+    ):
+        monkeypatch.setattr(service, name, _explode)
+
+
+def _sample_biblio(**overrides: Any) -> OpsBiblio:
+    """Build a minimal OpsBiblio for the biblio-shaped tests."""
+    fields: dict[str, Any] = {
+        "pub": "US.1.A1",
+        "family_id": "100",
+        "title": "t",
+        "abstract": "a",
+        "applicants": ("Acme",),
+        "inventors": ("Doe",),
+        "ipc": (),
+        "cpc": (),
+        "publication_date": "20200101",
+        "cited_patents": (),
+        "npl_citation_count": 0,
+    }
+    fields.update(overrides)
+    return OpsBiblio(**fields)
+
+
+def _sample_gp_doc(**overrides: Any) -> GPatentDoc:
+    """Build a minimal GPatentDoc for the claims-route tests."""
+    fields: dict[str, Any] = {
+        "pub_number": "US11468338B2",
+        "title": "t",
+        "abstract": "a",
+        "claims": (Claim(number=1, text="1. A widget.", depends_on=()),),
+        "cpc_codes": (),
+        "status_display": "Active",
+        "expiration": "2040-01-01",
+        "priority_date": "",
+        "publication_date": "",
+        "assignee": "Acme",
+        "backward_refs": (),
+        "forward_refs": (),
+        "similar": (),
+        "claims_fallback_text": "",
+    }
+    fields.update(overrides)
+    return GPatentDoc(**fields)
+
+
+# --- require_ops / ops_fulltext_candidate --------------------------------
+
+
+def test_require_ops_returns_the_client_it_is_given() -> None:
+    """A supplied client is handed back unchanged (the caller owns its lifecycle)."""
+    stub = _StubOpsClient()
+
+    assert service.require_ops(stub) is stub
+
+
+def test_require_ops_without_client_raises_config_error() -> None:
+    """A missing client is the "OPS not configured" case, with the shared message."""
+    with pytest.raises(ConfigError) as exc_info:
+        service.require_ops(None)
+
+    assert str(exc_info.value) == service.OPS_NOT_CONFIGURED_MESSAGE
+
+
+@pytest.mark.parametrize(
+    ("pub", "expected"),
+    [("EP1234567A1", True), ("WO2020123456A1", True), ("US11468338B2", False)],
+)
+def test_ops_fulltext_candidate(pub: str, expected: bool) -> None:
+    """Only EP and WO publications have OPS full text to fall back to."""
+    assert service.ops_fulltext_candidate(pub) is expected
+
+
+def test_ops_fulltext_candidate_unparseable_input_raises_value_error() -> None:
+    """An unparseable publication number propagates parse_pubnum's ValueError."""
+    with pytest.raises(ValueError):
+        service.ops_fulltext_candidate("not a pub")
+
+
+# --- search / search-biblio / plan-check ---------------------------------
+
+
+def test_search_returns_page_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """search returns the OpsSearchPage fields plus the raw path as a string."""
+    page = OpsSearchPage(
+        total_count=2,
+        query="ti=drone",
+        begin=1,
+        end=25,
+        hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
+    )
+    monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    stub = _StubOpsClient(search=(b"<xml/>", Path("/tmp/raw.xml")))
+
+    result = service.search("ti=drone", client=stub)
+
+    assert result == {
+        "query": "ti=drone",
+        "total": 2,
+        "begin": 1,
+        "end": 25,
+        "hits": [{"pub": "US.1.A1", "family_id": "100"}],
+        "raw_path": "/tmp/raw.xml",
+    }
+    assert stub.calls == [("search", ("ti=drone",), {"begin": 1, "end": 25})]
+
+
+def test_search_forwards_begin_and_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The paging window is passed through to the client verbatim."""
+    page = OpsSearchPage(total_count=0, query="ti=drone", begin=26, end=50, hits=())
+    monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    stub = _StubOpsClient(search=(b"<xml/>", Path("/tmp/raw.xml")))
+
+    service.search("ti=drone", begin=26, end=50, client=stub)
+
+    assert stub.calls == [("search", ("ti=drone",), {"begin": 26, "end": 50})]
+
+
+def test_search_biblio_returns_docs_and_raw_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """search_biblio returns total/begin/end plus one asdict entry per doc."""
+    biblio = _sample_biblio()
+    monkeypatch.setattr(
+        service,
+        "parse_search_biblio_xml",
+        lambda xml: type(
+            "Page", (), {"total_count": 1, "begin": 1, "end": 25, "docs": (biblio,)}
+        )(),
+    )
+    stub = _StubOpsClient(search_biblio=(b"<xml/>", Path("/tmp/sb.xml")))
+
+    data = _as_json(service.search_biblio("ti=drone", client=stub))
+
+    assert data["total"] == 1
+    assert data["begin"] == 1
+    assert data["end"] == 25
+    assert data["docs"] == [
+        {
+            "pub": "US.1.A1",
+            "family_id": "100",
+            "title": "t",
+            "abstract": "a",
+            "applicants": ["Acme"],
+            "inventors": ["Doe"],
+            "ipc": [],
+            "cpc": [],
+            "publication_date": "20200101",
+            "cited_patents": [],
+            "npl_citation_count": 0,
+        }
+    ]
+    assert data["raw_path"] == "/tmp/sb.xml"
+
+
+def test_plan_check_forwards_client_and_max_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    """plan_check hands the caller's client and max_total to search_plan_check."""
+    captured: dict[str, Any] = {}
+
+    def fake_plan_check(
+        queries: list[str], *, client: Any = None, max_total: int | None = None
+    ) -> dict[str, Any]:
+        captured["queries"] = queries
+        captured["client"] = client
+        captured["max_total"] = max_total
+        return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
+
+    monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
+    stub = _StubOpsClient()
+
+    result = service.plan_check(("ti=drone", "ab=foo"), max_total=100, client=stub)
+
+    assert captured["queries"] == ["ti=drone", "ab=foo"]
+    assert captured["client"] is stub
+    assert captured["max_total"] == 100
+    assert result == {"results": [], "total_sum": 0, "exceeded": False, "max_total": 100}
+
+
+# --- single-document lookups ---------------------------------------------
+
+
+def test_biblio_returns_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """biblio returns the OpsBiblio fields plus the raw path as a string."""
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio(inventors=()))
+    stub = _StubOpsClient(biblio=(b"<xml/>", Path("/tmp/b.xml")))
+
+    data = _as_json(service.biblio("US.1.A1", client=stub))
+
+    assert data["pub"] == "US.1.A1"
+    assert data["applicants"] == ["Acme"]
+    assert data["raw_path"] == "/tmp/b.xml"
+    assert stub.calls == [("biblio", ("US.1.A1",), {})]
+
+
+def test_legal_returns_docdb_pub_and_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """legal keys the result by the DOCDB spelling of the requested publication."""
+    events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
+    stub = _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
+
+    data = _as_json(service.legal("US11468338B2", client=stub))
+
+    assert data == {
+        "pub": "US.11468338.B2",
+        "events": [
+            {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
+        ],
+        "raw_path": "/tmp/l.xml",
+    }
+
+
+def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    """family returns family_id/members/raw_path, with members as a JSON list."""
+    monkeypatch.setattr(
+        service,
+        "parse_family_xml",
+        lambda xml: OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1")),
+    )
+    stub = _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
+
+    result = service.family("US.1.A1", client=stub)
+
+    assert result == {
+        "family_id": "100",
+        "members": ["US.1.A1", "EP.2.A1"],
+        "raw_path": "/tmp/f.xml",
+    }
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(lambda: service.search("ti=drone", client=None), id="search"),
+        pytest.param(lambda: service.search_biblio("ti=drone", client=None), id="search_biblio"),
+        pytest.param(lambda: service.plan_check(["ti=drone"], client=None), id="plan_check"),
+        pytest.param(lambda: service.biblio("US.1.A1", client=None), id="biblio"),
+        pytest.param(lambda: service.legal("US.1.A1", client=None), id="legal"),
+        pytest.param(lambda: service.family("US.1.A1", client=None), id="family"),
+    ],
+)
+@pytest.mark.usefixtures("no_outward_calls")
+def test_ops_functions_without_client_raise_config_error(call: Callable[[], Any]) -> None:
+    """Every OPS-dependent function fails with ConfigError before doing any work."""
+    with pytest.raises(ConfigError) as exc_info:
+        call()
+
+    assert str(exc_info.value) == service.OPS_NOT_CONFIGURED_MESSAGE
+
+
+# --- claims (route selection) --------------------------------------------
+
+
+def test_claims_google_patents_route_without_gp_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no gp_client, fetch_patent_html is called with the pub alone (source='gp')."""
+    page_path = tmp_path / "US11468338B2.html"
+    page_path.write_text("<html></html>", encoding="utf-8")
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_fetch(*args: Any, **kwargs: Any) -> Path:
+        calls.append((args, kwargs))
+        return page_path
+
+    monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
+
+    data = _as_json(service.claims("US11468338B2"))
+
+    assert calls == [(("US11468338B2",), {})]
+    assert data == {
+        "source": "gp",
+        "pub": "US11468338B2",
+        "claims": [{"number": 1, "text": "1. A widget.", "depends_on": []}],
+        "claims_fallback_text": "",
+        "status_display": "Active",
+        "expiration": "2040-01-01",
+        "assignee": "Acme",
+    }
+
+
+def test_claims_passes_a_supplied_gp_client_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A caller-owned httpx.Client is forwarded to fetch_patent_html as client=."""
+    page_path = tmp_path / "US11468338B2.html"
+    page_path.write_text("<html></html>", encoding="utf-8")
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def fake_fetch(*args: Any, **kwargs: Any) -> Path:
+        calls.append((args, kwargs))
+        return page_path
+
+    monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, text="<html></html>"))
+
+    with httpx.Client(transport=transport) as gp_client:
+        result = service.claims("US11468338B2", gp_client=gp_client)
+
+        assert calls == [(("US11468338B2",), {"client": gp_client})]
+
+    assert result["source"] == "gp"
+
+
+def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GP 404 for an EP/WO document, with a client at hand, tries OPS full text."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    monkeypatch.setattr(
+        service,
+        "parse_claims_xml",
+        lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
+    )
+    stub = _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
+
+    data = _as_json(service.claims("EP1234567A1", client=stub))
+
+    assert data == {
+        "source": "ops-fulltext",
+        "pub": "EP1234567A1",
+        "claims": [{"number": 1, "text": "1. Claim text.", "depends_on": []}],
+        "raw_path": "/tmp/c.xml",
+    }
+
+
+def test_claims_gp_unavailable_for_us_never_calls_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A US document has no OPS full text, so the client is left untouched."""
+    unavailable = GPUnavailable(
+        pub="US20240111636A1", status_code=404, retry_after_hint="wait a bit"
+    )
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    monkeypatch.setattr(service, "parse_claims_xml", _explode)
+    stub = _StubOpsClient()
+
+    result = service.claims("US20240111636A1", client=stub)
+
+    assert result == {
+        "unavailable": True,
+        "pub": "US20240111636A1",
+        "retry_after_hint": "wait a bit",
+    }
+    assert stub.calls == []
+
+
+def test_claims_gp_unavailable_for_ep_without_client_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without an OPS client there is no fallback route, so the result is unavailable."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    monkeypatch.setattr(service, "parse_claims_xml", _explode)
+
+    result = service.claims("EP1234567A1")
+
+    assert result == {"unavailable": True, "pub": "EP1234567A1", "retry_after_hint": "wait"}
+
+
+def test_claims_ops_fulltext_404_is_also_reported_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When OPS full text also 404s, the result is still the normal unavailable shape."""
+    unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    not_found = httpx.HTTPStatusError(
+        "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
+    )
+    stub = _StubOpsClient(claims=not_found)
+
+    result = service.claims("WO2020123456A1", client=stub)
+
+    assert result == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+
+
+def test_claims_ops_fulltext_server_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Any OPS error other than 404 is a real failure and reaches the caller."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    server_error = httpx.HTTPStatusError(
+        "500", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(500)
+    )
+    stub = _StubOpsClient(claims=server_error)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        service.claims("EP1234567A1", client=stub)
+
+
+# --- normalize / dedup / verify / usage ----------------------------------
+
+
+def test_normalize_returns_every_spelling() -> None:
+    """normalize returns every spelling of a valid publication number."""
+    assert service.normalize("US.11468338.B2") == {
+        "input": "US.11468338.B2",
+        "country": "US",
+        "number": "11468338",
+        "kind": "B2",
+        "docdb": "US.11468338.B2",
+        "epodoc": "US11468338B2",
+        "google": "US11468338B2",
+    }
+
+
+def test_normalize_unparseable_input_raises_value_error() -> None:
+    """An unparseable publication number propagates parse_pubnum's ValueError."""
+    with pytest.raises(ValueError):
+        service.normalize("not-a-pub")
+
+
+def test_dedup_wraps_families_with_their_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """dedup returns dedup_families()'s list under "families" plus its length."""
+    families = [{"family_id": "1", "members": ["US.1.A1", "EP.2.A1"]}]
+    monkeypatch.setattr(service, "dedup_families", lambda hits: families)
+
+    result = service.dedup([{"pub": "US.1.A1", "family_id": "1"}])
+
+    assert result == {"families": families, "count": 1}
+
+
+def test_verify_returns_verify_batch_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """verify passes both lists to verify_batch and returns its result verbatim."""
+    captured: dict[str, Any] = {}
+    report = {"ok": True, "input_count": 2, "output_count": 2}
+
+    def fake_verify(input_pubs: Any, output_records: Any) -> dict[str, Any]:
+        captured["input_pubs"] = input_pubs
+        captured["output_records"] = output_records
+        return report
+
+    monkeypatch.setattr(service, "verify_batch", fake_verify)
+
+    result = service.verify(["US.1.A1", "EP.2.A1"], ["US.1.A1", "EP.2.A1"])
+
+    assert captured == {
+        "input_pubs": ["US.1.A1", "EP.2.A1"],
+        "output_records": ["US.1.A1", "EP.2.A1"],
+    }
+    assert result is report
+
+
+def test_usage_without_path_calls_usage_report_with_no_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """usage() lets utils.usage_report resolve the default log path itself."""
+    calls: list[tuple[Any, ...]] = []
+    report = {"available": False, "path": "/tmp/headers.jsonl"}
+
+    def fake_usage_report(*args: Any) -> dict[str, Any]:
+        calls.append(args)
+        return report
+
+    monkeypatch.setattr(service, "usage_report", fake_usage_report)
+
+    result = service.usage()
+
+    assert calls == [()]
+    assert result is report
+
+
+def test_usage_with_path_passes_it_positionally(monkeypatch: pytest.MonkeyPatch) -> None:
+    """usage(path) forwards the explicit log path to utils.usage_report."""
+    calls: list[tuple[Any, ...]] = []
+
+    def fake_usage_report(*args: Any) -> dict[str, Any]:
+        calls.append(args)
+        return {"available": False, "path": "/x"}
+
+    monkeypatch.setattr(service, "usage_report", fake_usage_report)
+
+    service.usage(Path("/x"))
+
+    assert calls == [(Path("/x"),)]

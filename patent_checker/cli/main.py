@@ -15,12 +15,14 @@ stderr text; the process exit code encodes the same distinction:
 - ``4``: EPO OPS is not configured (``patent_checker.config.ConfigError``, or
   a command that requires OPS finding :func:`~patent_checker.config.
   ops_configured` false before making any request).
+
+Every subcommand handler is a thin adapter over :mod:`patent_checker.service`,
+which holds the actual logic and is shared with the MCP server.
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -28,25 +30,9 @@ from typing import Any
 
 import httpx
 
-from patent_checker import __version__, consent
+from patent_checker import __version__, consent, service
 from patent_checker.config import ConfigError, ops_configured
-from patent_checker.gp.fetch import GPUnavailable, fetch_patent_html
-from patent_checker.gp.parse import parse_patent_html
 from patent_checker.ops.client import OpsClient
-from patent_checker.ops.parse import (
-    parse_biblio_xml,
-    parse_claims_xml,
-    parse_family_xml,
-    parse_legal_xml,
-    parse_search_biblio_xml,
-    parse_search_xml,
-)
-from patent_checker.pubnum import parse_pubnum
-from patent_checker.utils import dedup_families, search_plan_check, usage_report, verify_batch
-
-# Countries for which EPO OPS carries full-text claims, used by the
-# claims-command fallback route (Google Patents -> OPS full text -> none).
-_OPS_FULLTEXT_COUNTRIES = ("EP", "WO")
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -75,21 +61,19 @@ def _error_result(error_type: str, message: str) -> dict[str, Any]:
     return {"error": {"type": error_type, "message": message}}
 
 
-def _require_ops() -> None:
-    """Raise ConfigError when EPO OPS credentials cannot be resolved.
+def _ops_client() -> OpsClient:
+    """Return a fresh OpsClient for one command run.
 
-    Called at the top of every OPS-dependent handler so the check happens
-    before any request is attempted, per the CLI's ops_not_configured
-    contract.
+    The credential check happens here, before the client is built, so an
+    unconfigured OPS is reported without any request being attempted, per the
+    CLI's ops_not_configured contract.
 
     Raises:
         ConfigError: If OPS is not configured.
     """
     if not ops_configured():
-        raise ConfigError(
-            "EPO OPS credentials are not configured; set PATENT_CHECKER_OPS_KEY and "
-            "PATENT_CHECKER_OPS_SECRET (see .env.example)"
-        )
+        raise ConfigError(service.OPS_NOT_CONFIGURED_MESSAGE)
+    return OpsClient()
 
 
 def _read_json_array(path: str, *, allow_stdin: bool = False) -> list[Any]:
@@ -120,42 +104,23 @@ def _read_query_file(path: str) -> list[str]:
 
 def _cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     """Run a published-data CQL search and return one page of hits."""
-    _require_ops()
-    with OpsClient() as client:
-        xml, raw_path = client.search(args.cql, begin=args.begin, end=args.end)
-    page = parse_search_xml(xml)
-    return {
-        "query": page.query,
-        "total": page.total_count,
-        "begin": page.begin,
-        "end": page.end,
-        "hits": [dataclasses.asdict(hit) for hit in page.hits],
-        "raw_path": str(raw_path),
-    }
+    with _ops_client() as client:
+        return service.search(args.cql, begin=args.begin, end=args.end, client=client)
 
 
 def _cmd_search_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Run a biblio-constituent CQL search and return one page of full biblio records."""
-    _require_ops()
-    with OpsClient() as client:
-        xml, raw_path = client.search_biblio(args.cql, begin=args.begin, end=args.end)
-    page = parse_search_biblio_xml(xml)
-    return {
-        "total": page.total_count,
-        "begin": page.begin,
-        "end": page.end,
-        "docs": [dataclasses.asdict(doc) for doc in page.docs],
-        "raw_path": str(raw_path),
-    }
+    with _ops_client() as client:
+        return service.search_biblio(args.cql, begin=args.begin, end=args.end, client=client)
 
 
 def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
     """Measure the hit count of every candidate query in a search plan."""
-    _require_ops()
     queries = list(args.queries)
     if args.file:
         queries.extend(_read_query_file(args.file))
-    return search_plan_check(queries, max_total=args.max_total)
+    with _ops_client() as client:
+        return service.plan_check(queries, max_total=args.max_total, client=client)
 
 
 # --- single-document lookups --------------------------------------------
@@ -163,12 +128,8 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch bibliographic data for one publication."""
-    _require_ops()
-    with OpsClient() as client:
-        xml, raw_path = client.biblio(args.pub)
-    result = dataclasses.asdict(parse_biblio_xml(xml))
-    result["raw_path"] = str(raw_path)
-    return result
+    with _ops_client() as client:
+        return service.biblio(args.pub, client=client)
 
 
 def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
@@ -177,70 +138,24 @@ def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
     See the module docstring's exit-code note: an unavailable document is a
     normal (exit 0) result, not an error.
     """
-    fetched = fetch_patent_html(args.pub)
-    if isinstance(fetched, Path):
-        doc = parse_patent_html(fetched.read_text(encoding="utf-8"))
-        return {
-            "source": "gp",
-            "pub": doc.pub_number,
-            "claims": [dataclasses.asdict(claim) for claim in doc.claims],
-            "claims_fallback_text": doc.claims_fallback_text,
-            "status_display": doc.status_display,
-            "expiration": doc.expiration,
-            "assignee": doc.assignee,
-        }
-
-    # fetched is a GPUnavailable: try the OPS full-text route for EP/WO before
-    # giving up.
-    assert isinstance(fetched, GPUnavailable)
-    country = parse_pubnum(args.pub).country
-    if country in _OPS_FULLTEXT_COUNTRIES and ops_configured():
+    # An OPS client is only built when the fallback route could actually be
+    # taken; the Google Patents route needs no credentials.
+    if service.ops_fulltext_candidate(args.pub) and ops_configured():
         with OpsClient() as client:
-            try:
-                xml, raw_path = client.claims(args.pub)
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code == httpx.codes.NOT_FOUND:
-                    return _claims_unavailable(fetched)
-                raise
-        return {
-            "source": "ops-fulltext",
-            "pub": args.pub,
-            "claims": [dataclasses.asdict(claim) for claim in parse_claims_xml(xml)],
-            "raw_path": str(raw_path),
-        }
-
-    return _claims_unavailable(fetched)
-
-
-def _claims_unavailable(fetched: GPUnavailable) -> dict[str, Any]:
-    """Build the "claims could not be fetched from any source" result."""
-    return {"unavailable": True, "pub": fetched.pub, "retry_after_hint": fetched.retry_after_hint}
+            return service.claims(args.pub, client=client)
+    return service.claims(args.pub)
 
 
 def _cmd_legal(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication."""
-    _require_ops()
-    with OpsClient() as client:
-        xml, raw_path = client.legal(args.pub)
-    events = parse_legal_xml(xml)
-    return {
-        "pub": parse_pubnum(args.pub).docdb(),
-        "events": [dataclasses.asdict(event) for event in events],
-        "raw_path": str(raw_path),
-    }
+    with _ops_client() as client:
+        return service.legal(args.pub, client=client)
 
 
 def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch the simple patent family of one publication."""
-    _require_ops()
-    with OpsClient() as client:
-        xml, raw_path = client.family(args.pub)
-    family = parse_family_xml(xml)
-    return {
-        "family_id": family.family_id,
-        "members": list(family.members),
-        "raw_path": str(raw_path),
-    }
+    with _ops_client() as client:
+        return service.family(args.pub, client=client)
 
 
 # --- offline helpers -----------------------------------------------------
@@ -248,35 +163,24 @@ def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
     """Parse a publication number and return every spelling used across sources."""
-    parsed = parse_pubnum(args.text)
-    return {
-        "input": args.text,
-        "country": parsed.country,
-        "number": parsed.number,
-        "kind": parsed.kind,
-        "docdb": parsed.docdb(),
-        "epodoc": parsed.epodoc(),
-        "google": parsed.google(),
-    }
+    return service.normalize(args.text)
 
 
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
     """Collapse a list of search hits into one record per patent family."""
-    hits = _read_json_array(args.path, allow_stdin=True)
-    families = dedup_families(hits)
-    return {"families": families, "count": len(families)}
+    return service.dedup(_read_json_array(args.path, allow_stdin=True))
 
 
 def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
     """Cross-check a delegated batch's output against its input publication list."""
     input_pubs = _read_json_array(args.input)
     output_records = _read_json_array(args.output)
-    return verify_batch(input_pubs, output_records)
+    return service.verify(input_pubs, output_records)
 
 
 def _cmd_usage(args: argparse.Namespace) -> dict[str, Any]:
     """Summarize the local OPS request-header log."""
-    return usage_report()
+    return service.usage()
 
 
 # --- consent ---------------------------------------------------------------
