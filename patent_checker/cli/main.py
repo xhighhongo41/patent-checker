@@ -31,6 +31,7 @@ from typing import Any
 import httpx
 
 from patent_checker import __version__, consent, service
+from patent_checker.cache import Cache, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
 
@@ -76,6 +77,11 @@ def _ops_client() -> OpsClient:
     return OpsClient()
 
 
+def _cache() -> Cache:
+    """Return the file cache rooted in this run's data base directory."""
+    return default_cache()
+
+
 def _read_json_array(path: str, *, allow_stdin: bool = False) -> list[Any]:
     """Read *path* (or stdin, when *path* is ``"-"`` and allowed) as a JSON array.
 
@@ -105,13 +111,17 @@ def _read_query_file(path: str) -> list[str]:
 def _cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     """Run a published-data CQL search and return one page of hits."""
     with _ops_client() as client:
-        return service.search(args.cql, begin=args.begin, end=args.end, client=client)
+        return service.search(
+            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+        )
 
 
 def _cmd_search_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Run a biblio-constituent CQL search and return one page of full biblio records."""
     with _ops_client() as client:
-        return service.search_biblio(args.cql, begin=args.begin, end=args.end, client=client)
+        return service.search_biblio(
+            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+        )
 
 
 def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
@@ -129,7 +139,7 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch bibliographic data for one publication."""
     with _ops_client() as client:
-        return service.biblio(args.pub, client=client)
+        return service.biblio(args.pub, client=client, cache=_cache())
 
 
 def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
@@ -142,20 +152,20 @@ def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
     # taken; the Google Patents route needs no credentials.
     if service.ops_fulltext_candidate(args.pub) and ops_configured():
         with OpsClient() as client:
-            return service.claims(args.pub, client=client)
-    return service.claims(args.pub)
+            return service.claims(args.pub, client=client, cache=_cache())
+    return service.claims(args.pub, cache=_cache())
 
 
 def _cmd_legal(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication."""
     with _ops_client() as client:
-        return service.legal(args.pub, client=client)
+        return service.legal(args.pub, client=client, cache=_cache())
 
 
 def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch the simple patent family of one publication."""
     with _ops_client() as client:
-        return service.family(args.pub, client=client)
+        return service.family(args.pub, client=client, cache=_cache())
 
 
 # --- offline helpers -----------------------------------------------------

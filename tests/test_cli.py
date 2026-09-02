@@ -32,6 +32,12 @@ from patent_checker.ops.parse import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI tests hermetic: no file cache reads or writes."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: None)
+
+
 def _invoke(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
     """Run ``main(argv)``, tolerating either a return code or a SystemExit.
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import httpx
 import pytest
 
 from patent_checker import service
+from patent_checker.cache import Cache, pub_key
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
@@ -561,3 +563,193 @@ def test_usage_with_path_passes_it_positionally(monkeypatch: pytest.MonkeyPatch)
     service.usage(Path("/x"))
 
     assert calls == [(Path("/x"),)]
+
+
+# --- cache integration -----------------------------------------------------
+
+
+def test_search_serves_a_second_identical_call_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat search is served from cache; a different end still calls the client."""
+    page = OpsSearchPage(total_count=0, query="ti=drone", begin=1, end=25, hits=())
+    monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    stub = _StubOpsClient(search=(b"<xml/>", Path("/tmp/raw.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.search("ti=drone", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.search("ti=drone", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert second["raw_path"] == "/tmp/raw.xml"
+    assert len(stub.calls) == 1
+
+    service.search("ti=drone", end=50, client=stub, cache=cache)
+    assert len(stub.calls) == 2
+
+
+def test_search_biblio_serves_a_second_identical_call_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat search-biblio call is served from cache without calling the client again."""
+    page = type(
+        "Page", (), {"total_count": 1, "begin": 1, "end": 25, "docs": (_sample_biblio(),)}
+    )()
+    monkeypatch.setattr(service, "parse_search_biblio_xml", lambda xml: page)
+    stub = _StubOpsClient(search_biblio=(b"<xml/>", Path("/tmp/sb.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.search_biblio("ti=drone", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.search_biblio("ti=drone", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert second["raw_path"] == "/tmp/sb.xml"
+    assert len(stub.calls) == 1
+
+
+def test_biblio_serves_a_second_identical_call_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat biblio call is served from cache without calling the client again."""
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio())
+    stub = _StubOpsClient(biblio=(b"<xml/>", Path("/tmp/b.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.biblio("US.1.A1", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.biblio("US.1.A1", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert second["raw_path"] == "/tmp/b.xml"
+    assert len(stub.calls) == 1
+
+
+def test_legal_serves_a_second_call_within_the_same_day_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat legal call on the same day is served from cache."""
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: ())
+    stub = _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.legal("US11468338B2", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.legal("US11468338B2", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert second["raw_path"] == "/tmp/l.xml"
+    assert len(stub.calls) == 1
+
+
+def test_legal_cache_re_fetches_on_the_next_calendar_day(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A legal cache entry from a previous calendar day is not reused."""
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: ())
+    stub = _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
+    clock_value = datetime(2026, 9, 1, 23, 59, 0)
+    cache = Cache(tmp_path, clock=lambda: clock_value)
+
+    service.legal("US11468338B2", client=stub, cache=cache)
+    assert len(stub.calls) == 1
+
+    clock_value = datetime(2026, 9, 2, 0, 1, 0)
+    service.legal("US11468338B2", client=stub, cache=cache)
+    assert len(stub.calls) == 2
+
+
+def test_family_serves_a_second_identical_call_from_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat family call is served from cache without calling the client again."""
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=("US.1.A1",))
+    )
+    stub = _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.family("US.1.A1", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.family("US.1.A1", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert second["raw_path"] == "/tmp/f.xml"
+    assert len(stub.calls) == 1
+
+
+def test_claims_ops_fulltext_success_is_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A repeat OPS full-text claims call is served from cache."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    monkeypatch.setattr(
+        service,
+        "parse_claims_xml",
+        lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
+    )
+    stub = _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.claims("EP1234567A1", client=stub, cache=cache)
+    assert "cached" not in first
+    assert len(stub.calls) == 1
+
+    second = service.claims("EP1234567A1", client=stub, cache=cache)
+    assert second["cached"] is True
+    assert len(stub.calls) == 1
+
+
+def test_claims_unavailable_result_is_never_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A 404-unavailable claims result is not stored, so the client is called again."""
+    unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    not_found = httpx.HTTPStatusError(
+        "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
+    )
+    stub = _StubOpsClient(claims=not_found)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.claims("WO2020123456A1", client=stub, cache=cache)
+    assert first == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert len(stub.calls) == 1
+
+    second = service.claims("WO2020123456A1", client=stub, cache=cache)
+    assert second == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert len(stub.calls) == 2
+
+
+def test_claims_gp_route_result_never_carries_cached(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Google Patents route ignores the cache argument entirely."""
+    page_path = tmp_path / "US11468338B2.html"
+    page_path.write_text("<html></html>", encoding="utf-8")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda *args, **kwargs: page_path)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
+    cache = Cache(tmp_path / "cache", clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    result = service.claims("US11468338B2", cache=cache)
+
+    assert "cached" not in result
+    assert not (tmp_path / "cache").exists()
+
+
+def test_ops_function_config_error_wins_over_a_cache_hit(tmp_path: Path) -> None:
+    """OPS availability is checked before the cache, even with a fresh entry on disk."""
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+    cache.put("biblio", pub_key("US.1.A1"), b"<xml/>", ident="US.1.A1", raw_path=Path("/tmp/b.xml"))
+
+    with pytest.raises(ConfigError) as exc_info:
+        service.biblio("US.1.A1", client=None, cache=cache)
+
+    assert str(exc_info.value) == service.OPS_NOT_CONFIGURED_MESSAGE

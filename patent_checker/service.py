@@ -17,8 +17,11 @@ Exceptions propagate unchanged and are mapped by the caller:
 - ``httpx.HTTPError``: an external API call failed (CLI exit code 3).
 - ``ConfigError``: EPO OPS is not configured (CLI exit code 4).
 
-Response caching will be integrated at this layer in a later task, so both
-front ends pick it up at once.
+A file cache (:mod:`patent_checker.cache`) is integrated at this layer: the
+OPS-backed functions below take an optional ``cache`` keyword argument, and a
+fresh hit is served from disk (adding ``"cached": True`` to the result)
+without calling the client, so both front ends pick up caching without any
+change of their own.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable, fetch_patent_html
 from patent_checker.gp.parse import parse_patent_html
@@ -90,7 +94,14 @@ def ops_fulltext_candidate(pub: str) -> bool:
 # --- search family -----------------------------------------------------
 
 
-def search(cql: str, *, begin: int = 1, end: int = 25, client: OpsClient | None) -> dict[str, Any]:
+def search(
+    cql: str,
+    *,
+    begin: int = 1,
+    end: int = 25,
+    client: OpsClient | None,
+    cache: Cache | None = None,
+) -> dict[str, Any]:
     """Run a published-data CQL search and return one page of hits.
 
     Args:
@@ -98,17 +109,27 @@ def search(cql: str, *, begin: int = 1, end: int = 25, client: OpsClient | None)
         begin: First hit of the requested page (1-based, inclusive).
         end: Last hit of the requested page (inclusive).
         client: Caller-owned OPS client.
+        cache: Optional file cache; a same-day hit is served without calling
+            the client.
 
     Returns:
-        ``{"query", "total", "begin", "end", "hits": [...], "raw_path"}``.
+        ``{"query", "total", "begin", "end", "hits": [...], "raw_path"}``,
+        plus ``"cached": True`` when the result came from *cache*.
 
     Raises:
         ConfigError: If *client* is ``None``.
     """
     client = require_ops(client)
-    xml, raw_path = client.search(cql, begin=begin, end=end)
+    key = search_key(cql, begin, end)
+    cache_hit = cache.get("search", key) if cache is not None else None
+    if cache_hit is not None:
+        xml, raw_path = cache_hit.content, cache_hit.raw_path
+    else:
+        xml, raw_path = client.search(cql, begin=begin, end=end)
+        if cache is not None:
+            cache.put("search", key, xml, ident=cql, raw_path=raw_path)
     page = parse_search_xml(xml)
-    return {
+    result = {
         "query": page.query,
         "total": page.total_count,
         "begin": page.begin,
@@ -116,10 +137,18 @@ def search(cql: str, *, begin: int = 1, end: int = 25, client: OpsClient | None)
         "hits": [dataclasses.asdict(hit) for hit in page.hits],
         "raw_path": str(raw_path),
     }
+    if cache_hit is not None:
+        result["cached"] = True
+    return result
 
 
 def search_biblio(
-    cql: str, *, begin: int = 1, end: int = 25, client: OpsClient | None
+    cql: str,
+    *,
+    begin: int = 1,
+    end: int = 25,
+    client: OpsClient | None,
+    cache: Cache | None = None,
 ) -> dict[str, Any]:
     """Run a biblio-constituent CQL search and return one page of full biblio records.
 
@@ -128,23 +157,36 @@ def search_biblio(
         begin: First hit of the requested page (1-based, inclusive).
         end: Last hit of the requested page (inclusive).
         client: Caller-owned OPS client.
+        cache: Optional file cache; a same-day hit is served without calling
+            the client.
 
     Returns:
-        ``{"total", "begin", "end", "docs": [...], "raw_path"}``.
+        ``{"total", "begin", "end", "docs": [...], "raw_path"}``, plus
+        ``"cached": True`` when the result came from *cache*.
 
     Raises:
         ConfigError: If *client* is ``None``.
     """
     client = require_ops(client)
-    xml, raw_path = client.search_biblio(cql, begin=begin, end=end)
+    key = search_key(cql, begin, end)
+    cache_hit = cache.get("searchbib", key) if cache is not None else None
+    if cache_hit is not None:
+        xml, raw_path = cache_hit.content, cache_hit.raw_path
+    else:
+        xml, raw_path = client.search_biblio(cql, begin=begin, end=end)
+        if cache is not None:
+            cache.put("searchbib", key, xml, ident=cql, raw_path=raw_path)
     page = parse_search_biblio_xml(xml)
-    return {
+    result = {
         "total": page.total_count,
         "begin": page.begin,
         "end": page.end,
         "docs": [dataclasses.asdict(doc) for doc in page.docs],
         "raw_path": str(raw_path),
     }
+    if cache_hit is not None:
+        result["cached"] = True
+    return result
 
 
 def plan_check(
@@ -169,75 +211,117 @@ def plan_check(
 # --- single-document lookups --------------------------------------------
 
 
-def biblio(pub: str, *, client: OpsClient | None) -> dict[str, Any]:
+def biblio(pub: str, *, client: OpsClient | None, cache: Cache | None = None) -> dict[str, Any]:
     """Fetch bibliographic data for one publication.
 
     Args:
         pub: Publication number in any spelling accepted by ``parse_pubnum``.
         client: Caller-owned OPS client.
+        cache: Optional file cache; a hit is served without calling the
+            client (biblio data never expires).
 
     Returns:
-        The ``OpsBiblio`` fields plus ``"raw_path"``.
+        The ``OpsBiblio`` fields plus ``"raw_path"``, plus ``"cached": True``
+        when the result came from *cache*.
 
     Raises:
         ConfigError: If *client* is ``None``.
     """
     client = require_ops(client)
-    xml, raw_path = client.biblio(pub)
+    key = pub_key(pub)
+    cache_hit = cache.get("biblio", key) if cache is not None else None
+    if cache_hit is not None:
+        xml, raw_path = cache_hit.content, cache_hit.raw_path
+    else:
+        xml, raw_path = client.biblio(pub)
+        if cache is not None:
+            cache.put("biblio", key, xml, ident=pub, raw_path=raw_path)
     result = dataclasses.asdict(parse_biblio_xml(xml))
     result["raw_path"] = str(raw_path)
+    if cache_hit is not None:
+        result["cached"] = True
     return result
 
 
-def legal(pub: str, *, client: OpsClient | None) -> dict[str, Any]:
+def legal(pub: str, *, client: OpsClient | None, cache: Cache | None = None) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication.
 
     Args:
         pub: Publication number in any spelling accepted by ``parse_pubnum``.
         client: Caller-owned OPS client.
+        cache: Optional file cache; a same-day hit is served without calling
+            the client.
 
     Returns:
-        ``{"pub" (DOCDB spelling), "events": [...], "raw_path"}``.
+        ``{"pub" (DOCDB spelling), "events": [...], "raw_path"}``, plus
+        ``"cached": True`` when the result came from *cache*.
 
     Raises:
         ConfigError: If *client* is ``None``.
         ValueError: If *pub* is not a parseable publication number.
     """
     client = require_ops(client)
-    xml, raw_path = client.legal(pub)
+    key = pub_key(pub)
+    cache_hit = cache.get("legal", key) if cache is not None else None
+    if cache_hit is not None:
+        xml, raw_path = cache_hit.content, cache_hit.raw_path
+    else:
+        xml, raw_path = client.legal(pub)
+        if cache is not None:
+            cache.put("legal", key, xml, ident=pub, raw_path=raw_path)
     events = parse_legal_xml(xml)
-    return {
-        "pub": parse_pubnum(pub).docdb(),
+    result = {
+        "pub": key,
         "events": [dataclasses.asdict(event) for event in events],
         "raw_path": str(raw_path),
     }
+    if cache_hit is not None:
+        result["cached"] = True
+    return result
 
 
-def family(pub: str, *, client: OpsClient | None) -> dict[str, Any]:
+def family(pub: str, *, client: OpsClient | None, cache: Cache | None = None) -> dict[str, Any]:
     """Fetch the simple patent family of one publication.
 
     Args:
         pub: Publication number in any spelling accepted by ``parse_pubnum``.
         client: Caller-owned OPS client.
+        cache: Optional file cache; a hit is served without calling the
+            client (family data never expires).
 
     Returns:
-        ``{"family_id", "members": [...], "raw_path"}``.
+        ``{"family_id", "members": [...], "raw_path"}``, plus ``"cached":
+        True`` when the result came from *cache*.
 
     Raises:
         ConfigError: If *client* is ``None``.
     """
     client = require_ops(client)
-    xml, raw_path = client.family(pub)
+    key = pub_key(pub)
+    cache_hit = cache.get("family", key) if cache is not None else None
+    if cache_hit is not None:
+        xml, raw_path = cache_hit.content, cache_hit.raw_path
+    else:
+        xml, raw_path = client.family(pub)
+        if cache is not None:
+            cache.put("family", key, xml, ident=pub, raw_path=raw_path)
     result = parse_family_xml(xml)
-    return {
+    out = {
         "family_id": result.family_id,
         "members": list(result.members),
         "raw_path": str(raw_path),
     }
+    if cache_hit is not None:
+        out["cached"] = True
+    return out
 
 
 def claims(
-    pub: str, *, client: OpsClient | None = None, gp_client: httpx.Client | None = None
+    pub: str,
+    *,
+    client: OpsClient | None = None,
+    gp_client: httpx.Client | None = None,
+    cache: Cache | None = None,
 ) -> dict[str, Any]:
     """Fetch claims: Google Patents first, OPS full text as a fallback for EP/WO.
 
@@ -252,9 +336,14 @@ def claims(
             full-text fallback.
         gp_client: Caller-owned HTTP client for Google Patents. A short-lived
             one is created per request when this is ``None``.
+        cache: Optional file cache for the OPS full-text route; a hit is
+            served without calling the client. The Google Patents route has
+            its own cache (:mod:`patent_checker.gp.fetch`) and ignores this
+            argument, and an "unavailable" result is never cached.
 
     Returns:
-        ``{"source": "gp", ...}``, ``{"source": "ops-fulltext", ...}``, or
+        ``{"source": "gp", ...}``, ``{"source": "ops-fulltext", ...}`` (plus
+        ``"cached": True`` when it came from *cache*), or
         ``{"unavailable": True, "pub", "retry_after_hint"}``.
 
     Raises:
@@ -285,18 +374,28 @@ def claims(
     # giving up.
     assert isinstance(fetched, GPUnavailable)
     if ops_fulltext_candidate(pub) and client is not None:
-        try:
-            xml, raw_path = client.claims(pub)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == httpx.codes.NOT_FOUND:
-                return _claims_unavailable(fetched)
-            raise
-        return {
+        key = pub_key(pub)
+        cache_hit = cache.get("claims", key) if cache is not None else None
+        if cache_hit is not None:
+            xml, raw_path = cache_hit.content, cache_hit.raw_path
+        else:
+            try:
+                xml, raw_path = client.claims(pub)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == httpx.codes.NOT_FOUND:
+                    return _claims_unavailable(fetched)
+                raise
+            if cache is not None:
+                cache.put("claims", key, xml, ident=pub, raw_path=raw_path)
+        result = {
             "source": "ops-fulltext",
             "pub": pub,
             "claims": [dataclasses.asdict(claim) for claim in parse_claims_xml(xml)],
             "raw_path": str(raw_path),
         }
+        if cache_hit is not None:
+            result["cached"] = True
+        return result
 
     return _claims_unavailable(fetched)
 
