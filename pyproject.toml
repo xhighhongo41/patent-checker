@@ -1,9 +1,15 @@
 [project]
 name = "patent-checker"
-version = "0.2.0"
+version = "0.3.0"
 description = "Patent prior-art exploration toolkit: core library and CLI"
 requires-python = ">=3.12"
-dependencies = ["httpx", "beautifulsoup4", "lxml", "python-dotenv"]
+dependencies = [
+    "httpx",
+    "beautifulsoup4",
+    "lxml",
+    "python-dotenv",
+    "fastmcp>=4.0.1,<5",
+]
 
 [project.scripts]
 patent-checker = "patent_checker.cli.main:main"

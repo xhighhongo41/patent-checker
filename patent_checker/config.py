@@ -11,6 +11,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# The only upstream hosts patent-checker is allowed to contact. Enforced by
+# ``patent_checker.net.AllowlistTransport`` before any connection is made.
+ALLOWED_HOSTS: frozenset[str] = frozenset({"ops.epo.org", "patents.google.com"})
+
+# Process-wide override for the data base directory, set by the MCP server to
+# select a per-user data directory when ``PATENT_CHECKER_DATA_DIR`` is unset.
+_data_base_override: Path | None = None
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or ambiguous."""
@@ -21,14 +29,59 @@ def load_env() -> None:
     load_dotenv()
 
 
+def set_data_base(path: Path | None) -> None:
+    """Set or clear the process-wide data base directory override.
+
+    Args:
+        path: The directory to use as the data base, or ``None`` to clear a
+            previously set override and fall back to the default resolution.
+    """
+    global _data_base_override
+    _data_base_override = path
+
+
+def data_base() -> Path:
+    """Resolve the data base directory without creating it.
+
+    Resolution order: ``$PATENT_CHECKER_DATA_DIR`` if set and non-empty, then
+    the override set via :func:`set_data_base`, then ``<cwd>/.patent-checker``.
+    """
+    env_value = os.environ.get("PATENT_CHECKER_DATA_DIR")
+    if env_value:
+        return Path(env_value)
+    if _data_base_override is not None:
+        return _data_base_override
+    return Path.cwd() / ".patent-checker"
+
+
+def user_data_dir() -> Path:
+    """Return the per-user data directory for patent-checker, without creating it.
+
+    On Windows, this is ``%LOCALAPPDATA%/patent-checker`` (falling back to
+    ``~/AppData/Local/patent-checker`` if unset). On other platforms, this is
+    ``$XDG_DATA_HOME/patent-checker`` (falling back to
+    ``~/.local/share/patent-checker`` if unset).
+    """
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    else:
+        xdg_data_home = os.environ.get("XDG_DATA_HOME")
+        base = Path(xdg_data_home) if xdg_data_home else Path.home() / ".local" / "share"
+    # Built as a single ``Path(...)`` call (rather than ``base / "patent-checker"``)
+    # so this also works when ``os.name`` is monkeypatched in tests: joining an
+    # already-resolved concrete path with ``/`` re-dispatches on the concrete
+    # subclass, which CPython refuses to instantiate for the "wrong" platform.
+    return Path(base, "patent-checker")
+
+
 def data_dir(source: str) -> Path:
     """Return the raw-data directory for ``source`` (e.g. ``ops``), creating it.
 
-    The base directory is ``$PATENT_CHECKER_DATA_DIR`` if set, otherwise
-    ``<cwd>/.patent-checker``. The returned path is ``<base>/raw/<source>``.
+    The base directory is resolved by :func:`data_base`. The returned path is
+    ``<base>/raw/<source>``.
     """
-    base = Path(os.environ.get("PATENT_CHECKER_DATA_DIR") or (Path.cwd() / ".patent-checker"))
-    path = base / "raw" / source
+    path = data_base() / "raw" / source
     path.mkdir(parents=True, exist_ok=True)
     return path
 
