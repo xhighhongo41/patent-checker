@@ -22,15 +22,18 @@ _ENV_VARS = (
 
 @pytest.fixture(autouse=True)
 def _clean_environment(monkeypatch, tmp_path):
-    """Clear every server-settings env var and isolate cwd from the repo's own ``.env``.
+    """Clear every server-settings env var and keep the repo's own ``.env`` out.
 
-    The repository's ``.env`` (if any) holds real secrets; ``load_env()``
-    reads ``.env`` from the current directory, so tests must run from an
-    empty ``tmp_path`` to avoid leaking those secrets into test state.
+    The repository's ``.env`` (if any) holds real secrets and may carry the
+    server variables; python-dotenv searches for it upward from the package
+    directory, not from the current directory, so ``chdir`` alone is not
+    enough. ``load_dotenv`` is replaced by a no-op (``load_env`` itself is
+    still called, which one test asserts).
     """
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
 
 
 def _consent(monkeypatch, value: str = "1") -> None:
