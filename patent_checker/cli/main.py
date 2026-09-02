@@ -1,20 +1,25 @@
 """Command-line entry point for patent-checker.
 
 Every subcommand prints one JSON object to stdout (``json.dumps(...,
-ensure_ascii=False, indent=2)``); ``consent show`` is the only exception, as
-it prints the raw notice Markdown so it can be shown to a human as-is. Errors
-are reported the same way, as ``{"error": {"type": str, "message": str}}``,
-so a calling Skill/agent can branch on the JSON alone rather than parsing
-stderr text; the process exit code encodes the same distinction:
+ensure_ascii=False, indent=2)``); two subcommands are exceptions: like
+``consent show``, ``serve --show-operator-notice`` prints the raw notice
+Markdown so it can be shown to a human as-is, and ``serve`` on success prints
+nothing to stdout at all -- its startup banner goes to stderr (stdout is the
+protocol channel of the stdio transport) and it then blocks serving until the
+process is stopped. Errors are reported the same way, as
+``{"error": {"type": str, "message": str}}``, so a calling Skill/agent can
+branch on the JSON alone rather than parsing stderr text; the process exit
+code encodes the same distinction:
 
 - ``0``: success (this includes ``claims`` reporting a document as
   unavailable -- "could not be fetched" is itself a valid, non-error result).
 - ``2``: invalid input (a ``ValueError``, including a malformed argument
   argparse itself rejects).
 - ``3``: an external API call failed (``httpx.HTTPError``).
-- ``4``: EPO OPS is not configured (``patent_checker.config.ConfigError``, or
-  a command that requires OPS finding :func:`~patent_checker.config.
-  ops_configured` false before making any request).
+- ``4``: configuration is missing or invalid (``patent_checker.config.
+  ConfigError``): EPO OPS credentials for an OPS-backed command (error type
+  ``ops_not_configured``), or MCP server settings for ``serve`` (error type
+  ``config_error``).
 
 Every subcommand handler is a thin adapter over :mod:`patent_checker.service`,
 which holds the actual logic and is shared with the MCP server.
@@ -193,6 +198,38 @@ def _cmd_usage(args: argparse.Namespace) -> dict[str, Any]:
     return service.usage()
 
 
+# --- serve -----------------------------------------------------------------
+
+
+def _cmd_serve(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Print the operator notice, or run the MCP server until stopped.
+
+    The server modules are imported here rather than at module load time, so
+    a failure to import FastMCP or any other server-only dependency cannot
+    affect the other subcommands.
+    """
+    from patent_checker.server import app as server_app
+    from patent_checker.server import settings as server_settings
+
+    if args.show_operator_notice:
+        lang, text = server_settings.operator_notice_text(args.lang)
+        if lang != args.lang:
+            print(f"note: falling back to {lang}", file=sys.stderr)
+        print(text)
+        return None
+
+    try:
+        settings = server_settings.load_settings(
+            transport=args.transport, host=args.host, port=args.port
+        )
+    except ConfigError as exc:
+        _print_json(_error_result("config_error", str(exc)))
+        raise SystemExit(4) from exc
+
+    server_app.run(settings)
+    return None
+
+
 # --- consent ---------------------------------------------------------------
 
 
@@ -293,6 +330,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
     usage_parser = subparsers.add_parser("usage", help="Summarize the local OPS request-header log")
     usage_parser.set_defaults(handler=_cmd_usage)
+
+    serve_parser = subparsers.add_parser("serve", help="Run the MCP server")
+    serve_parser.add_argument("--transport", choices=("http", "stdio"), default="http")
+    serve_parser.add_argument("--host", default=None, help="Bind host (http only)")
+    serve_parser.add_argument("--port", type=int, default=None, help="Bind port (http only)")
+    serve_parser.add_argument(
+        "--show-operator-notice",
+        action="store_true",
+        help="Print the operator notice and exit, instead of starting the server",
+    )
+    serve_parser.add_argument("--lang", default="en", help="Language of the operator notice")
+    serve_parser.set_defaults(handler=_cmd_serve)
 
     _add_consent_parser(subparsers)
 

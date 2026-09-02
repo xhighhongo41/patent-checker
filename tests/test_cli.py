@@ -18,8 +18,11 @@ from typing import Any
 import httpx
 import pytest
 
+import patent_checker.server.app as server_app
+import patent_checker.server.settings as server_settings
 from patent_checker import consent, service
 from patent_checker.cli import main as cli_main
+from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
@@ -575,6 +578,132 @@ def test_consent_without_subcommand_is_invalid_input(capsys: pytest.CaptureFixtu
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- serve ------------------------------------------------------------
+
+
+def test_serve_show_operator_notice_prints_english_by_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """serve --show-operator-notice prints the English notice text and exits 0."""
+    _, expected_text = server_settings.operator_notice_text("en")
+
+    rc = cli_main.main(["serve", "--show-operator-notice"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == expected_text + "\n"
+
+
+def test_serve_show_operator_notice_lang_ja(capsys: pytest.CaptureFixture[str]) -> None:
+    """serve --show-operator-notice --lang ja prints the Japanese notice text."""
+    _, expected_text = server_settings.operator_notice_text("ja")
+
+    rc = cli_main.main(["serve", "--show-operator-notice", "--lang", "ja"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == expected_text + "\n"
+
+
+def test_serve_show_operator_notice_unsupported_lang_falls_back_to_en(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unsupported --lang falls back to English and notes it on stderr."""
+    _, expected_text = server_settings.operator_notice_text("en")
+
+    rc = cli_main.main(["serve", "--show-operator-notice", "--lang", "xx"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == expected_text + "\n"
+    assert "note: falling back to en" in captured.err
+
+
+def test_serve_show_operator_notice_never_calls_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--show-operator-notice never resolves settings or starts the server."""
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc = cli_main.main(["serve", "--show-operator-notice"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert run_calls == []
+
+
+def test_serve_defaults_call_load_settings_and_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """serve with no flags resolves settings with the default transport/host/port."""
+    captured_kwargs: dict[str, Any] = {}
+    sentinel_settings = object()
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        captured_kwargs.update(transport=transport, host=host, port=port)
+        return sentinel_settings
+
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc = cli_main.main(["serve"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == ""
+    assert captured_kwargs == {"transport": "http", "host": None, "port": None}
+    assert run_calls == [sentinel_settings]
+
+
+def test_serve_passes_transport_host_port_through(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """serve --transport/--host/--port pass their values to load_settings."""
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        captured_kwargs.update(transport=transport, host=host, port=port)
+        return object()
+
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: None)
+
+    rc = cli_main.main(["serve", "--transport", "stdio", "--host", "0.0.0.0", "--port", "9000"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert captured_kwargs == {"transport": "stdio", "host": "0.0.0.0", "port": 9000}
+
+
+def test_serve_config_error_is_reported_as_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ConfigError from load_settings is reported as config_error, exit code 4."""
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        raise ConfigError("boom")
+
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc, data = _invoke(["serve"], capsys)
+
+    assert rc == 4
+    assert data == {"error": {"type": "config_error", "message": "boom"}}
+    assert run_calls == []
+
+
+def test_serve_invalid_transport_is_invalid_input(capsys: pytest.CaptureFixture[str]) -> None:
+    """An unsupported --transport value is rejected by argparse itself, exit code 2."""
+    rc, data = _invoke(["serve", "--transport", "tcp"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
 # --- general CLI behavior -------------------------------------------------
 
 
@@ -598,6 +727,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "verify",
         "usage",
         "consent",
+        "serve",
     ):
         assert name in out
 
