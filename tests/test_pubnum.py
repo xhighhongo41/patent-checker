@@ -12,7 +12,9 @@ from patent_checker.pubnum import PubNumber, parse_pubnum
 VALID_CASES = [
     ("US.11468338.B2", "US", "11468338", "B2"),  # docdb spelling
     ("US11468338B2", "US", "11468338", "B2"),  # epodoc / Google spelling
-    ("US20200104750A1", "US", "20200104750", "A1"),  # published application
+    # Published application, pre-2026: parse_pubnum shrinks the Google-style
+    # 11-digit number back to the 10-digit docdb form.
+    ("US20200104750A1", "US", "2020104750", "A1"),
     ("US.11468338", "US", "11468338", ""),  # docdb, no kind
     ("US11468338", "US", "11468338", ""),  # epodoc, no kind
     ("JP2006187606A", "JP", "2006187606", "A"),  # single-letter kind
@@ -172,12 +174,94 @@ def test_google_does_not_pad_non_year_looking_ten_digit_number() -> None:
     assert pubnum.google() == "US1234567890A1"
 
 
-def test_docdb_roundtrip_keeps_google_style_eleven_digit_number() -> None:
-    """Parsing a Google-style 11-digit number keeps 11 digits in docdb().
+def test_docdb_roundtrip_shrinks_pre_2026_google_style_number() -> None:
+    """Parsing a pre-2026 Google-style 11-digit number shrinks it back to 10 digits.
 
-    This is the documented, one-directional asymmetry: parse_pubnum does not
-    shrink an 11-digit Google Patents number back down to the 10-digit
-    docdb form.
+    DOCDB spells US A-kind publications with 10 digits through 2025, so
+    parse_pubnum removes the "0" Google Patents inserts after the year,
+    restoring the 10-digit docdb form.
     """
     result = parse_pubnum("US20240111636A1")
-    assert result.docdb() == "US.20240111636.A1"
+    assert result.docdb() == "US.2024111636.A1"
+
+
+# (Google-style input, expected docdb spelling)
+# DOCDB spells US A-kind publications with 10 digits through 2025 and 11
+# digits from 2026 (verified against EPO OPS, 2026-09), so parse_pubnum's
+# 11-to-10-digit shrink only applies to years before 2026.
+US_APPLICATION_YEAR_ROUNDTRIP_CASES = [
+    ("US20070016547A1", "US.2007016547.A1", "US2007016547A1", "US20070016547A1"),
+    ("US20260024003A1", "US.20260024003.A1", "US20260024003A1", "US20260024003A1"),
+    ("US20250000001A1", "US.2025000001.A1", "US2025000001A1", "US20250000001A1"),
+    ("US20260000001A1", "US.20260000001.A1", "US20260000001A1", "US20260000001A1"),
+]
+
+
+@pytest.mark.parametrize(("text", "docdb", "epodoc", "google"), US_APPLICATION_YEAR_ROUNDTRIP_CASES)
+def test_parse_pubnum_shrinks_us_application_number_by_year(
+    text: str, docdb: str, epodoc: str, google: str
+) -> None:
+    """parse_pubnum shrinks 11-digit US A-kind numbers only for years before 2026."""
+    result = parse_pubnum(text)
+    assert result.docdb() == docdb
+    assert result.epodoc() == epodoc
+    assert result.google() == google
+
+
+def test_parse_pubnum_roundtrips_through_google_for_pre_2026_us_application() -> None:
+    """Feeding google()'s output back through parse_pubnum restores the docdb form."""
+    original = parse_pubnum("US.2025131256.A1")
+    roundtripped = parse_pubnum(original.google())
+    assert roundtripped.docdb() == original.docdb()
+
+
+# (input text, expected docdb spelling)
+# Each case fails exactly one of the conditions required to shrink an
+# 11-digit US number, so the number is passed through unchanged.
+US_APPLICATION_SHRINK_SKIPPED_CASES = [
+    ("US20260024003B2", "US.20260024003.B2"),  # kind is B-series, not A-series
+    ("US20070016547", "US.20070016547"),  # no kind at all
+    ("CN20070016547A", "CN.20070016547.A"),  # non-US office
+    ("US20071016547A1", "US.20071016547.A1"),  # 5th digit is not "0"
+    ("US18070016547A1", "US.18070016547.A1"),  # leading two digits not "19"/"20"
+    ("US.202418774328.A", "US.202418774328.A"),  # 12 digits, not 11
+]
+
+
+@pytest.mark.parametrize(("text", "docdb"), US_APPLICATION_SHRINK_SKIPPED_CASES)
+def test_parse_pubnum_does_not_shrink_when_a_condition_is_not_met(text: str, docdb: str) -> None:
+    """parse_pubnum leaves the number untouched unless every shrink condition holds."""
+    result = parse_pubnum(text)
+    assert result.docdb() == docdb
+
+
+# (input text, expected docdb spelling)
+# The USPTO citation style splits the digit run with a single "/"; parse_pubnum
+# accepts it and strips the slash before applying the year-based normalization.
+SLASH_FORM_VALID_CASES = [
+    ("US 2007/0016547 A1", "US.2007016547.A1"),
+    ("US2007/0016547A1", "US.2007016547.A1"),
+    ("US 2026/0024003 A1", "US.20260024003.A1"),
+]
+
+
+@pytest.mark.parametrize(("text", "docdb"), SLASH_FORM_VALID_CASES)
+def test_parse_pubnum_accepts_single_slash_in_digit_run(text: str, docdb: str) -> None:
+    """parse_pubnum accepts the USPTO citation style with one "/" in the digits."""
+    result = parse_pubnum(text)
+    assert result.docdb() == docdb
+
+
+SLASH_FORM_INVALID_CASES = [
+    "US 2007/0016/547 A1",  # two slashes
+    "US /20070016547 A1",  # leading slash
+    "US 20070016547/ A1",  # trailing slash
+    "US//20070016547A1",  # doubled slash right after country
+]
+
+
+@pytest.mark.parametrize("text", SLASH_FORM_INVALID_CASES)
+def test_parse_pubnum_rejects_malformed_slash_forms(text: str) -> None:
+    """More than one slash, or a slash with nothing on one side, still raises."""
+    with pytest.raises(ValueError):
+        parse_pubnum(text)
