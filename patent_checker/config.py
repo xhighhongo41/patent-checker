@@ -7,6 +7,9 @@ where raw API responses are stored.
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Collection
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -14,6 +17,13 @@ from dotenv import load_dotenv
 # The only upstream hosts patent-checker is allowed to contact. Enforced by
 # ``patent_checker.net.AllowlistTransport`` before any connection is made.
 ALLOWED_HOSTS: frozenset[str] = frozenset({"ops.epo.org", "patents.google.com"})
+
+ENV_CACHE_DIR = "PATENT_CHECKER_CACHE_DIR"
+ENV_CACHE_TTL = "PATENT_CHECKER_CACHE_TTL"
+
+# Matches ``<n>d`` / ``<n>h`` TTL spellings; ``"0"`` (no expiry) is handled
+# separately in :func:`parse_ttl` since it takes no unit suffix.
+_TTL_PATTERN = re.compile(r"^(\d+)([dh])$")
 
 # Process-wide override for the data base directory, set by the MCP server to
 # select a per-user data directory when ``PATENT_CHECKER_DATA_DIR`` is unset.
@@ -84,6 +94,112 @@ def data_dir(source: str) -> Path:
     path = data_base() / "raw" / source
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def cache_base() -> Path:
+    """Resolve the shared cache root without creating it.
+
+    Resolution order:
+
+    1. ``$PATENT_CHECKER_CACHE_DIR`` if set and non-empty.
+    2. ``<data_base()>/cache`` if the data base directory has been
+       explicitly selected, i.e. ``$PATENT_CHECKER_DATA_DIR`` is set and
+       non-empty, or an override was installed via :func:`set_data_base`.
+       This keeps everything under one directory when a data directory is
+       explicitly requested (as the MCP server does at startup to publish
+       its own data directory), matching the pre-v0.4 behaviour.
+    3. ``<user_data_dir()>/cache`` otherwise, so that by default the CLI and
+       the MCP server share one cache location for the current user.
+    """
+    env_value = os.environ.get(ENV_CACHE_DIR)
+    if env_value:
+        return Path(env_value)
+    data_base_is_explicit = (
+        bool(os.environ.get("PATENT_CHECKER_DATA_DIR")) or _data_base_override is not None
+    )
+    if data_base_is_explicit:
+        return data_base() / "cache"
+    return user_data_dir() / "cache"
+
+
+def parse_ttl(text: str) -> timedelta | None:
+    """Parse one time-to-live spelling.
+
+    Accepts ``"0"`` (no expiry, returns ``None``), ``"<n>d"`` (n days), or
+    ``"<n>h"`` (n hours), where ``n`` is a positive integer (leading zeros
+    are allowed). Surrounding whitespace is stripped before parsing.
+
+    Args:
+        text: The TTL spelling to parse.
+
+    Raises:
+        ConfigError: If ``text`` does not match one of the accepted formats.
+    """
+    stripped = text.strip()
+    if stripped == "0":
+        return None
+    match = _TTL_PATTERN.match(stripped)
+    if match:
+        amount = int(match.group(1))
+        if amount > 0:
+            return timedelta(days=amount) if match.group(2) == "d" else timedelta(hours=amount)
+    raise ConfigError(f"invalid TTL {text!r}; expected one of: 0, <n>d, <n>h")
+
+
+def cache_ttl_overrides(valid_kinds: Collection[str]) -> dict[str, timedelta | None]:
+    """Return the per-kind TTL overrides from ``$PATENT_CHECKER_CACHE_TTL``.
+
+    The environment variable holds a comma-separated list of
+    ``<kind>=<ttl>`` entries (see :func:`parse_ttl` for the accepted ``ttl``
+    spellings). Surrounding whitespace around kinds, TTLs, and whole entries
+    is ignored.
+
+    Args:
+        valid_kinds: The cache kinds that may be overridden.
+
+    Raises:
+        ConfigError: If an entry is malformed, names a kind not in
+            ``valid_kinds``, names the same kind more than once, or has an
+            invalid TTL.
+    """
+    raw = os.environ.get(ENV_CACHE_TTL, "")
+    if not raw.strip():
+        return {}
+
+    overrides: dict[str, timedelta | None] = {}
+    for entry in raw.split(","):
+        stripped_entry = entry.strip()
+        if not stripped_entry or "=" not in stripped_entry:
+            raise ConfigError(
+                f"invalid entry {stripped_entry!r} in {ENV_CACHE_TTL}; "
+                "expected comma-separated <kind>=<ttl> pairs"
+            )
+        kind_part, _, ttl_part = stripped_entry.partition("=")
+        if "=" in ttl_part:
+            raise ConfigError(
+                f"invalid entry {stripped_entry!r} in {ENV_CACHE_TTL}; "
+                "expected comma-separated <kind>=<ttl> pairs"
+            )
+        kind = kind_part.strip()
+        if not kind:
+            raise ConfigError(
+                f"invalid entry {stripped_entry!r} in {ENV_CACHE_TTL}; kind must not be empty"
+            )
+        if kind not in valid_kinds:
+            raise ConfigError(
+                f"unknown cache kind {kind!r} in {ENV_CACHE_TTL}; "
+                f"valid kinds are: {', '.join(sorted(valid_kinds))}"
+            )
+        if kind in overrides:
+            raise ConfigError(f"duplicate cache kind {kind!r} in {ENV_CACHE_TTL}")
+        try:
+            overrides[kind] = parse_ttl(ttl_part.strip())
+        except ConfigError as exc:
+            raise ConfigError(
+                f"invalid TTL for entry {stripped_entry!r} in {ENV_CACHE_TTL}: {exc}"
+            ) from exc
+
+    return overrides
 
 
 def _resolve_secret(name: str) -> str:
