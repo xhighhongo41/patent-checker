@@ -238,6 +238,32 @@ def test_verify_batch_dict_output_record_without_pub_key_raises_key_error() -> N
         verify_batch(["US.1.A1"], [{"not_pub": "US.1.A1"}])
 
 
+def test_verify_batch_treats_google_and_docdb_spellings_of_us_application_as_same() -> None:
+    """Regression test fixing a v0.4 defect ahead of the implementation (T2).
+
+    Google Patents spells a US published application with an 11-digit
+    number (year + 7-digit serial) while docdb spells the same publication
+    with a 10-digit number (year + 6-digit serial); verify_batch must treat
+    them as the same publication instead of reporting a false mismatch.
+    """
+    result = verify_batch(["US.2007016547.A1"], ["US20070016547A1"])
+    assert result["ok"] is True
+    assert result["missing"] == []
+    assert result["unexpected"] == []
+
+
+def test_verify_batch_keeps_eleven_digit_spelling_for_us_applications_from_2026() -> None:
+    """Guard test: both spellings already use 11 digits from 2026 onward.
+
+    docdb assigned 11-digit serials to US published applications starting in
+    2026, so both sides already spell the number the same way; this must
+    stay green even after the T2 fix normalizes the 10-digit vs. 11-digit
+    case above, so a future fix cannot regress this already-matching case.
+    """
+    result = verify_batch(["US.20260024003.A1"], ["US20260024003A1"])
+    assert result["ok"] is True
+
+
 # --- search_plan_check -----------------------------------------------------
 
 

@@ -23,6 +23,7 @@ from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
+from patent_checker.ops.client import OpsClient
 from patent_checker.ops.parse import (
     OpsBiblio,
     OpsFamily,
@@ -30,6 +31,18 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
+
+FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+
+_TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
+
+
+def _load_fixture(name: str) -> bytes:
+    """Return the raw bytes of a saved OPS fixture, skipping if unavailable."""
+    path = FIXTURE_DIR / name
+    if not path.exists():
+        pytest.skip(f"fixture not available: {path}")
+    return path.read_bytes()
 
 
 class _StubOpsClient:
@@ -753,3 +766,41 @@ def test_ops_function_config_error_wins_over_a_cache_hit(tmp_path: Path) -> None
         service.biblio("US.1.A1", client=None, cache=cache)
 
     assert str(exc_info.value) == service.OPS_NOT_CONFIGURED_MESSAGE
+
+
+@pytest.mark.xfail(strict=True, reason="pending v0.4 T5")
+def test_biblio_persists_exactly_one_body_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Regression test fixing a v0.4 defect ahead of the implementation (T5).
+
+    A single service.biblio() call currently writes the response body
+    twice: once under raw/ops/ (OpsClient's observation-first capture) and
+    once more under the cache; only one copy of the body should be kept on
+    disk.
+    """
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "dummy-key")
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "dummy-secret")
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path))
+    fixture = _load_fixture("20260827-001754_biblio_US.11468338.B2.xml")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/accesstoken"):
+            return httpx.Response(200, json=_TOKEN_JSON)
+        return httpx.Response(200, content=fixture)
+
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with OpsClient(transport=httpx.MockTransport(handler)) as client:
+        service.biblio("US.11468338.B2", client=client, cache=cache)
+
+    body_files = [
+        path
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+        and path.suffix == ".xml"
+        and not path.name.endswith(".meta.json")
+        and not path.name.endswith(".tmp")
+        and path.name != "headers.jsonl"
+    ]
+    assert len(body_files) == 1

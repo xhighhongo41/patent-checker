@@ -224,6 +224,25 @@ def test_put_twice_overwrites_the_entry(tmp_path: Path) -> None:
     assert hit.raw_path == "/tmp/new.xml"
 
 
+@pytest.mark.xfail(strict=True, reason="pending v0.4 T4")
+def test_get_rejects_truncated_content_when_sidecar_is_intact(tmp_path: Path) -> None:
+    """Regression test fixing a v0.4 defect ahead of the implementation (T4).
+
+    If the content file is truncated after a successful put() (e.g. a
+    process killed mid-write on a later overwrite), get() must not serve
+    the partial body back as a hit even though the sidecar is intact.
+    """
+    cache = Cache(tmp_path / "cache")
+    content = b"<xml>" + b"a" * 500 + b"</xml>"
+    content_path = cache.put(
+        "biblio", "EP.1.A1", content, ident="EP1A1", raw_path=Path("/tmp/raw.xml")
+    )
+
+    content_path.write_bytes(content[: len(content) // 2])
+
+    assert cache.get("biblio", "EP.1.A1") is None
+
+
 # --- default_cache -------------------------------------------------------
 
 
