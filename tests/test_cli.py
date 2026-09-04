@@ -18,8 +18,11 @@ from typing import Any
 import httpx
 import pytest
 
-from patent_checker import consent
+import patent_checker.server.app as server_app
+import patent_checker.server.settings as server_settings
+from patent_checker import consent, service
 from patent_checker.cli import main as cli_main
+from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
@@ -30,6 +33,12 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI tests hermetic: no file cache reads or writes."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: None)
 
 
 def _invoke(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
@@ -89,7 +98,7 @@ def test_search_success(
         end=25,
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
-    monkeypatch.setattr(cli_main, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
 
     rc, data = _invoke(["search", "ti=drone"], capsys)
 
@@ -158,7 +167,7 @@ def test_search_biblio_success(
         npl_citation_count=0,
     )
     monkeypatch.setattr(
-        cli_main,
+        service,
         "parse_search_biblio_xml",
         lambda xml: type(
             "Page", (), {"total_count": 1, "begin": 1, "end": 25, "docs": (biblio,)}
@@ -197,11 +206,14 @@ def test_plan_check_reads_queries_from_positional_args_and_file(
 
     captured: dict[str, Any] = {}
 
-    def fake_plan_check(queries: list[str], *, max_total: int | None = None) -> dict[str, Any]:
+    def fake_plan_check(
+        queries: list[str], *, client: Any = None, max_total: int | None = None
+    ) -> dict[str, Any]:
         captured["queries"] = queries
         return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
 
-    monkeypatch.setattr(cli_main, "search_plan_check", fake_plan_check)
+    monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient())
 
     rc, data = _invoke(
         ["plan-check", "extra=1", "--file", str(query_file), "--max-total", "100"], capsys
@@ -236,7 +248,7 @@ def test_biblio_success(
         cited_patents=(),
         npl_citation_count=0,
     )
-    monkeypatch.setattr(cli_main, "parse_biblio_xml", lambda xml: biblio)
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: biblio)
 
     rc, data = _invoke(["biblio", "US.1.A1"], capsys)
 
@@ -253,7 +265,7 @@ def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
         cli_main, "OpsClient", lambda: _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
     )
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
-    monkeypatch.setattr(cli_main, "parse_legal_xml", lambda xml: events)
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
 
     rc, data = _invoke(["legal", "US.1.A1"], capsys)
 
@@ -274,7 +286,7 @@ def test_family_success(
         cli_main, "OpsClient", lambda: _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
     )
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
-    monkeypatch.setattr(cli_main, "parse_family_xml", lambda xml: family)
+    monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
@@ -313,8 +325,8 @@ def test_claims_google_patents_route(
     """When Google Patents has the page, claims is read from it (source='gp')."""
     page_path = tmp_path / "US11468338B2.html"
     page_path.write_text("<html></html>", encoding="utf-8")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: page_path)
-    monkeypatch.setattr(cli_main, "parse_patent_html", lambda html: _sample_gp_doc())
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: page_path)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
     rc, data = _invoke(["claims", "US11468338B2"], capsys)
 
@@ -332,13 +344,13 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
 ) -> None:
     """A GP 404 for an EP/WO document, with OPS configured, tries OPS full text."""
     unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     monkeypatch.setattr(
         cli_main, "OpsClient", lambda: _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
     )
     monkeypatch.setattr(
-        cli_main,
+        service,
         "parse_claims_xml",
         lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
     )
@@ -359,7 +371,7 @@ def test_claims_unavailable_when_no_fallback_route(
     unavailable = GPUnavailable(
         pub="US20240111636A1", status_code=404, retry_after_hint="wait a bit"
     )
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
 
     rc, data = _invoke(["claims", "US20240111636A1"], capsys)
@@ -377,7 +389,7 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 ) -> None:
     """When OPS full text also 404s, the result is still the normal unavailable shape."""
     unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(cli_main, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     not_found = httpx.HTTPStatusError(
         "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
@@ -475,7 +487,7 @@ def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """usage prints utils.usage_report()'s result verbatim."""
     fake = {"available": False, "path": "/tmp/headers.jsonl"}
-    monkeypatch.setattr(cli_main, "usage_report", lambda: fake)
+    monkeypatch.setattr(service, "usage_report", lambda: fake)
 
     rc, data = _invoke(["usage"], capsys)
 
@@ -566,6 +578,132 @@ def test_consent_without_subcommand_is_invalid_input(capsys: pytest.CaptureFixtu
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- serve ------------------------------------------------------------
+
+
+def test_serve_show_operator_notice_prints_english_by_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """serve --show-operator-notice prints the English notice text and exits 0."""
+    _, expected_text = server_settings.operator_notice_text("en")
+
+    rc = cli_main.main(["serve", "--show-operator-notice"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == expected_text + "\n"
+
+
+def test_serve_show_operator_notice_lang_ja(capsys: pytest.CaptureFixture[str]) -> None:
+    """serve --show-operator-notice --lang ja prints the Japanese notice text."""
+    _, expected_text = server_settings.operator_notice_text("ja")
+
+    rc = cli_main.main(["serve", "--show-operator-notice", "--lang", "ja"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == expected_text + "\n"
+
+
+def test_serve_show_operator_notice_unsupported_lang_falls_back_to_en(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unsupported --lang falls back to English and notes it on stderr."""
+    _, expected_text = server_settings.operator_notice_text("en")
+
+    rc = cli_main.main(["serve", "--show-operator-notice", "--lang", "xx"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.out == expected_text + "\n"
+    assert "note: falling back to en" in captured.err
+
+
+def test_serve_show_operator_notice_never_calls_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--show-operator-notice never resolves settings or starts the server."""
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc = cli_main.main(["serve", "--show-operator-notice"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert run_calls == []
+
+
+def test_serve_defaults_call_load_settings_and_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """serve with no flags resolves settings with the default transport/host/port."""
+    captured_kwargs: dict[str, Any] = {}
+    sentinel_settings = object()
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        captured_kwargs.update(transport=transport, host=host, port=port)
+        return sentinel_settings
+
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc = cli_main.main(["serve"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert out == ""
+    assert captured_kwargs == {"transport": "http", "host": None, "port": None}
+    assert run_calls == [sentinel_settings]
+
+
+def test_serve_passes_transport_host_port_through(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """serve --transport/--host/--port pass their values to load_settings."""
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        captured_kwargs.update(transport=transport, host=host, port=port)
+        return object()
+
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: None)
+
+    rc = cli_main.main(["serve", "--transport", "stdio", "--host", "0.0.0.0", "--port", "9000"])
+    capsys.readouterr()
+
+    assert rc == 0
+    assert captured_kwargs == {"transport": "stdio", "host": "0.0.0.0", "port": 9000}
+
+
+def test_serve_config_error_is_reported_as_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ConfigError from load_settings is reported as config_error, exit code 4."""
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        raise ConfigError("boom")
+
+    run_calls: list[Any] = []
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: run_calls.append(settings))
+
+    rc, data = _invoke(["serve"], capsys)
+
+    assert rc == 4
+    assert data == {"error": {"type": "config_error", "message": "boom"}}
+    assert run_calls == []
+
+
+def test_serve_invalid_transport_is_invalid_input(capsys: pytest.CaptureFixture[str]) -> None:
+    """An unsupported --transport value is rejected by argparse itself, exit code 2."""
+    rc, data = _invoke(["serve", "--transport", "tcp"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
 # --- general CLI behavior -------------------------------------------------
 
 
@@ -589,6 +727,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "verify",
         "usage",
         "consent",
+        "serve",
     ):
         assert name in out
 
