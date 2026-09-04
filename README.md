@@ -20,7 +20,7 @@ release.
    helpers only).
 2. Read the operator notice and acknowledge it:
    `uv run patent-checker serve --show-operator-notice` (add `--lang ja` for
-   Japanese), then set `PATENT_CHECKER_OPERATOR_CONSENT=1` in `.env`.
+   Japanese), then set `PATENT_CHECKER_OPERATOR_CONSENT=1.0` in `.env`.
 3. Generate a bearer token and set `PATENT_CHECKER_SERVER_TOKEN` in `.env`:
    `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
 4. Start the server: `uv run patent-checker serve` (Streamable HTTP on

@@ -36,7 +36,7 @@ def _clean_environment(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
 
 
-def _consent(monkeypatch, value: str = "1") -> None:
+def _consent(monkeypatch, value: str = server_settings.OPERATOR_NOTICE_VERSION) -> None:
     """Set the operator-consent env var to *value*."""
     monkeypatch.setenv("PATENT_CHECKER_OPERATOR_CONSENT", value)
 
@@ -58,19 +58,19 @@ def test_consent_unset_raises_with_actionable_message(monkeypatch) -> None:
 
     message = str(exc_info.value)
     assert "--show-operator-notice" in message
-    assert "PATENT_CHECKER_OPERATOR_CONSENT=1" in message
+    assert f"PATENT_CHECKER_OPERATOR_CONSENT={server_settings.OPERATOR_NOTICE_VERSION}" in message
 
 
 def test_consent_stale_version_raises_mentioning_both_versions(monkeypatch) -> None:
     """A stale consent value mentions both the acknowledged and current versions."""
-    _consent(monkeypatch, "0")
+    _consent(monkeypatch, "0.9")
     _token(monkeypatch)
 
     with pytest.raises(config.ConfigError) as exc_info:
         server_settings.load_settings()
 
     message = str(exc_info.value)
-    assert "0" in message
+    assert "'0.9'" in message
     assert server_settings.OPERATOR_NOTICE_VERSION in message
 
 
@@ -347,7 +347,7 @@ def test_operator_notice_text_english() -> None:
 
     assert lang == "en"
     first_line = text.splitlines()[0]
-    assert "(version 1)" in first_line
+    assert f"(version {server_settings.OPERATOR_NOTICE_VERSION})" in first_line
     assert server_settings.OPERATOR_NOTICE_VERSION in first_line
 
 
@@ -357,7 +357,7 @@ def test_operator_notice_text_japanese() -> None:
 
     assert lang == "ja"
     first_line = text.splitlines()[0]
-    assert "バージョン 1" in first_line
+    assert f"バージョン {server_settings.OPERATOR_NOTICE_VERSION}" in first_line
     assert server_settings.OPERATOR_NOTICE_VERSION in first_line
 
 

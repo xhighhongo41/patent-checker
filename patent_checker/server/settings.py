@@ -26,7 +26,7 @@ from patent_checker.config import ConfigError, load_env, user_data_dir
 # The operator-notice version is independent of both the package release
 # version and of ``patent_checker.consent.NOTICE_VERSION``: it is bumped only
 # when the operator notice's own legal content changes.
-OPERATOR_NOTICE_VERSION = "1"
+OPERATOR_NOTICE_VERSION = "1.0"
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
