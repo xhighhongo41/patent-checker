@@ -4,15 +4,16 @@ Search published patents related to your own software project and generate a
 survey report (best effort). This tool does **not** determine infringement and
 is not a substitute for professional legal advice.
 
-**Status: pre-release (v0.3, local MCP server).** This version provides the
-core library, the `patent-checker` CLI (EPO OPS + Google Patents access,
-screening utilities, consent gate), an MCP server exposing the same
-operations as tools (with a minimal response cache), and the Agent Skill
-under `skills/`. Packaged distribution and installers are planned for later
+**Status: pre-release (v0.4, cache management and clean-up).** This version
+provides the core library, the `patent-checker` CLI (EPO OPS + Google Patents
+access, screening utilities, consent gate, `cache status` / `cache clear` /
+`clean`), an MCP server exposing the same operations as tools (with a
+per-user shared document cache, per-kind expiry and self-repair), and the
+Agent Skill under `skills/`. Packaged distribution and installers are planned for later
 versions; full installation instructions will follow with the first public
 release.
 
-## Running the MCP server (v0.3, from a checkout)
+## Running the MCP server (v0.4, from a checkout)
 
 1. `uv sync`, then copy `.env.example` to `.env` and fill in the EPO OPS
    credentials (`PATENT_CHECKER_OPS_KEY` / `_SECRET`). Without them the
