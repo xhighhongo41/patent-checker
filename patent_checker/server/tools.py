@@ -71,7 +71,7 @@ TOOL_NAMES: tuple[str, ...] = (
 # turning one tool call into an unbounded amount of work.
 MAX_CQL_LENGTH = 4000
 MAX_QUERIES = 50
-MAX_RECORDS = 10000
+MAX_RECORDS = service.MAX_BATCH_RECORDS  # shared with the CLI's dedup/verify validation
 
 # Stable prefixes of the ToolError messages, so a client can branch on the
 # kind of failure without parsing the human-readable remainder.

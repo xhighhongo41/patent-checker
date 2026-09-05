@@ -115,3 +115,13 @@ def test_operator_notice_files_carry_the_current_version(lang: str) -> None:
     effective, text = operator_notice_text(lang)
     assert effective == lang
     assert OPERATOR_NOTICE_VERSION in text.splitlines()[0]
+
+
+def test_skill_documents_the_cache_and_cleanup_commands() -> None:
+    """SKILL.md must tell the agent how caching shows up and how traces are removed (v0.4)."""
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    assert "`patent-checker clean`" in text
+    assert "`patent-checker cache status`" in text
+    assert "--yes" in text
+    assert "`search_cache_dir`" in text
+    assert "--refresh" in text
