@@ -86,7 +86,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -160,6 +160,45 @@ class CacheHit:
     def raw_path(self) -> str:
         """Return the body file as a string: the only copy kept on disk."""
         return str(self.path)
+
+
+@dataclass(frozen=True)
+class CacheEntry:
+    """One entry (or entry fragment) found on disk by :meth:`Cache.entries`.
+
+    Attributes:
+        kind: One of :data:`KINDS`.
+        key: Cache key, as produced by :func:`pub_key` or :func:`search_key`.
+        root: ``"shared"`` or ``"local"``, whichever root *kind* is stored
+            under.
+        path: The body file path (may not exist when *broken*).
+        meta_path: The sidecar path (may not exist when *broken*).
+        ident: The identifier recorded in the sidecar, or ``None`` when the
+            sidecar is missing or unreadable.
+        fetched_at: The timestamp recorded in the sidecar, or ``None`` under
+            the same conditions as *ident*.
+        size: Body bytes on disk; ``0`` when the body is missing.
+        expired: ``True`` when the sidecar is readable and the entry is no
+            longer fresh. Always ``False`` when *broken* is ``True``.
+        broken: ``True`` when the entry cannot be served for a structural
+            reason (see *problem*).
+        problem: Why the entry is broken -- one of ``"missing body"``,
+            ``"missing sidecar"``, ``"unreadable sidecar"``,
+            ``"size mismatch"`` or ``"stray tmp file"``; ``None`` when the
+            entry is not broken.
+    """
+
+    kind: str
+    key: str
+    root: str
+    path: Path
+    meta_path: Path
+    ident: str | None
+    fetched_at: str | None
+    size: int
+    expired: bool
+    broken: bool
+    problem: str | None
 
 
 def pub_key(pub: str) -> str:
@@ -265,6 +304,27 @@ def is_fresh(
         # A malformed timestamp, and an offset-aware one that cannot be
         # compared with the naive local *now*, both mean "do not trust it".
         return False
+
+
+def format_ttl(ttl: timedelta | None) -> str:
+    """Return a short human-readable rendering of a TTL.
+
+    Args:
+        ttl: A time-to-live, or ``None`` for "never expires".
+
+    Returns:
+        ``"never"`` for ``None``; ``"<n>d"`` for a whole number of days;
+        otherwise ``"<n>h"`` for a whole number of hours; otherwise
+        ``"<n>s"`` for the total number of seconds.
+    """
+    if ttl is None:
+        return "never"
+    total_seconds = int(ttl.total_seconds())
+    if total_seconds % 86400 == 0:
+        return f"{total_seconds // 86400}d"
+    if total_seconds % 3600 == 0:
+        return f"{total_seconds // 3600}h"
+    return f"{total_seconds}s"
 
 
 class Cache:
@@ -455,6 +515,197 @@ class Cache:
 
         return content_path
 
+    def entries(self, kind: str | None = None) -> list[CacheEntry]:
+        """Return every entry found on disk, across one or all kinds.
+
+        A kind whose directory does not exist yet contributes no entries.
+        Entries are built from the union of body files, sidecar files and
+        stray ``.tmp`` files sitting in a kind's directory, one
+        :class:`CacheEntry` per key.
+
+        Args:
+            kind: One of :data:`KINDS`, or ``None`` for every kind.
+
+        Raises:
+            ValueError: If *kind* is given and is not one of :data:`KINDS`.
+        """
+        if kind is not None:
+            _check_kind(kind)
+            kinds: tuple[str, ...] = (kind,)
+        else:
+            kinds = KINDS
+        found: list[CacheEntry] = []
+        for one_kind in kinds:
+            found.extend(self._entries_for_kind(one_kind))
+        found.sort(key=lambda entry: (entry.kind, entry.key))
+        return found
+
+    def stats(self) -> dict[str, Any]:
+        """Return counts and byte totals of every kind, ready to serialize as JSON."""
+        kinds_stats: dict[str, Any] = {}
+        totals = {"entries": 0, "bytes": 0, "expired": 0, "broken": 0}
+        for kind in KINDS:
+            kind_entries = self.entries(kind)
+            fetched_ats = [
+                entry.fetched_at for entry in kind_entries if entry.fetched_at is not None
+            ]
+            n_bytes = sum(entry.size for entry in kind_entries)
+            n_expired = sum(1 for entry in kind_entries if entry.expired)
+            n_broken = sum(1 for entry in kind_entries if entry.broken)
+            kinds_stats[kind] = {
+                "root": "local" if kind in LOCAL_KINDS else "shared",
+                "dir": str(self.root_for(kind) / kind_subdir(kind)),
+                "entries": len(kind_entries),
+                "bytes": n_bytes,
+                "expired": n_expired,
+                "broken": n_broken,
+                "oldest": min(fetched_ats) if fetched_ats else None,
+                "newest": max(fetched_ats) if fetched_ats else None,
+            }
+            totals["entries"] += len(kind_entries)
+            totals["bytes"] += n_bytes
+            totals["expired"] += n_expired
+            totals["broken"] += n_broken
+        return {
+            "shared_dir": str(self._shared),
+            "local_dir": str(self._local),
+            "same_root": self._shared.resolve() == self._local.resolve(),
+            "ttls": {kind: format_ttl(self._ttls[kind]) for kind in KINDS},
+            "kinds": kinds_stats,
+            "totals": totals,
+        }
+
+    def select(
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        older_than: timedelta | None = None,
+        pub: str | None = None,
+        expired: bool = False,
+        broken: bool = False,
+    ) -> list[CacheEntry]:
+        """Return the entries matching every given filter (AND semantics).
+
+        Args:
+            kinds: Restrict to these kinds; ``None`` for every kind.
+            older_than: Keep only entries whose sidecar can be read and
+                whose age is at least *older_than* (``fetched_at +
+                older_than <= now``, so an entry exactly *older_than* old is
+                included). Entries with an unreadable sidecar never match.
+            pub: Keep only the entry keyed by this publication number
+                (:func:`pub_key`); search-keyed kinds never match, since
+                their keys are not publication numbers.
+            expired: When ``True``, require the entry to be expired.
+            broken: When ``True``, require the entry to be broken. When
+                both *expired* and *broken* are ``True``, an entry matches
+                if either is true (an OR of the two); when both are
+                ``False``, freshness and brokenness are not filtered on.
+
+        Raises:
+            ValueError: If *kinds* names a kind that is not one of
+                :data:`KINDS`, or *pub* is not a parseable publication
+                number.
+        """
+        if kinds is not None:
+            for one_kind in kinds:
+                _check_kind(one_kind)
+        kind_set = set(kinds) if kinds is not None else None
+        target_key = pub_key(pub) if pub is not None else None
+        now = self._clock()
+
+        result: list[CacheEntry] = []
+        for entry in self.entries():
+            if kind_set is not None and entry.kind not in kind_set:
+                continue
+            if target_key is not None and entry.key != target_key:
+                continue
+            if older_than is not None:
+                if entry.fetched_at is None:
+                    continue
+                try:
+                    fetched_at_dt = datetime.fromisoformat(entry.fetched_at)
+                except ValueError:
+                    continue
+                if fetched_at_dt + older_than > now:
+                    continue
+            if (expired or broken) and not (
+                (expired and entry.expired) or (broken and entry.broken)
+            ):
+                continue
+            result.append(entry)
+        return result
+
+    def remove(self, entries: Iterable[CacheEntry]) -> dict[str, Any]:
+        """Delete the body, sidecar and any stray ``.tmp`` files of *entries*.
+
+        Every path removed is required to sit under :attr:`shared` or
+        :attr:`local` (checked with the path's directory resolved, but
+        without following a symlink at the path itself, so a symlink that
+        lives under a cache root is removable even when it points
+        elsewhere -- only the link is deleted, never its target). A path
+        that fails this check is left alone and reported in ``errors``. A
+        path that does not exist is silently skipped. Directories are
+        never removed.
+
+        Args:
+            entries: Entries to delete, typically produced by
+                :meth:`entries` or :meth:`select`.
+
+        Returns:
+            A dict with ``removed`` (number of files deleted), ``bytes``
+            (body bytes freed, from the *entries*' recorded ``size``),
+            ``paths`` (the deleted file paths, as strings) and ``errors``
+            (a list of ``{"path": ..., "error": ...}`` for paths that were
+            not removed).
+        """
+        shared_root = self._shared.resolve()
+        local_root = self._local.resolve()
+        removed = 0
+        freed_bytes = 0
+        removed_paths: list[str] = []
+        errors: list[dict[str, str]] = []
+
+        def _under_a_root(path: Path) -> bool:
+            try:
+                parent = path.parent.resolve()
+            except OSError:
+                return False
+            candidate = parent / path.name
+            return candidate.is_relative_to(shared_root) or candidate.is_relative_to(local_root)
+
+        def _remove_one(path: Path) -> bool:
+            if not _under_a_root(path):
+                errors.append({"path": str(path), "error": "outside the cache roots"})
+                return False
+            if not path.exists() and not path.is_symlink():
+                return False
+            try:
+                path.unlink()
+            except OSError as exc:
+                errors.append({"path": str(path), "error": str(exc)})
+                return False
+            removed_paths.append(str(path))
+            return True
+
+        for entry in entries:
+            if _remove_one(entry.path):
+                removed += 1
+                freed_bytes += entry.size
+            for extra in (
+                entry.meta_path,
+                entry.path.with_name(entry.path.name + _TMP_SUFFIX),
+                entry.meta_path.with_name(entry.meta_path.name + _TMP_SUFFIX),
+            ):
+                if _remove_one(extra):
+                    removed += 1
+
+        return {
+            "removed": removed,
+            "bytes": freed_bytes,
+            "paths": removed_paths,
+            "errors": errors,
+        }
+
     def _read_meta(self, meta_path: Path) -> dict[str, Any] | None:
         """Return the sidecar at *meta_path* as a dict, or ``None`` if unusable."""
         try:
@@ -486,6 +737,95 @@ class Cache:
                 continue
             _unlink_quietly(meta_path.with_name(f"{key}{suffix}"))
             _unlink_quietly(meta_path)
+
+    def _entries_for_kind(self, kind: str) -> list[CacheEntry]:
+        """Return the entries of *kind* found in its directory, one per key."""
+        kind_dir = self.root_for(kind) / kind_subdir(kind)
+        try:
+            names = [child.name for child in kind_dir.iterdir()]
+        except OSError:
+            return []
+
+        suffix = content_suffix(kind)
+        bodies: set[str] = set()
+        metas: set[str] = set()
+        body_tmp: set[str] = set()
+        meta_tmp: set[str] = set()
+        for name in names:
+            if name.endswith(_TMP_SUFFIX):
+                inner = name[: -len(_TMP_SUFFIX)]
+                if inner.endswith(_META_SUFFIX):
+                    meta_tmp.add(inner[: -len(_META_SUFFIX)])
+                elif inner.endswith(suffix):
+                    body_tmp.add(inner[: -len(suffix)])
+                continue
+            if name.endswith(_META_SUFFIX):
+                metas.add(name[: -len(_META_SUFFIX)])
+            elif name.endswith(suffix):
+                bodies.add(name[: -len(suffix)])
+
+        root_name = "local" if kind in LOCAL_KINDS else "shared"
+        keys = bodies | metas | body_tmp | meta_tmp
+        return [
+            self._build_entry(kind, key, kind_dir, suffix, root_name, bodies, metas) for key in keys
+        ]
+
+    def _build_entry(
+        self,
+        kind: str,
+        key: str,
+        kind_dir: Path,
+        suffix: str,
+        root_name: str,
+        bodies: set[str],
+        metas: set[str],
+    ) -> CacheEntry:
+        """Build the :class:`CacheEntry` for *kind*/*key* from what is on disk."""
+        path = kind_dir / f"{key}{suffix}"
+        meta_path = kind_dir / f"{key}{_META_SUFFIX}"
+        has_body = key in bodies
+        has_meta = key in metas
+
+        meta: dict[str, Any] | None = None
+        if has_meta:
+            meta = self._read_meta(meta_path)
+            if meta is not None and any(field not in meta for field in _REQUIRED_META_FIELDS):
+                meta = None
+
+        size = path.stat().st_size if has_body else 0
+
+        problem: str | None = None
+        if not has_body:
+            problem = "missing body" if has_meta else "stray tmp file"
+        elif not has_meta:
+            problem = "missing sidecar"
+        elif meta is None:
+            problem = "unreadable sidecar"
+        else:
+            expected_size = meta.get("size")
+            if expected_size is not None and expected_size != size:
+                problem = "size mismatch"
+
+        broken = problem is not None
+        ident = meta.get("ident") if meta is not None else None
+        fetched_at = meta.get("fetched_at") if meta is not None else None
+        expired = (
+            False if broken else not is_fresh(kind, fetched_at, self._clock(), ttls=self._ttls)
+        )
+
+        return CacheEntry(
+            kind=kind,
+            key=key,
+            root=root_name,
+            path=path,
+            meta_path=meta_path,
+            ident=ident,
+            fetched_at=fetched_at,
+            size=size,
+            expired=expired,
+            broken=broken,
+            problem=problem,
+        )
 
 
 def _replace_atomically(path: Path, payload: bytes) -> None:
