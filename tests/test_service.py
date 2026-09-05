@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,7 @@ import httpx
 import pytest
 
 from patent_checker import service
-from patent_checker.cache import Cache, pub_key
+from patent_checker.cache import DEFAULT_TTLS, Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
@@ -33,6 +33,11 @@ from patent_checker.ops.parse import (
 )
 
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+
+# How long a cached legal-status response stays usable. The legal kind always
+# expires; the assertion just narrows the value away from ``None``.
+LEGAL_TTL = DEFAULT_TTLS["legal"]
+assert LEGAL_TTL is not None
 
 _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
 
@@ -596,7 +601,7 @@ def test_search_serves_a_second_identical_call_from_cache(
 
     second = service.search("ti=drone", client=stub, cache=cache)
     assert second["cached"] is True
-    assert second["raw_path"] == "/tmp/raw.xml"
+    assert second["raw_path"] == str(cache.content_path("search", search_key("ti=drone", 1, 25)))
     assert len(stub.calls) == 1
 
     service.search("ti=drone", end=50, client=stub, cache=cache)
@@ -620,7 +625,7 @@ def test_search_biblio_serves_a_second_identical_call_from_cache(
 
     second = service.search_biblio("ti=drone", client=stub, cache=cache)
     assert second["cached"] is True
-    assert second["raw_path"] == "/tmp/sb.xml"
+    assert second["raw_path"] == str(cache.content_path("searchbib", search_key("ti=drone", 1, 25)))
     assert len(stub.calls) == 1
 
 
@@ -638,7 +643,7 @@ def test_biblio_serves_a_second_identical_call_from_cache(
 
     second = service.biblio("US.1.A1", client=stub, cache=cache)
     assert second["cached"] is True
-    assert second["raw_path"] == "/tmp/b.xml"
+    assert second["raw_path"] == str(cache.content_path("biblio", pub_key("US.1.A1")))
     assert len(stub.calls) == 1
 
 
@@ -656,14 +661,14 @@ def test_legal_serves_a_second_call_within_the_same_day_from_cache(
 
     second = service.legal("US11468338B2", client=stub, cache=cache)
     assert second["cached"] is True
-    assert second["raw_path"] == "/tmp/l.xml"
+    assert second["raw_path"] == str(cache.content_path("legal", pub_key("US11468338B2")))
     assert len(stub.calls) == 1
 
 
-def test_legal_cache_re_fetches_on_the_next_calendar_day(
+def test_legal_cache_re_fetches_once_the_ttl_has_passed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A legal cache entry from a previous calendar day is not reused."""
+    """A legal cache entry older than the legal TTL is not reused."""
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: ())
     stub = _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
     clock_value = datetime(2026, 9, 1, 23, 59, 0)
@@ -672,7 +677,7 @@ def test_legal_cache_re_fetches_on_the_next_calendar_day(
     service.legal("US11468338B2", client=stub, cache=cache)
     assert len(stub.calls) == 1
 
-    clock_value = datetime(2026, 9, 2, 0, 1, 0)
+    clock_value = datetime(2026, 9, 1, 23, 59, 0) + LEGAL_TTL + timedelta(seconds=1)
     service.legal("US11468338B2", client=stub, cache=cache)
     assert len(stub.calls) == 2
 
@@ -693,7 +698,7 @@ def test_family_serves_a_second_identical_call_from_cache(
 
     second = service.family("US.1.A1", client=stub, cache=cache)
     assert second["cached"] is True
-    assert second["raw_path"] == "/tmp/f.xml"
+    assert second["raw_path"] == str(cache.content_path("family", pub_key("US.1.A1")))
     assert len(stub.calls) == 1
 
 
@@ -760,7 +765,7 @@ def test_claims_gp_route_result_never_carries_cached(
 def test_ops_function_config_error_wins_over_a_cache_hit(tmp_path: Path) -> None:
     """OPS availability is checked before the cache, even with a fresh entry on disk."""
     cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
-    cache.put("biblio", pub_key("US.1.A1"), b"<xml/>", ident="US.1.A1", raw_path=Path("/tmp/b.xml"))
+    cache.put("biblio", pub_key("US.1.A1"), b"<xml/>", ident="US.1.A1")
 
     with pytest.raises(ConfigError) as exc_info:
         service.biblio("US.1.A1", client=None, cache=cache)

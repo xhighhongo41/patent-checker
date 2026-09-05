@@ -150,7 +150,7 @@ def make_state(settings: ServerSettings) -> Iterator[Callable[..., ServerState]]
             settings=effective,
             ops_client=ops_client,
             gp_client=httpx.Client(transport=httpx.MockTransport(gp_handler)),
-            cache=Cache(effective.data_base / "cache" / "ops"),
+            cache=Cache(effective.data_base / "cache"),
         )
         created.append(state)
         return state
@@ -853,7 +853,7 @@ def test_build_state_without_credentials_has_no_ops_client(settings: ServerSetti
     state = build_state(settings)
     try:
         assert state.ops_client is None
-        assert state.cache.base == settings.data_base / "cache" / "ops"
+        assert state.cache.base == settings.data_base / "cache"
         # The guard refuses non-allowlisted hosts before any connection is made.
         with pytest.raises(HostNotAllowedError):
             state.gp_client.get("https://example.com/")

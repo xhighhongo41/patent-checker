@@ -127,7 +127,7 @@ def search(
     else:
         xml, raw_path = client.search(cql, begin=begin, end=end)
         if cache is not None:
-            cache.put("search", key, xml, ident=cql, raw_path=raw_path)
+            cache.put("search", key, xml, ident=cql)
     page = parse_search_xml(xml)
     result = {
         "query": page.query,
@@ -175,7 +175,7 @@ def search_biblio(
     else:
         xml, raw_path = client.search_biblio(cql, begin=begin, end=end)
         if cache is not None:
-            cache.put("searchbib", key, xml, ident=cql, raw_path=raw_path)
+            cache.put("searchbib", key, xml, ident=cql)
     page = parse_search_biblio_xml(xml)
     result = {
         "total": page.total_count,
@@ -235,7 +235,7 @@ def biblio(pub: str, *, client: OpsClient | None, cache: Cache | None = None) ->
     else:
         xml, raw_path = client.biblio(pub)
         if cache is not None:
-            cache.put("biblio", key, xml, ident=pub, raw_path=raw_path)
+            cache.put("biblio", key, xml, ident=pub)
     result = dataclasses.asdict(parse_biblio_xml(xml))
     result["raw_path"] = str(raw_path)
     if cache_hit is not None:
@@ -268,7 +268,7 @@ def legal(pub: str, *, client: OpsClient | None, cache: Cache | None = None) -> 
     else:
         xml, raw_path = client.legal(pub)
         if cache is not None:
-            cache.put("legal", key, xml, ident=pub, raw_path=raw_path)
+            cache.put("legal", key, xml, ident=pub)
     events = parse_legal_xml(xml)
     result = {
         "pub": key,
@@ -304,7 +304,7 @@ def family(pub: str, *, client: OpsClient | None, cache: Cache | None = None) ->
     else:
         xml, raw_path = client.family(pub)
         if cache is not None:
-            cache.put("family", key, xml, ident=pub, raw_path=raw_path)
+            cache.put("family", key, xml, ident=pub)
     result = parse_family_xml(xml)
     out = {
         "family_id": result.family_id,
@@ -386,7 +386,7 @@ def claims(
                     return _claims_unavailable(fetched)
                 raise
             if cache is not None:
-                cache.put("claims", key, xml, ident=pub, raw_path=raw_path)
+                cache.put("claims", key, xml, ident=pub)
         result = {
             "source": "ops-fulltext",
             "pub": pub,
