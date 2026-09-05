@@ -31,13 +31,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from patent_checker import __version__, consent, service
+from patent_checker import __version__, cleanup, config, consent, service
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
@@ -104,6 +105,76 @@ def _read_json_array(path: str, *, allow_stdin: bool = False) -> list[Any]:
     if not isinstance(data, list):
         raise ValueError(f"expected a JSON array in {path!r}, got {type(data).__name__}")
     return data
+
+
+def _check_batch_size(items: Sequence[Any], label: str) -> None:
+    """Reject a batch larger than :data:`patent_checker.service.MAX_BATCH_RECORDS`.
+
+    Raises:
+        ValueError: If *items* holds more entries than the shared limit.
+    """
+    if len(items) > service.MAX_BATCH_RECORDS:
+        raise ValueError(
+            f"{label} holds {len(items)} entries: at most {service.MAX_BATCH_RECORDS} are accepted"
+        )
+
+
+def _check_hits(hits: Sequence[Any], label: str) -> None:
+    """Check a ``dedup`` payload: a bounded list of objects carrying ``"pub"``.
+
+    Validating here keeps a malformed payload on the invalid_input path
+    (exit code 2, JSON envelope) instead of surfacing as a ``KeyError``
+    traceback from the dedup logic.
+
+    Raises:
+        ValueError: If the payload is too large, or an element is not an
+            object or has no ``"pub"`` key. The message names the offending
+            index.
+    """
+    _check_batch_size(hits, label)
+    for index, hit in enumerate(hits):
+        if not isinstance(hit, dict):
+            raise ValueError(
+                f'{label}[{index}] must be an object carrying "pub", got {type(hit).__name__}'
+            )
+        if "pub" not in hit:
+            raise ValueError(f'{label}[{index}] has no "pub" key')
+
+
+def _check_pub_strings(pubs: Sequence[Any], label: str) -> None:
+    """Check a ``verify --input`` payload: a bounded list of publication strings.
+
+    Raises:
+        ValueError: If the payload is too large or an element is not a
+            string. The message names the offending index.
+    """
+    _check_batch_size(pubs, label)
+    for index, pub in enumerate(pubs):
+        if not isinstance(pub, str):
+            raise ValueError(
+                f"{label}[{index}] must be a publication-number string, got {type(pub).__name__}"
+            )
+
+
+def _check_output_records(records: Sequence[Any], label: str) -> None:
+    """Check a ``verify --output`` payload: strings or objects carrying ``"pub"``.
+
+    Raises:
+        ValueError: If the payload is too large, or an element is neither a
+            string nor an object with a ``"pub"`` key. The message names the
+            offending index.
+    """
+    _check_batch_size(records, label)
+    for index, record in enumerate(records):
+        if isinstance(record, str):
+            continue
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"{label}[{index}] must be a publication-number string or an object "
+                f'carrying "pub", got {type(record).__name__}'
+            )
+        if "pub" not in record:
+            raise ValueError(f'{label}[{index}] has no "pub" key')
 
 
 def _read_query_file(path: str) -> list[str]:
@@ -200,14 +271,28 @@ def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
-    """Collapse a list of search hits into one record per patent family."""
-    return service.dedup(_read_json_array(args.path, allow_stdin=True))
+    """Collapse a list of search hits into one record per patent family.
+
+    Raises:
+        ValueError: If the payload is not a well-formed, bounded list of
+            hits (see :func:`_check_hits`).
+    """
+    hits = _read_json_array(args.path, allow_stdin=True)
+    _check_hits(hits, "hits")
+    return service.dedup(hits)
 
 
 def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
-    """Cross-check a delegated batch's output against its input publication list."""
+    """Cross-check a delegated batch's output against its input publication list.
+
+    Raises:
+        ValueError: If either payload is not well-formed or is over the
+            shared batch limit.
+    """
     input_pubs = _read_json_array(args.input)
+    _check_pub_strings(input_pubs, "--input")
     output_records = _read_json_array(args.output)
+    _check_output_records(output_records, "--output")
     return service.verify(input_pubs, output_records)
 
 
@@ -295,8 +380,12 @@ def _cache_entry_summary(entry: CacheEntry) -> dict[str, Any]:
 
 
 def _cmd_cache_status(args: argparse.Namespace) -> dict[str, Any]:
-    """Report cache entry counts and byte totals, per kind and in total."""
-    return _cache().stats()
+    """Report cache entry counts and byte totals, per kind, in total, and for the old layout."""
+    cache = _cache()
+    return {
+        **cache.stats(),
+        "legacy": cleanup.legacy_summary(config.data_base(), cache),
+    }
 
 
 def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
@@ -341,6 +430,52 @@ def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
         "paths": removal["paths"],
         "errors": removal["errors"],
     }
+
+
+# --- clean -------------------------------------------------------------
+
+
+def _cmd_clean(args: argparse.Namespace) -> dict[str, Any]:
+    """Report, and only with ``--yes`` remove, what this project left on disk.
+
+    Without ``--yes`` this is a dry run: the plan is listed and not one file
+    is deleted. A path that could not be removed is reported under
+    ``errors`` and does not fail the command, since the rest of the cleanup
+    did happen.
+    """
+    data_base = config.data_base()
+    user_data_dir = config.user_data_dir()
+    cache = _cache()
+    plan = cleanup.plan_cleanup(
+        data_base=data_base,
+        cache=cache,
+        shared=args.shared,
+        include_artifacts=args.include_artifacts,
+        include_consent=args.include_consent,
+        user_data_dir=user_data_dir,
+        user_consent_path=consent.user_consent_path(),
+    )
+    result: dict[str, Any] = {
+        "dry_run": not args.yes,
+        "scope": {
+            "project": str(data_base),
+            # Named only when they are actually in scope, so a reader cannot
+            # mistake a listed directory for one that will be touched.
+            "shared": str(cache.shared) if args.shared else None,
+            "user_data": str(user_data_dir) if args.shared else None,
+        },
+        **plan.to_dict(),
+    }
+    if not args.yes:
+        return result
+
+    removal = cleanup.execute(plan)
+    # The removed paths themselves are left out: they are as long as the
+    # plan, which the caller already has above.
+    result["removed_files"] = removal["removed_files"]
+    result["bytes"] = removal["bytes"]
+    result["errors"] = removal["errors"]
+    return result
 
 
 # --- argument parser -------------------------------------------------------
@@ -441,8 +576,36 @@ def _build_parser() -> argparse.ArgumentParser:
 
     _add_consent_parser(subparsers)
     _add_cache_parser(subparsers)
+    _add_clean_parser(subparsers)
 
     return parser
+
+
+def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``clean`` subcommand and its opt-in scope flags."""
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove this project's cache and exploration residue (dry run unless --yes)",
+    )
+    clean_parser.add_argument(
+        "--shared",
+        action="store_true",
+        help="Also the shared cache and the MCP server's data directory",
+    )
+    clean_parser.add_argument(
+        "--include-artifacts",
+        action="store_true",
+        help="Also the data-directory entries this tool does not write (reports, notes)",
+    )
+    clean_parser.add_argument(
+        "--include-consent",
+        action="store_true",
+        help="Also the recorded consent (the per-user record needs --shared too)",
+    )
+    clean_parser.add_argument(
+        "--yes", action="store_true", help="Actually delete the listed paths (default: dry run)"
+    )
+    clean_parser.set_defaults(handler=_cmd_clean)
 
 
 def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:

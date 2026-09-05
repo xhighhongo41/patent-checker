@@ -21,6 +21,7 @@ import pytest
 
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
+import patent_checker.server.tools as server_tools
 from patent_checker import consent, service
 from patent_checker.cache import Cache
 from patent_checker.cli import main as cli_main
@@ -60,6 +61,22 @@ def _invoke(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, d
         rc = exc.code
     out = capsys.readouterr().out
     return rc, json.loads(out)
+
+
+def _invoke_with_stderr(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[int, dict[str, Any], str]:
+    """Run ``main(argv)`` like :func:`_invoke`, also returning what went to stderr.
+
+    Used by the input-validation tests: a rejected payload must be reported
+    through the JSON envelope, never as a Python traceback.
+    """
+    try:
+        rc = cli_main.main(argv)
+    except SystemExit as exc:
+        rc = exc.code
+    captured = capsys.readouterr()
+    return rc, json.loads(captured.out), captured.err
 
 
 class _StubOpsClient:
@@ -504,10 +521,63 @@ def test_dedup_non_array_json_is_invalid_input(
     path = tmp_path / "bad.json"
     path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
 
-    rc, data = _invoke(["dedup", str(path)], capsys)
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
 
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_an_element_that_is_not_an_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hit that is not a JSON object is rejected by index, without a traceback."""
+    path = tmp_path / "hits.json"
+    path.write_text(json.dumps([{"pub": "US.1.A1"}, 2]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_an_element_without_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hit missing "pub" is invalid input rather than an uncaught KeyError."""
+    path = tmp_path / "hits.json"
+    path.write_text(json.dumps([{"x": 1}]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[0]" in data["error"]["message"]
+    assert "pub" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_more_hits_than_the_batch_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A payload over MAX_BATCH_RECORDS is refused before any work is done."""
+    path = tmp_path / "hits.json"
+    hits = [{"pub": "US.1.A1"}] * (service.MAX_BATCH_RECORDS + 1)
+    path.write_text(json.dumps(hits), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert str(service.MAX_BATCH_RECORDS) in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_batch_limit_is_shared_with_the_mcp_server() -> None:
+    """The CLI and the MCP server refuse an oversized batch at the same size."""
+    assert server_tools.MAX_RECORDS == service.MAX_BATCH_RECORDS
 
 
 def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -523,6 +593,84 @@ def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert data["ok"] is True
     assert data["input_count"] == 2
     assert data["output_count"] == 2
+
+
+def _write_verify_files(tmp_path: Path, input_data: Any, output_data: Any) -> list[str]:
+    """Write both verify payloads and return the argv tail naming them."""
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    input_path.write_text(json.dumps(input_data), encoding="utf-8")
+    output_path.write_text(json.dumps(output_data), encoding="utf-8")
+    return ["--input", str(input_path), "--output", str(output_path)]
+
+
+def test_verify_rejects_an_input_element_that_is_not_a_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--input must hold publication-number strings; anything else is invalid input."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1", 2], [])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_an_output_element_that_is_neither_string_nor_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--output takes strings or objects carrying "pub"; a number is neither."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [7])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[0]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_an_output_record_without_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An output object missing "pub" is invalid input rather than an uncaught KeyError."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [{"family_id": "1"}])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "pub" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_more_records_than_the_batch_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same MAX_BATCH_RECORDS ceiling applies to both verify payloads."""
+    oversized = ["US.1.A1"] * (service.MAX_BATCH_RECORDS + 1)
+    argv = ["verify", *_write_verify_files(tmp_path, oversized, [])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert str(service.MAX_BATCH_RECORDS) in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_accepts_output_records_carrying_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The validation does not reject the documented record shape."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [{"pub": "US.1.A1"}])]
+
+    rc, data = _invoke(argv, capsys)
+
+    assert rc == 0
+    assert data["ok"] is True
 
 
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -979,6 +1127,178 @@ def test_cache_clear_unparseable_pub_is_invalid_input(
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- clean -----------------------------------------------------------------
+
+
+def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
+    """Point ``clean`` and ``cache status`` at a throwaway tree; return its paths.
+
+    Every location the command can reach (project data base, shared cache,
+    the server's data directory and the per-user consent record) is
+    redirected under *tmp_path*, so no test can touch a real one.
+    """
+    project = tmp_path / "project"
+    shared = tmp_path / "shared"
+    user_data = tmp_path / "userdata"
+    user_consent = tmp_path / "userconfig" / "consent.json"
+    for path, text in (
+        (project / "cache" / "ops" / "search" / "aaaa.xml", "<search/>"),
+        (project / "cache" / "ops" / "biblio" / "US.1.A1.xml", "<biblio/>"),
+        (project / "raw" / "ops" / "headers.jsonl", "{}\n"),
+        (project / "raw" / "ops" / "20260101-120000_biblio_US1.xml", "<legacy/>"),
+        (project / "raw" / "gp" / "US1A1.html", "<html></html>"),
+        (project / "reports" / "report-x-20260101-1200.md", "# report"),
+        (project / "consent.json", '{"notice_version": "1"}'),
+        (shared / "ops" / "biblio" / "EP.2.A1.xml", "<biblio/>"),
+        (user_data / "raw" / "ops" / "headers.jsonl", "{}\n"),
+        (user_consent, '{"notice_version": "1"}'),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(cli_main.config, "data_base", lambda: project)
+    monkeypatch.setattr(cli_main.config, "user_data_dir", lambda: user_data)
+    monkeypatch.setattr(cli_main.consent, "user_consent_path", lambda: user_consent)
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(shared, project / "cache"))
+    return {
+        "project": project,
+        "shared": shared,
+        "user_data": user_data,
+        "user_consent": user_consent,
+    }
+
+
+def test_clean_default_is_a_dry_run_that_deletes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """clean without --yes lists this project's leftovers and leaves every file in place."""
+    paths = _clean_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc, data = _invoke(["clean"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert data["scope"] == {"project": str(paths["project"]), "shared": None, "user_data": None}
+    assert {item["category"] for item in data["items"]} == {
+        "search-cache",
+        "request-log",
+        "legacy-raw",
+        "legacy-cache",
+    }
+    assert data["total_files"] == 5
+    assert data["total_bytes"] > 0
+    assert "removed_files" not in data
+    assert _files_under(tmp_path) == before
+
+
+def test_clean_with_yes_removes_the_project_leftovers_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """clean --yes empties the cache and raw directories, sparing everything else."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is False
+    assert data["removed_files"] == data["total_files"]
+    assert data["bytes"] == data["total_bytes"]
+    assert data["errors"] == []
+    # The removed paths are only counted: the list itself would be unbounded.
+    assert "paths" not in data
+    assert _files_under(paths["project"] / "cache") == set()
+    assert _files_under(paths["project"] / "raw") == set()
+    assert (paths["project"] / "reports" / "report-x-20260101-1200.md").exists()
+    assert (paths["project"] / "consent.json").exists()
+    assert _files_under(paths["shared"]) != set()
+    assert _files_under(paths["user_data"]) != set()
+    assert paths["user_consent"].exists()
+
+
+def test_clean_include_artifacts_also_removes_what_the_agent_wrote(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--include-artifacts adds the reports, but still not the consent record."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--include-artifacts", "--yes"], capsys)
+
+    assert rc == 0
+    assert "artifact" in {item["category"] for item in data["items"]}
+    assert not (paths["project"] / "reports").exists()
+    assert (paths["project"] / "consent.json").exists()
+
+
+def test_clean_include_consent_removes_the_project_record_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--include-consent alone leaves the per-user record in place."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--include-consent", "--yes"], capsys)
+
+    assert rc == 0
+    assert not (paths["project"] / "consent.json").exists()
+    assert paths["user_consent"].exists()
+    assert (paths["project"] / "reports" / "report-x-20260101-1200.md").exists()
+
+
+def test_clean_shared_targets_the_shared_cache_and_the_server_data(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--shared names both extra scopes and, with --yes, empties them too."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--shared", "--include-consent", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["scope"]["shared"] == str(paths["shared"])
+    assert data["scope"]["user_data"] == str(paths["user_data"])
+    assert {"shared", "user"} <= {item["scope"] for item in data["items"]}
+    assert _files_under(paths["shared"]) == set()
+    assert _files_under(paths["user_data"]) == set()
+    assert not paths["user_consent"].exists()
+
+
+def test_clean_reports_removal_errors_and_still_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A path that could not be removed is reported in the JSON, not as a failure."""
+    _clean_env(monkeypatch, tmp_path)
+    failure = {
+        "removed_files": 0,
+        "bytes": 0,
+        "paths": [],
+        "errors": [{"path": "/elsewhere", "error": "outside the cleanup roots"}],
+    }
+    monkeypatch.setattr(cli_main.cleanup, "execute", lambda plan: failure)
+
+    rc, data = _invoke(["clean", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["removed_files"] == 0
+    assert data["errors"] == failure["errors"]
+
+
+def test_cache_status_reports_the_legacy_layout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status carries a legacy section counting what the v0.3 layout still holds."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    legacy = data["legacy"]
+    assert legacy["raw_ops_bodies"]["dir"] == str(paths["project"] / "raw" / "ops")
+    assert legacy["raw_ops_bodies"]["files"] == 1  # headers.jsonl is not a leftover
+    assert legacy["raw_gp"]["files"] == 1
+    assert legacy["cache_pub_kinds"]["files"] == 1
+    assert legacy["total_files"] == 3
+    assert legacy["total_bytes"] > 0
+
+
 # --- general CLI behavior -------------------------------------------------
 
 
@@ -1004,6 +1324,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "consent",
         "serve",
         "cache",
+        "clean",
     ):
         assert name in out
 

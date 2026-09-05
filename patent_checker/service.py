@@ -58,6 +58,11 @@ from patent_checker.utils import dedup_families, search_plan_check, usage_report
 # fallback route (Google Patents -> OPS full text -> none).
 OPS_FULLTEXT_COUNTRIES: tuple[str, ...] = ("EP", "WO")
 
+# Ceiling on the number of records an offline batch helper (``dedup``,
+# ``verify``) accepts, so one call cannot turn into unbounded work. Same
+# limit as the MCP tools' ``MAX_RECORDS``; both front ends share it.
+MAX_BATCH_RECORDS = 10000
+
 # Shared wording for the "OPS is not available" failure, so the CLI's
 # pre-flight check and this layer's client check report the same thing.
 OPS_NOT_CONFIGURED_MESSAGE = (
