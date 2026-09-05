@@ -278,25 +278,41 @@ def test_search_biblio_returns_docs_and_raw_path(monkeypatch: pytest.MonkeyPatch
 
 
 def test_plan_check_forwards_client_and_max_total(monkeypatch: pytest.MonkeyPatch) -> None:
-    """plan_check hands the caller's client and max_total to search_plan_check."""
+    """plan_check hands the caller's client, max_total, cache and refresh to search_plan_check.
+
+    Extended (T8-core) to also cover cache/refresh forwarding, so this one test
+    keeps documenting every keyword plan_check passes through.
+    """
     captured: dict[str, Any] = {}
 
     def fake_plan_check(
-        queries: list[str], *, client: Any = None, max_total: int | None = None
+        queries: list[str],
+        *,
+        client: Any = None,
+        max_total: int | None = None,
+        cache: Any = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         captured["queries"] = queries
         captured["client"] = client
         captured["max_total"] = max_total
+        captured["cache"] = cache
+        captured["refresh"] = refresh
         return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
 
     monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
     stub = _StubOpsClient()
+    cache = object()
 
-    result = service.plan_check(("ti=drone", "ab=foo"), max_total=100, client=stub)
+    result = service.plan_check(
+        ("ti=drone", "ab=foo"), max_total=100, client=stub, cache=cache, refresh=True
+    )
 
     assert captured["queries"] == ["ti=drone", "ab=foo"]
     assert captured["client"] is stub
     assert captured["max_total"] == 100
+    assert captured["cache"] is cache
+    assert captured["refresh"] is True
     assert result == {"results": [], "total_sum": 0, "exceeded": False, "max_total": 100}
 
 

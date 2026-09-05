@@ -26,7 +26,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
-from patent_checker import config, service
+from patent_checker import config, service, utils
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
@@ -253,7 +253,15 @@ def test_every_tool_description_states_what_it_returns(
 
 @pytest.mark.parametrize(
     "name",
-    ["ops_search", "ops_search_biblio", "get_biblio", "get_claims", "get_legal", "get_family"],
+    [
+        "ops_search",
+        "ops_search_biblio",
+        "search_plan_check",
+        "get_biblio",
+        "get_claims",
+        "get_legal",
+        "get_family",
+    ],
 )
 def test_cached_results_are_documented_for_the_cached_tools(
     settings: ServerSettings, make_state: Any, name: str
@@ -324,15 +332,22 @@ def test_ops_search_biblio_returns_docs(
 def test_search_plan_check_forwards_queries_and_budget(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
-    """search_plan_check hands the queries, the budget and the shared client to the service."""
+    """search_plan_check hands the queries, the budget, the client and the cache to the service."""
     captured: dict[str, Any] = {}
 
     def fake_plan_check(
-        queries: list[str], *, client: Any = None, max_total: int | None = None
+        queries: list[str],
+        *,
+        client: Any = None,
+        max_total: int | None = None,
+        cache: Any = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         captured["queries"] = queries
         captured["client"] = client
         captured["max_total"] = max_total
+        captured["cache"] = cache
+        captured["refresh"] = refresh
         return {
             "results": [{"query": queries[0], "total": 7}],
             "total_sum": 7,
@@ -342,7 +357,8 @@ def test_search_plan_check_forwards_queries_and_budget(
 
     monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
     stub = _StubOpsClient()
-    mcp = build_server(settings, state=make_state(ops_client=stub))
+    state = make_state(ops_client=stub)
+    mcp = build_server(settings, state=state)
 
     data = _call(mcp, "search_plan_check", {"queries": ["ti=drone"], "max_total": 100})
 
@@ -355,6 +371,8 @@ def test_search_plan_check_forwards_queries_and_budget(
     assert captured["queries"] == ["ti=drone"]
     assert captured["client"] is stub
     assert captured["max_total"] == 100
+    assert captured["cache"] is state.cache
+    assert captured["refresh"] is False
 
 
 def test_get_biblio_returns_biblio_fields(
@@ -698,6 +716,28 @@ def test_repeated_search_is_served_from_the_cache(
 
     assert "cached" not in first
     assert second["cached"] is True
+    assert len(stub.calls) == 1
+
+
+def test_repeated_plan_check_query_is_served_from_the_cache(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """The second search_plan_check call for the same query does not reach OPS.
+
+    search_plan_check shares its cache entry with a Range=1-2 ops_search/search
+    call for the same query, so this exercises the same on-disk cache as
+    test_repeated_search_is_served_from_the_cache above.
+    """
+    page = OpsSearchPage(total_count=3, query="ti=drone", begin=1, end=2, hits=())
+    monkeypatch.setattr(utils, "parse_search_xml", lambda xml: page)
+    stub = _StubOpsClient(search=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    first = _call(mcp, "search_plan_check", {"queries": ["ti=drone"]})
+    second = _call(mcp, "search_plan_check", {"queries": ["ti=drone"]})
+
+    assert first["results"] == [{"query": "ti=drone", "total": 3}]
+    assert second["results"] == [{"query": "ti=drone", "total": 3, "cached": True}]
     assert len(stub.calls) == 1
 
 

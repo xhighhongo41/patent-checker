@@ -266,7 +266,11 @@ def search_plan_check(
 
     Returns ``{"results": [{"query", "total"} or {"query", "error"}],
     "total_sum", "exceeded", "max_total"}``, where "exceeded" says whether
-    the summed totals are above the given budget. Results are not cached.
+    the summed totals are above the given budget. Each query's count is read
+    from the same cache (and shares the same cache entry, keyed by query and
+    range) as the search-page tools, so a query already counted or searched
+    with Range=1-2 is not sent upstream again; a result entry served this
+    way carries ``"cached": true``.
 
     Args:
         queries: CQL query expressions to measure (1 to 50 entries).
@@ -277,7 +281,9 @@ def search_plan_check(
     with _mapped_errors():
         _validate_queries(queries)
         with state.ops_lock:
-            return service.plan_check(queries, max_total=max_total, client=state.ops_client)
+            return service.plan_check(
+                queries, max_total=max_total, client=state.ops_client, cache=state.cache
+            )
 
 
 def get_biblio(pub: str, *, ctx: Context) -> dict[str, Any]:

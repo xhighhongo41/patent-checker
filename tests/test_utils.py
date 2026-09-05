@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from patent_checker.cache import Cache
 from patent_checker.utils import (
     dedup_families,
     search_plan_check,
@@ -347,6 +348,83 @@ def test_search_plan_check_does_not_close_an_injected_client() -> None:
     client = _StubOpsClient(responses)
     search_plan_check(["q1"], client=client)
     assert client.closed is False
+
+
+# --- search_plan_check caching (T8-core) ------------------------------------
+
+
+def test_search_plan_check_second_identical_query_is_served_from_cache(tmp_path: Path) -> None:
+    """A repeated query is answered from the cache, without calling the client again."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = search_plan_check(["q1"], client=client, cache=cache)
+    second = search_plan_check(["q1"], client=client, cache=cache)
+
+    assert first["results"] == [{"query": "q1", "total": 1}]
+    assert second["results"] == [{"query": "q1", "total": 1, "cached": True}]
+    assert len(client.calls) == 1
+
+
+def test_search_plan_check_a_different_query_still_calls_the_client(tmp_path: Path) -> None:
+    """Caching one query does not serve a different query from the cache."""
+    responses = {
+        "q1": _load_fixture("20260827-074259_search_5214adad8e.xml"),  # total=1
+        "q2": _load_fixture("20260827-074307_search_03be517d21.xml"),  # total=10
+    }
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    search_plan_check(["q1"], client=client, cache=cache)
+    result = search_plan_check(["q1", "q2"], client=client, cache=cache)
+
+    assert result["results"][0] == {"query": "q1", "total": 1, "cached": True}
+    assert result["results"][1] == {"query": "q2", "total": 10}
+    assert [call[0] for call in client.calls] == ["q1", "q2"]
+
+
+def test_search_plan_check_refresh_ignores_and_overwrites_the_cache(tmp_path: Path) -> None:
+    """refresh=True re-fetches even a fresh cache hit and replaces the stored entry."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    search_plan_check(["q1"], client=client, cache=cache)
+    result = search_plan_check(["q1"], client=client, cache=cache, refresh=True)
+
+    assert result["results"] == [{"query": "q1", "total": 1}]
+    assert len(client.calls) == 2
+
+    # The overwritten entry is served (as a hit) by a later, non-refreshing call.
+    third = search_plan_check(["q1"], client=client, cache=cache)
+    assert third["results"] == [{"query": "q1", "total": 1, "cached": True}]
+    assert len(client.calls) == 2
+
+
+def test_search_plan_check_without_cache_always_calls_the_client() -> None:
+    """Passing no cache preserves the pre-v0.4 behavior: every call reaches the client."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+
+    search_plan_check(["q1"], client=client)
+    search_plan_check(["q1"], client=client)
+
+    assert len(client.calls) == 2
+
+
+def test_search_plan_check_error_is_not_cached(tmp_path: Path) -> None:
+    """A query that ends up as an error entry is never cached, so it is retried next time."""
+    responses: dict[str, bytes | BaseException] = {"q1": ValueError("invalid Range")}
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = search_plan_check(["q1"], client=client, cache=cache)
+    second = search_plan_check(["q1"], client=client, cache=cache)
+
+    assert "error" in first["results"][0]
+    assert "error" in second["results"][0]
+    assert len(client.calls) == 2
 
 
 # --- usage_report -----------------------------------------------------------

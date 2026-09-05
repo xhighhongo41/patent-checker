@@ -206,7 +206,12 @@ def search_biblio(
 
 
 def plan_check(
-    queries: Sequence[str], *, max_total: int | None = None, client: OpsClient | None
+    queries: Sequence[str],
+    *,
+    max_total: int | None = None,
+    client: OpsClient | None,
+    cache: Cache | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Measure the hit count of every candidate query in a search plan.
 
@@ -214,6 +219,9 @@ def plan_check(
         queries: CQL query expressions to measure.
         max_total: Hit-count budget the summed totals are compared against.
         client: Caller-owned OPS client.
+        cache: Optional file cache; a fresh hit is served without calling
+            the client.
+        refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
         :func:`patent_checker.utils.search_plan_check`'s report.
@@ -221,7 +229,13 @@ def plan_check(
     Raises:
         ConfigError: If *client* is ``None``.
     """
-    return search_plan_check(list(queries), client=require_ops(client), max_total=max_total)
+    return search_plan_check(
+        list(queries),
+        client=require_ops(client),
+        max_total=max_total,
+        cache=cache,
+        refresh=refresh,
+    )
 
 
 # --- single-document lookups --------------------------------------------
