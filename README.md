@@ -34,7 +34,16 @@ release.
    session, then start a new one):
    `claude mcp add --transport http patent-checker http://127.0.0.1:8642/mcp --header "Authorization: Bearer <token>"`.
 
-The server's raw responses and cache live under the per-user data directory
-(`$XDG_DATA_HOME/patent-checker`, Windows `%LOCALAPPDATA%\patent-checker`;
-override with `PATENT_CHECKER_DATA_DIR`). The CLI keeps using
-`./.patent-checker` and remains available as a fallback for every tool.
+Fetched patent documents (biblio, claims, legal status, families, Google
+Patents pages) are kept once, in a per-user shared cache
+(`$XDG_DATA_HOME/patent-checker/cache`, Windows
+`%LOCALAPPDATA%\patent-checker\cache`; override with
+`PATENT_CHECKER_CACHE_DIR`) that the CLI and the server share, with a
+per-kind expiry (`PATENT_CHECKER_CACHE_TTL`). Search results and the request
+log stay in the data directory of whoever ran them: the server's per-user
+directory (override with `PATENT_CHECKER_DATA_DIR`, which then also holds
+the shared cache), or `./.patent-checker` for the CLI, which remains
+available as a fallback for every tool. `patent-checker cache status` shows
+what is cached; `patent-checker clean` lists — and only with `--yes`
+deletes — a project's traces, keeping reports and the consent record
+unless asked otherwise.
