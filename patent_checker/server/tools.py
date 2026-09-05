@@ -458,21 +458,31 @@ def usage_report(*, ctx: Context) -> dict[str, Any]:
 def server_status(*, ctx: Context) -> dict[str, Any]:
     """Report the server's version, transport, directories and OPS availability.
 
-    Offline: no request is made. ``ops_configured: false`` means the server
-    runs in degraded mode, where only the Google Patents route and the
-    offline tools work.
+    Offline: no request is made (``cache_entries`` counts files already on
+    disk; it does not check freshness). ``ops_configured: false`` means the
+    server runs in degraded mode, where only the Google Patents route and
+    the offline tools work.
 
     Returns ``{"version", "ops_configured", "transport", "data_dir",
-    "cache_dir", "operator_notice_version"}``.
+    "cache_dir", "search_cache_dir", "cache_ttl", "cache_entries",
+    "operator_notice_version"}``, where "cache_dir" is the shared
+    (publication-keyed) cache root, "search_cache_dir" is the local
+    (search-keyed) cache root, "cache_ttl" maps each cache kind to its
+    effective time-to-live (e.g. ``"90d"`` or ``"never"``), and
+    "cache_entries" maps each cache kind to its entry count.
     """
     state = _state(ctx)
     with _mapped_errors():
+        stats = state.cache.stats()
         return {
             "version": importlib.metadata.version("patent-checker"),
             "ops_configured": state.ops_client is not None,
             "transport": state.settings.transport,
             "data_dir": str(state.settings.data_base),
-            "cache_dir": str(state.cache.base),
+            "cache_dir": str(state.cache.shared),
+            "search_cache_dir": str(state.cache.local),
+            "cache_ttl": stats["ttls"],
+            "cache_entries": {kind: info["entries"] for kind, info in stats["kinds"].items()},
             "operator_notice_version": state.settings.operator_notice_version,
         }
 

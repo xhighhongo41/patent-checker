@@ -26,7 +26,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
-from patent_checker import config, service, utils
+from patent_checker import cache, config, service, utils
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
@@ -151,7 +151,9 @@ def make_state(settings: ServerSettings) -> Iterator[Callable[..., ServerState]]
             settings=effective,
             ops_client=ops_client,
             gp_client=httpx.Client(transport=httpx.MockTransport(gp_handler)),
-            cache=Cache(effective.data_base / "cache"),
+            cache=Cache(
+                effective.cache_base, effective.data_base / "cache", ttls=effective.cache_ttls
+            ),
         )
         created.append(state)
         return state
@@ -550,9 +552,29 @@ def test_server_status_reports_the_running_configuration(
         "ops_configured": True,
         "transport": "stdio",
         "data_dir": str(tmp_path),
-        "cache_dir": str(state.cache.base),
+        "cache_dir": str(state.cache.shared),
+        "search_cache_dir": str(state.cache.local),
+        "cache_ttl": {kind: cache.format_ttl(ttl) for kind, ttl in cache.DEFAULT_TTLS.items()},
+        "cache_entries": {kind: 0 for kind in cache.KINDS},
         "operator_notice_version": OPERATOR_NOTICE_VERSION,
     }
+
+
+def test_server_status_reports_cache_entries_and_ttl_overrides(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """A cached entry is counted and a TTL override is reflected in cache_ttl."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=1d")
+    overridden_settings = load_settings(transport="stdio")
+    state = make_state(ops_client=_StubOpsClient(), state_settings=overridden_settings)
+    state.cache.put("biblio", pub_key("US11468338B2"), b"<xml/>", ident="US11468338B2")
+    mcp = build_server(overridden_settings, state=state)
+
+    data = _call(mcp, "server_status")
+
+    assert data["cache_entries"]["biblio"] == 1
+    assert data["cache_ttl"]["legal"] == "1d"
+    assert data["cache_ttl"]["biblio"] == "90d"
 
 
 # --- error mapping -------------------------------------------------------
