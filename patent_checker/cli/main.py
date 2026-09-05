@@ -18,8 +18,9 @@ code encodes the same distinction:
 - ``3``: an external API call failed (``httpx.HTTPError``).
 - ``4``: configuration is missing or invalid (``patent_checker.config.
   ConfigError``): EPO OPS credentials for an OPS-backed command (error type
-  ``ops_not_configured``), or MCP server settings for ``serve`` (error type
-  ``config_error``).
+  ``ops_not_configured``), or any other invalid configuration -- MCP server
+  settings for ``serve``, or a malformed ``$PATENT_CHECKER_CACHE_TTL`` for a
+  cache-backed command (error type ``config_error``).
 
 Every subcommand handler is a thin adapter over :mod:`patent_checker.service`,
 which holds the actual logic and is shared with the MCP server.
@@ -30,13 +31,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from patent_checker import __version__, consent, service
-from patent_checker.cache import Cache, default_cache
+from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
 
@@ -145,7 +147,13 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
     if args.file:
         queries.extend(_read_query_file(args.file))
     with _ops_client() as client:
-        return service.plan_check(queries, max_total=args.max_total, client=client)
+        return service.plan_check(
+            queries,
+            max_total=args.max_total,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
+        )
 
 
 # --- single-document lookups --------------------------------------------
@@ -269,6 +277,72 @@ def _cmd_consent_record(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+# --- cache -------------------------------------------------------------
+
+
+def _cache_entry_summary(entry: CacheEntry) -> dict[str, Any]:
+    """Return the JSON-serializable summary of one ``CacheEntry`` for ``cache clear``."""
+    return {
+        "kind": entry.kind,
+        "key": entry.key,
+        "root": entry.root,
+        "path": str(entry.path),
+        "fetched_at": entry.fetched_at,
+        "expired": entry.expired,
+        "broken": entry.broken,
+        "problem": entry.problem,
+    }
+
+
+def _cmd_cache_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Report cache entry counts and byte totals, per kind and in total."""
+    return _cache().stats()
+
+
+def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
+    """Select cache entries matching the given filters and, only with ``--yes``, delete them.
+
+    Without ``--yes`` this is a dry run: nothing is deleted, and the
+    selected entries are listed so a caller can review them first.
+
+    Raises:
+        ValueError: If ``--older-than`` is negative, an unknown ``--kind``
+            is given, or ``--pub`` is not a parseable publication number
+            (all propagated from :meth:`Cache.select`, except the
+            ``--older-than`` sign check done here).
+    """
+    if args.older_than is not None and args.older_than < 0:
+        raise ValueError(f"--older-than must not be negative, got {args.older_than}")
+    older_than = timedelta(days=args.older_than) if args.older_than is not None else None
+
+    cache = _cache()
+    selected = cache.select(
+        kinds=args.kind,
+        older_than=older_than,
+        pub=args.pub,
+        expired=args.expired,
+        broken=args.broken,
+    )
+
+    if not args.yes:
+        return {
+            "dry_run": True,
+            "selected": len(selected),
+            "bytes": sum(entry.size for entry in selected),
+            "entries": [_cache_entry_summary(entry) for entry in selected],
+        }
+
+    removal = cache.remove(selected)
+    return {
+        "dry_run": False,
+        "selected": len(selected),
+        "removed": removal["removed"],
+        "bytes": removal["bytes"],
+        "paths": removal["paths"],
+        "errors": removal["errors"],
+    }
+
+
 # --- argument parser -------------------------------------------------------
 
 
@@ -310,6 +384,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     plan_check_parser.add_argument("--file", help="File with one CQL query per line")
     plan_check_parser.add_argument("--max-total", type=int, default=None)
+    _add_refresh_flag(plan_check_parser)
     plan_check_parser.set_defaults(handler=_cmd_plan_check)
 
     biblio_parser = subparsers.add_parser("biblio", help="Fetch bibliographic data")
@@ -365,8 +440,43 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(handler=_cmd_serve)
 
     _add_consent_parser(subparsers)
+    _add_cache_parser(subparsers)
 
     return parser
+
+
+def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``cache`` subcommand and its ``status``/``clear`` children."""
+    cache_parser = subparsers.add_parser("cache", help="Inspect and clear the file cache")
+    cache_subparsers = cache_parser.add_subparsers(dest="cache_command", required=True)
+
+    status_parser = cache_subparsers.add_parser(
+        "status", help="Report cache entry counts and byte totals"
+    )
+    status_parser.set_defaults(handler=_cmd_cache_status)
+
+    clear_parser = cache_subparsers.add_parser(
+        "clear", help="Delete cache entries matching filters (dry run unless --yes)"
+    )
+    clear_parser.add_argument(
+        "--kind", action="append", default=None, help="Restrict to this cache kind (repeatable)"
+    )
+    clear_parser.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Only entries at least this many days old",
+    )
+    clear_parser.add_argument(
+        "--pub", default=None, help="Only the entry for this publication number"
+    )
+    clear_parser.add_argument("--expired", action="store_true", help="Only expired entries")
+    clear_parser.add_argument("--broken", action="store_true", help="Only broken entries")
+    clear_parser.add_argument(
+        "--yes", action="store_true", help="Actually delete the selected entries (default: dry run)"
+    )
+    clear_parser.set_defaults(handler=_cmd_cache_clear)
 
 
 def _add_consent_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -416,7 +526,16 @@ def main(argv: list[str] | None = None) -> int:
         _print_json(_error_result("invalid_input", str(exc)))
         return 2
     except ConfigError as exc:
-        _print_json(_error_result("ops_not_configured", str(exc)))
+        # OPS credential problems keep their own error type, since a Skill/
+        # agent may special-case them (e.g. point the user at `consent`
+        # instead of the operator's environment); every other ConfigError
+        # (a malformed $PATENT_CHECKER_CACHE_TTL, in practice) is generic.
+        error_type = (
+            "ops_not_configured"
+            if str(exc) == service.OPS_NOT_CONFIGURED_MESSAGE
+            else "config_error"
+        )
+        _print_json(_error_result(error_type, str(exc)))
         return 4
     except httpx.HTTPError as exc:
         _print_json(_error_result("external_api_error", str(exc)))

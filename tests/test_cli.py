@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ import pytest
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 from patent_checker import consent, service
+from patent_checker.cache import Cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable
@@ -205,9 +207,15 @@ def test_plan_check_reads_queries_from_positional_args_and_file(
     captured: dict[str, Any] = {}
 
     def fake_plan_check(
-        queries: list[str], *, client: Any = None, max_total: int | None = None
+        queries: list[str],
+        *,
+        client: Any = None,
+        max_total: int | None = None,
+        cache: Any = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         captured["queries"] = queries
+        captured["refresh"] = refresh
         return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
 
     monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
@@ -402,6 +410,7 @@ _REFRESHABLE_COMMANDS = [
     ("claims", "US11468338B2", "claims"),
     ("legal", "US.1.A1", "legal"),
     ("family", "US.1.A1", "family"),
+    ("plan-check", "ti=drone", "plan_check"),
 ]
 
 
@@ -736,6 +745,240 @@ def test_serve_invalid_transport_is_invalid_input(capsys: pytest.CaptureFixture[
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- cache -----------------------------------------------------------------
+
+
+def _files_under(root: Path) -> set[Path]:
+    """Return every regular file under *root*, or an empty set if *root* does not exist."""
+    if not root.exists():
+        return set()
+    return {path for path in root.rglob("*") if path.is_file()}
+
+
+def test_cache_status_on_empty_cache_reports_zero_totals_and_dirs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status on a cache with nothing written reports zero entries and its directories."""
+    shared = tmp_path / "shared"
+    local = tmp_path / "local"
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(shared, local))
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    assert data["shared_dir"] == str(shared)
+    assert data["local_dir"] == str(local)
+    assert data["same_root"] is False
+    assert data["totals"]["entries"] == 0
+
+
+def test_cache_status_reports_per_kind_counts_and_same_root_when_one_root(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status reflects entries written via Cache.put, per kind and in total."""
+    cache = Cache(tmp_path / "cache")  # local defaults to shared -> one root
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("search", "abc123", b"<xml/>", ident="ti=drone")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    assert data["same_root"] is True
+    assert data["totals"]["entries"] == 2
+    assert data["kinds"]["biblio"]["entries"] == 1
+    assert data["kinds"]["search"]["entries"] == 1
+    assert data["kinds"]["claims"]["entries"] == 0
+
+
+def test_cache_status_config_error_from_cache_ttl_is_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ConfigError raised by _cache() (a malformed cache TTL) is reported as config_error."""
+
+    def _raise() -> Cache:
+        raise ConfigError("PATENT_CHECKER_CACHE_TTL: invalid TTL 'bogus'")
+
+    monkeypatch.setattr(cli_main, "_cache", _raise)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 4
+    assert data["error"]["type"] == "config_error"
+
+
+def test_cache_without_subcommand_is_invalid_input(capsys: pytest.CaptureFixture[str]) -> None:
+    """'cache' with no status/clear child is an argparse-level invalid_input error."""
+    rc, data = _invoke(["cache"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_default_is_a_dry_run_that_deletes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache clear without --yes lists the selection but leaves every file in place."""
+    root = tmp_path / "cache"
+    cache = Cache(root)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+    before = _files_under(root)
+
+    rc, data = _invoke(["cache", "clear"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert data["selected"] == 2
+    assert {entry["kind"] for entry in data["entries"]} == {"biblio", "legal"}
+    assert _files_under(root) == before
+
+
+def test_cache_clear_with_yes_deletes_only_the_selected_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache clear --kind biblio --yes deletes only the biblio entry's files."""
+    root = tmp_path / "cache"
+    cache = Cache(root)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--kind", "biblio", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is False
+    assert data["selected"] == 1
+    assert data["removed"] == 2  # body file + sidecar
+    assert data["errors"] == []
+    assert cache.content_path("biblio", "US.1.A1").exists() is False
+    assert cache.content_path("legal", "US.1.A1").exists() is True
+
+
+def test_cache_clear_kind_filter_accepts_repeated_flags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--kind may be repeated to select more than one kind."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("family", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--kind", "biblio", "--kind", "legal"], capsys)
+
+    assert rc == 0
+    assert data["selected"] == 2
+    assert {entry["kind"] for entry in data["entries"]} == {"biblio", "legal"}
+
+
+def test_cache_clear_older_than_selects_by_age_boundary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--older-than N keeps entries fetched at least N days before the check (boundary included)."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="old")  # exactly 2 days old at check time
+
+    clock_value = datetime(2026, 9, 2, 12, 0, 0)
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="new")  # 1 day old at check time
+
+    clock_value = datetime(2026, 9, 3, 12, 0, 0)
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--older-than", "2"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["biblio"]
+
+
+def test_cache_clear_pub_selects_only_that_publications_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--pub restricts the selection to the entries keyed by that publication number."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("biblio", "EP.2.A1", b"<xml/>", ident="EP.2.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--pub", "US1A1"], capsys)
+
+    assert rc == 0
+    assert [entry["key"] for entry in data["entries"]] == ["US.1.A1"]
+
+
+def test_cache_clear_expired_flag_selects_only_expired_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--expired keeps only entries whose TTL has elapsed."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")  # legal TTL is 7 days
+    cache.put("claims", "US.1.A1", b"<xml/>", ident="US.1.A1")  # claims never expires
+
+    clock_value = datetime(2026, 9, 1, 12, 0, 0) + timedelta(days=8)
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--expired"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["legal"]
+
+
+def test_cache_clear_broken_flag_selects_only_broken_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--broken keeps only entries that cannot be served for a structural reason."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.content_path("biblio", "US.1.A1").unlink()  # body now missing -> broken
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--broken"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["biblio"]
+    assert data["entries"][0]["problem"] == "missing body"
+
+
+def test_cache_clear_negative_older_than_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A negative --older-than is rejected as invalid_input, exit code 2."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--older-than", "-1"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_unknown_kind_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """An unknown --kind is rejected (via Cache.select's ValueError) as invalid_input."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--kind", "bogus"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_unparseable_pub_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A --pub value that is not a parseable publication number is invalid_input."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--pub", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
 # --- general CLI behavior -------------------------------------------------
 
 
@@ -760,6 +1003,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "usage",
         "consent",
         "serve",
+        "cache",
     ):
         assert name in out
 
