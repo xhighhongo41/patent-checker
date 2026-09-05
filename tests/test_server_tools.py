@@ -27,8 +27,9 @@ from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
 from patent_checker import config, service
-from patent_checker.cache import Cache
+from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
+from patent_checker.gp.fetch import FetchedPage
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
 from patent_checker.net import AllowlistTransport, HostNotAllowedError
@@ -273,7 +274,7 @@ def test_cached_results_are_documented_for_the_cached_tools(
 
 
 def test_ops_search_returns_the_service_page(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """ops_search forwards the paging window and returns the CLI's search keys."""
     page = OpsSearchPage(
@@ -284,32 +285,39 @@ def test_ops_search_returns_the_service_page(
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
-    stub = _StubOpsClient(search=(b"<xml/>", tmp_path / "raw.xml"))
-    mcp = build_server(settings, state=make_state(ops_client=stub))
+    stub = _StubOpsClient(search=b"<xml/>")
+    state = make_state(ops_client=stub)
+    mcp = build_server(settings, state=state)
 
     data = _call(mcp, "ops_search", {"cql": "ti=drone", "begin": 1, "end": 25})
 
     assert data["query"] == "ti=drone"
     assert data["total"] == 2
     assert data["hits"] == [{"pub": "US.1.A1", "family_id": "100"}]
-    assert data["raw_path"] == str(tmp_path / "raw.xml")
+    assert data["raw_path"] == str(
+        state.cache.content_path("search", search_key("ti=drone", 1, 25))
+    )
     assert stub.calls == [("search", ("ti=drone",), {"begin": 1, "end": 25})]
 
 
 def test_ops_search_biblio_returns_docs(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """ops_search_biblio returns one full biblio record per hit."""
     page = OpsSearchBiblioPage(total_count=1, begin=1, end=25, docs=(_sample_biblio(),))
     monkeypatch.setattr(service, "parse_search_biblio_xml", lambda xml: page)
-    stub = _StubOpsClient(search_biblio=(b"<xml/>", tmp_path / "sb.xml"))
-    mcp = build_server(settings, state=make_state(ops_client=stub))
+    stub = _StubOpsClient(search_biblio=b"<xml/>")
+    state = make_state(ops_client=stub)
+    mcp = build_server(settings, state=state)
 
     data = _call(mcp, "ops_search_biblio", {"cql": "ti=drone"})
 
     assert data["total"] == 1
     assert data["docs"][0]["pub"] == "US.11468338.B2"
     assert data["docs"][0]["applicants"] == ["Acme"]
+    assert data["raw_path"] == str(
+        state.cache.content_path("searchbib", search_key("ti=drone", 1, 25))
+    )
     assert stub.calls == [("search_biblio", ("ti=drone",), {"begin": 1, "end": 25})]
 
 
@@ -350,28 +358,29 @@ def test_search_plan_check_forwards_queries_and_budget(
 
 
 def test_get_biblio_returns_biblio_fields(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """get_biblio returns the OpsBiblio fields plus the raw path."""
     monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio())
-    stub = _StubOpsClient(biblio=(b"<xml/>", tmp_path / "b.xml"))
-    mcp = build_server(settings, state=make_state(ops_client=stub))
+    stub = _StubOpsClient(biblio=b"<xml/>")
+    state = make_state(ops_client=stub)
+    mcp = build_server(settings, state=state)
 
     data = _call(mcp, "get_biblio", {"pub": "US11468338B2"})
 
     assert data["pub"] == "US.11468338.B2"
     assert data["title"] == "t"
-    assert data["raw_path"] == str(tmp_path / "b.xml")
+    assert data["raw_path"] == str(state.cache.content_path("biblio", pub_key("US11468338B2")))
     assert stub.calls == [("biblio", ("US11468338B2",), {})]
 
 
 def test_get_legal_returns_events(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """get_legal returns the docdb spelling and one entry per legal event."""
     event = OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20240101", pre_lines=())
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: (event,))
-    stub = _StubOpsClient(legal=(b"<xml/>", tmp_path / "l.xml"))
+    stub = _StubOpsClient(legal=b"<xml/>")
     mcp = build_server(settings, state=make_state(ops_client=stub))
 
     data = _call(mcp, "get_legal", {"pub": "US11468338B2"})
@@ -383,13 +392,13 @@ def test_get_legal_returns_events(
 
 
 def test_get_family_returns_members(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """get_family returns the family id and its member publications."""
     monkeypatch.setattr(
         service, "parse_family_xml", lambda xml: OpsFamily(family_id="1", members=("US.1.A1",))
     )
-    stub = _StubOpsClient(family=(b"<xml/>", tmp_path / "f.xml"))
+    stub = _StubOpsClient(family=b"<xml/>")
     mcp = build_server(settings, state=make_state(ops_client=stub))
 
     data = _call(mcp, "get_family", {"pub": "US11468338B2"})
@@ -399,17 +408,18 @@ def test_get_family_returns_members(
 
 
 def test_get_claims_uses_the_shared_google_patents_client(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """get_claims takes the Google Patents route and passes the state's GP client."""
-    page = tmp_path / "US11468338B2.html"
-    page.write_text("<html></html>", encoding="utf-8")
     captured: dict[str, Any] = {}
 
-    def fake_fetch(pub: str, *, force: bool = False, client: Any = None) -> Path:
+    def fake_fetch(
+        pub: str, *, force: bool = False, client: Any = None, cache: Any = None
+    ) -> FetchedPage:
         captured["pub"] = pub
         captured["client"] = client
-        return page
+        captured["cache"] = cache
+        return FetchedPage(pub=pub, html="<html></html>", path=None, cached=False)
 
     monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
@@ -421,6 +431,7 @@ def test_get_claims_uses_the_shared_google_patents_client(
     assert data["source"] == "gp"
     assert data["claims"] == [{"number": 1, "text": "1. A widget.", "depends_on": []}]
     assert captured["client"] is state.gp_client
+    assert captured["cache"] is state.cache
 
 
 def test_normalize_pubnum_returns_every_spelling(settings: ServerSettings, make_state: Any) -> None:
@@ -674,12 +685,12 @@ def test_offline_and_google_patents_tools_still_work_without_ops(
 
 
 def test_repeated_search_is_served_from_the_cache(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """The second identical search is answered from disk and marked ``cached``."""
     page = OpsSearchPage(total_count=0, query="ti=drone", begin=1, end=25, hits=())
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
-    stub = _StubOpsClient(search=(b"<xml/>", tmp_path / "raw.xml"))
+    stub = _StubOpsClient(search=b"<xml/>")
     mcp = build_server(settings, state=make_state(ops_client=stub))
 
     first = _call(mcp, "ops_search", {"cql": "ti=drone"})
@@ -808,26 +819,26 @@ def test_concurrent_ops_tools_do_not_overlap(
 
 
 def test_concurrent_claims_calls_do_not_overlap(
-    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
     """The Google Patents lock keeps two concurrent get_claims calls strictly sequential.
 
     FastMCP runs sync tools in worker threads and does execute two calls at
     once (verified separately), so a maximum overlap of one proves the lock.
     """
-    page = tmp_path / "page.html"
-    page.write_text("<html></html>", encoding="utf-8")
     active = {"current": 0, "max": 0}
     active_lock = threading.Lock()
 
-    def fake_fetch(pub: str, *, force: bool = False, client: Any = None) -> Path:
+    def fake_fetch(
+        pub: str, *, force: bool = False, client: Any = None, cache: Any = None
+    ) -> FetchedPage:
         with active_lock:
             active["current"] += 1
             active["max"] = max(active["max"], active["current"])
         time.sleep(0.2)
         with active_lock:
             active["current"] -= 1
-        return page
+        return FetchedPage(pub=pub, html="<html></html>", path=None, cached=False)
 
     monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())

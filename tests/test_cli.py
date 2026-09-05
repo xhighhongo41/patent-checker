@@ -23,7 +23,7 @@ import patent_checker.server.settings as server_settings
 from patent_checker import consent, service
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
-from patent_checker.gp.fetch import GPUnavailable
+from patent_checker.gp.fetch import FetchedPage, GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
 from patent_checker.ops.parse import (
@@ -37,7 +37,11 @@ from patent_checker.ops.parse import (
 
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep CLI tests hermetic: no file cache reads or writes."""
+    """Keep CLI tests hermetic: no file cache reads or writes.
+
+    Without a cache nothing stores the response body, so every ``raw_path``
+    below is ``null``; the paths themselves are covered where the cache is.
+    """
     monkeypatch.setattr(cli_main, "_cache", lambda: None)
 
 
@@ -88,9 +92,7 @@ def test_search_success(
 ) -> None:
     """A successful search prints the OpsSearchPage fields plus the raw path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(search=(b"<xml/>", Path("/tmp/raw.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(search=b"<xml/>"))
     page = OpsSearchPage(
         total_count=2,
         query="ti=drone",
@@ -109,7 +111,7 @@ def test_search_success(
         "begin": 1,
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
-        "raw_path": "/tmp/raw.xml",
+        "raw_path": None,
     }
 
 
@@ -148,11 +150,7 @@ def test_search_biblio_success(
 ) -> None:
     """search-biblio prints total/begin/end plus one asdict entry per doc."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main,
-        "OpsClient",
-        lambda: _StubOpsClient(search_biblio=(b"<xml/>", Path("/tmp/sb.xml"))),
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(search_biblio=b"<xml/>"))
     biblio = OpsBiblio(
         pub="US.1.A1",
         family_id="100",
@@ -193,7 +191,7 @@ def test_search_biblio_success(
             "npl_citation_count": 0,
         }
     ]
-    assert data["raw_path"] == "/tmp/sb.xml"
+    assert data["raw_path"] is None
 
 
 def test_plan_check_reads_queries_from_positional_args_and_file(
@@ -232,9 +230,7 @@ def test_biblio_success(
 ) -> None:
     """biblio prints the OpsBiblio fields plus the raw path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(biblio=(b"<xml/>", Path("/tmp/b.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(biblio=b"<xml/>"))
     biblio = OpsBiblio(
         pub="US.1.A1",
         family_id="100",
@@ -255,15 +251,13 @@ def test_biblio_success(
     assert rc == 0
     assert data["pub"] == "US.1.A1"
     assert data["applicants"] == ["Acme"]
-    assert data["raw_path"] == "/tmp/b.xml"
+    assert data["raw_path"] is None
 
 
 def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """legal prints one asdict entry per event, keyed under events, plus raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(legal=b"<xml/>"))
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
 
@@ -274,7 +268,7 @@ def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert data["events"] == [
         {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
     ]
-    assert data["raw_path"] == "/tmp/l.xml"
+    assert data["raw_path"] is None
 
 
 def test_family_success(
@@ -282,16 +276,14 @@ def test_family_success(
 ) -> None:
     """family prints family_id/members/raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(family=b"<xml/>"))
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
     monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
     assert rc == 0
-    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": "/tmp/f.xml"}
+    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": None}
 
 
 # --- claims (route selection) -------------------------------------------
@@ -320,12 +312,11 @@ def _sample_gp_doc(**overrides: Any) -> GPatentDoc:
 
 
 def test_claims_google_patents_route(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """When Google Patents has the page, claims is read from it (source='gp')."""
-    page_path = tmp_path / "US11468338B2.html"
-    page_path.write_text("<html></html>", encoding="utf-8")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: page_path)
+    page = FetchedPage(pub="US11468338B2", html="<html></html>", path=None, cached=False)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: page)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
     rc, data = _invoke(["claims", "US11468338B2"], capsys)
@@ -344,11 +335,9 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
 ) -> None:
     """A GP 404 for an EP/WO document, with OPS configured, tries OPS full text."""
     unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(claims=b"<xml/>"))
     monkeypatch.setattr(
         service,
         "parse_claims_xml",
@@ -361,7 +350,7 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
     assert data["source"] == "ops-fulltext"
     assert data["pub"] == "EP1234567A1"
     assert data["claims"] == [{"number": 1, "text": "1. Claim text.", "depends_on": []}]
-    assert data["raw_path"] == "/tmp/c.xml"
+    assert data["raw_path"] is None
 
 
 def test_claims_unavailable_when_no_fallback_route(
@@ -371,7 +360,7 @@ def test_claims_unavailable_when_no_fallback_route(
     unavailable = GPUnavailable(
         pub="US20240111636A1", status_code=404, retry_after_hint="wait a bit"
     )
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
 
     rc, data = _invoke(["claims", "US20240111636A1"], capsys)
@@ -389,7 +378,7 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 ) -> None:
     """When OPS full text also 404s, the result is still the normal unavailable shape."""
     unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     not_found = httpx.HTTPStatusError(
         "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
@@ -400,6 +389,49 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 
     assert rc == 0
     assert data == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+
+
+# --- --refresh ------------------------------------------------------------
+
+
+# The subcommands that read through the cache, with an argument each accepts.
+_REFRESHABLE_COMMANDS = [
+    ("search", "ti=drone", "search"),
+    ("search-biblio", "ti=drone", "search_biblio"),
+    ("biblio", "US.1.A1", "biblio"),
+    ("claims", "US11468338B2", "claims"),
+    ("legal", "US.1.A1", "legal"),
+    ("family", "US.1.A1", "family"),
+]
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+@pytest.mark.parametrize(("command", "argument", "function"), _REFRESHABLE_COMMANDS)
+def test_refresh_flag_is_forwarded_to_the_service(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    argument: str,
+    function: str,
+    refresh: bool,
+) -> None:
+    """--refresh reaches the service as refresh=True; without it the default False is sent."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient())
+    captured: dict[str, Any] = {}
+
+    def recorder(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"called": function}
+
+    monkeypatch.setattr(service, function, recorder)
+    argv = [command, argument] + (["--refresh"] if refresh else [])
+
+    rc, data = _invoke(argv, capsys)
+
+    assert rc == 0
+    assert data == {"called": function}
+    assert captured["refresh"] is refresh
 
 
 # --- normalize / dedup / verify / usage ----------------------------------

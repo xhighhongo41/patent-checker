@@ -388,7 +388,7 @@ def _run_search_plan_check(
     total_sum = 0
     for query in queries:
         try:
-            xml, _path = client.search(query, begin=1, end=2)
+            xml = client.search(query, begin=1, end=2)
             total = parse_search_xml(xml).total_count
         except (ValueError, httpx.HTTPError) as exc:
             results.append({"query": query, "error": str(exc)})

@@ -275,13 +275,13 @@ class _StubOpsClient:
         self.closed = False
         self.calls: list[tuple[str, int, int]] = []
 
-    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> tuple[bytes, Path]:
+    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
         """Record the call and replay the canned response for *cql*."""
         self.calls.append((cql, begin, end))
         response = self._responses[cql]
         if isinstance(response, BaseException):
             raise response
-        return response, Path("unused.xml")
+        return response
 
     def close(self) -> None:
         """Mark the stub as closed, so tests can assert it was (not) called."""

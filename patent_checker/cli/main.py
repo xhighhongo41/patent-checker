@@ -83,7 +83,7 @@ def _ops_client() -> OpsClient:
 
 
 def _cache() -> Cache:
-    """Return the file cache rooted in this run's data base directory."""
+    """Return the file cache: the shared cache root plus this project's search cache."""
     return default_cache()
 
 
@@ -117,7 +117,12 @@ def _cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     """Run a published-data CQL search and return one page of hits."""
     with _ops_client() as client:
         return service.search(
-            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+            args.cql,
+            begin=args.begin,
+            end=args.end,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
         )
 
 
@@ -125,7 +130,12 @@ def _cmd_search_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Run a biblio-constituent CQL search and return one page of full biblio records."""
     with _ops_client() as client:
         return service.search_biblio(
-            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+            args.cql,
+            begin=args.begin,
+            end=args.end,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
         )
 
 
@@ -144,7 +154,7 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch bibliographic data for one publication."""
     with _ops_client() as client:
-        return service.biblio(args.pub, client=client, cache=_cache())
+        return service.biblio(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
@@ -157,20 +167,20 @@ def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
     # taken; the Google Patents route needs no credentials.
     if service.ops_fulltext_candidate(args.pub) and ops_configured():
         with OpsClient() as client:
-            return service.claims(args.pub, client=client, cache=_cache())
-    return service.claims(args.pub, cache=_cache())
+            return service.claims(args.pub, client=client, cache=_cache(), refresh=args.refresh)
+    return service.claims(args.pub, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_legal(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication."""
     with _ops_client() as client:
-        return service.legal(args.pub, client=client, cache=_cache())
+        return service.legal(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch the simple patent family of one publication."""
     with _ops_client() as client:
-        return service.family(args.pub, client=client, cache=_cache())
+        return service.family(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 # --- offline helpers -----------------------------------------------------
@@ -262,6 +272,11 @@ def _cmd_consent_record(args: argparse.Namespace) -> dict[str, Any]:
 # --- argument parser -------------------------------------------------------
 
 
+def _add_refresh_flag(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``--refresh`` flag to a cache-backed subcommand."""
+    parser.add_argument("--refresh", action="store_true", help="Ignore cached data and fetch again")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level parser with every subcommand registered."""
     parser = _JsonArgumentParser(
@@ -275,6 +290,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("cql", help="CQL query expression")
     search_parser.add_argument("--begin", type=int, default=1)
     search_parser.add_argument("--end", type=int, default=25)
+    _add_refresh_flag(search_parser)
     search_parser.set_defaults(handler=_cmd_search)
 
     search_biblio_parser = subparsers.add_parser(
@@ -283,6 +299,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_biblio_parser.add_argument("cql", help="CQL query expression")
     search_biblio_parser.add_argument("--begin", type=int, default=1)
     search_biblio_parser.add_argument("--end", type=int, default=25)
+    _add_refresh_flag(search_biblio_parser)
     search_biblio_parser.set_defaults(handler=_cmd_search_biblio)
 
     plan_check_parser = subparsers.add_parser(
@@ -297,20 +314,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     biblio_parser = subparsers.add_parser("biblio", help="Fetch bibliographic data")
     biblio_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(biblio_parser)
     biblio_parser.set_defaults(handler=_cmd_biblio)
 
     claims_parser = subparsers.add_parser(
         "claims", help="Fetch claims (GP, OPS fallback for EP/WO)"
     )
     claims_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(claims_parser)
     claims_parser.set_defaults(handler=_cmd_claims)
 
     legal_parser = subparsers.add_parser("legal", help="Fetch INPADOC legal-status events")
     legal_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(legal_parser)
     legal_parser.set_defaults(handler=_cmd_legal)
 
     family_parser = subparsers.add_parser("family", help="Fetch the simple patent family")
     family_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(family_parser)
     family_parser.set_defaults(handler=_cmd_family)
 
     normalize_parser = subparsers.add_parser("normalize", help="Normalize a publication number")
