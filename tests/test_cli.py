@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,12 @@ import pytest
 
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
+import patent_checker.server.tools as server_tools
 from patent_checker import consent, service
+from patent_checker.cache import Cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
-from patent_checker.gp.fetch import GPUnavailable
+from patent_checker.gp.fetch import FetchedPage, GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
 from patent_checker.ops.parse import (
@@ -37,7 +40,11 @@ from patent_checker.ops.parse import (
 
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep CLI tests hermetic: no file cache reads or writes."""
+    """Keep CLI tests hermetic: no file cache reads or writes.
+
+    Without a cache nothing stores the response body, so every ``raw_path``
+    below is ``null``; the paths themselves are covered where the cache is.
+    """
     monkeypatch.setattr(cli_main, "_cache", lambda: None)
 
 
@@ -54,6 +61,22 @@ def _invoke(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, d
         rc = exc.code
     out = capsys.readouterr().out
     return rc, json.loads(out)
+
+
+def _invoke_with_stderr(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> tuple[int, dict[str, Any], str]:
+    """Run ``main(argv)`` like :func:`_invoke`, also returning what went to stderr.
+
+    Used by the input-validation tests: a rejected payload must be reported
+    through the JSON envelope, never as a Python traceback.
+    """
+    try:
+        rc = cli_main.main(argv)
+    except SystemExit as exc:
+        rc = exc.code
+    captured = capsys.readouterr()
+    return rc, json.loads(captured.out), captured.err
 
 
 class _StubOpsClient:
@@ -88,9 +111,7 @@ def test_search_success(
 ) -> None:
     """A successful search prints the OpsSearchPage fields plus the raw path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(search=(b"<xml/>", Path("/tmp/raw.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(search=b"<xml/>"))
     page = OpsSearchPage(
         total_count=2,
         query="ti=drone",
@@ -109,7 +130,7 @@ def test_search_success(
         "begin": 1,
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
-        "raw_path": "/tmp/raw.xml",
+        "raw_path": None,
     }
 
 
@@ -148,11 +169,7 @@ def test_search_biblio_success(
 ) -> None:
     """search-biblio prints total/begin/end plus one asdict entry per doc."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main,
-        "OpsClient",
-        lambda: _StubOpsClient(search_biblio=(b"<xml/>", Path("/tmp/sb.xml"))),
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(search_biblio=b"<xml/>"))
     biblio = OpsBiblio(
         pub="US.1.A1",
         family_id="100",
@@ -193,7 +210,7 @@ def test_search_biblio_success(
             "npl_citation_count": 0,
         }
     ]
-    assert data["raw_path"] == "/tmp/sb.xml"
+    assert data["raw_path"] is None
 
 
 def test_plan_check_reads_queries_from_positional_args_and_file(
@@ -207,9 +224,15 @@ def test_plan_check_reads_queries_from_positional_args_and_file(
     captured: dict[str, Any] = {}
 
     def fake_plan_check(
-        queries: list[str], *, client: Any = None, max_total: int | None = None
+        queries: list[str],
+        *,
+        client: Any = None,
+        max_total: int | None = None,
+        cache: Any = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
         captured["queries"] = queries
+        captured["refresh"] = refresh
         return {"results": [], "total_sum": 0, "exceeded": False, "max_total": max_total}
 
     monkeypatch.setattr(service, "search_plan_check", fake_plan_check)
@@ -232,9 +255,7 @@ def test_biblio_success(
 ) -> None:
     """biblio prints the OpsBiblio fields plus the raw path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(biblio=(b"<xml/>", Path("/tmp/b.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(biblio=b"<xml/>"))
     biblio = OpsBiblio(
         pub="US.1.A1",
         family_id="100",
@@ -255,15 +276,13 @@ def test_biblio_success(
     assert rc == 0
     assert data["pub"] == "US.1.A1"
     assert data["applicants"] == ["Acme"]
-    assert data["raw_path"] == "/tmp/b.xml"
+    assert data["raw_path"] is None
 
 
 def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """legal prints one asdict entry per event, keyed under events, plus raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(legal=(b"<xml/>", Path("/tmp/l.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(legal=b"<xml/>"))
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
 
@@ -274,7 +293,7 @@ def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert data["events"] == [
         {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
     ]
-    assert data["raw_path"] == "/tmp/l.xml"
+    assert data["raw_path"] is None
 
 
 def test_family_success(
@@ -282,16 +301,14 @@ def test_family_success(
 ) -> None:
     """family prints family_id/members/raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(family=(b"<xml/>", Path("/tmp/f.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(family=b"<xml/>"))
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
     monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
     assert rc == 0
-    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": "/tmp/f.xml"}
+    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": None}
 
 
 # --- claims (route selection) -------------------------------------------
@@ -320,12 +337,11 @@ def _sample_gp_doc(**overrides: Any) -> GPatentDoc:
 
 
 def test_claims_google_patents_route(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """When Google Patents has the page, claims is read from it (source='gp')."""
-    page_path = tmp_path / "US11468338B2.html"
-    page_path.write_text("<html></html>", encoding="utf-8")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: page_path)
+    page = FetchedPage(pub="US11468338B2", html="<html></html>", path=None, cached=False)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: page)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
     rc, data = _invoke(["claims", "US11468338B2"], capsys)
@@ -344,11 +360,9 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
 ) -> None:
     """A GP 404 for an EP/WO document, with OPS configured, tries OPS full text."""
     unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
-    monkeypatch.setattr(
-        cli_main, "OpsClient", lambda: _StubOpsClient(claims=(b"<xml/>", Path("/tmp/c.xml")))
-    )
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(claims=b"<xml/>"))
     monkeypatch.setattr(
         service,
         "parse_claims_xml",
@@ -361,7 +375,7 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
     assert data["source"] == "ops-fulltext"
     assert data["pub"] == "EP1234567A1"
     assert data["claims"] == [{"number": 1, "text": "1. Claim text.", "depends_on": []}]
-    assert data["raw_path"] == "/tmp/c.xml"
+    assert data["raw_path"] is None
 
 
 def test_claims_unavailable_when_no_fallback_route(
@@ -371,7 +385,7 @@ def test_claims_unavailable_when_no_fallback_route(
     unavailable = GPUnavailable(
         pub="US20240111636A1", status_code=404, retry_after_hint="wait a bit"
     )
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
 
     rc, data = _invoke(["claims", "US20240111636A1"], capsys)
@@ -389,7 +403,7 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 ) -> None:
     """When OPS full text also 404s, the result is still the normal unavailable shape."""
     unavailable = GPUnavailable(pub="WO2020123456A1", status_code=404, retry_after_hint="wait")
-    monkeypatch.setattr(service, "fetch_patent_html", lambda pub: unavailable)
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
     not_found = httpx.HTTPStatusError(
         "404", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(404)
@@ -400,6 +414,50 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 
     assert rc == 0
     assert data == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+
+
+# --- --refresh ------------------------------------------------------------
+
+
+# The subcommands that read through the cache, with an argument each accepts.
+_REFRESHABLE_COMMANDS = [
+    ("search", "ti=drone", "search"),
+    ("search-biblio", "ti=drone", "search_biblio"),
+    ("biblio", "US.1.A1", "biblio"),
+    ("claims", "US11468338B2", "claims"),
+    ("legal", "US.1.A1", "legal"),
+    ("family", "US.1.A1", "family"),
+    ("plan-check", "ti=drone", "plan_check"),
+]
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+@pytest.mark.parametrize(("command", "argument", "function"), _REFRESHABLE_COMMANDS)
+def test_refresh_flag_is_forwarded_to_the_service(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    argument: str,
+    function: str,
+    refresh: bool,
+) -> None:
+    """--refresh reaches the service as refresh=True; without it the default False is sent."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient())
+    captured: dict[str, Any] = {}
+
+    def recorder(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {"called": function}
+
+    monkeypatch.setattr(service, function, recorder)
+    argv = [command, argument] + (["--refresh"] if refresh else [])
+
+    rc, data = _invoke(argv, capsys)
+
+    assert rc == 0
+    assert data == {"called": function}
+    assert captured["refresh"] is refresh
 
 
 # --- normalize / dedup / verify / usage ----------------------------------
@@ -463,10 +521,63 @@ def test_dedup_non_array_json_is_invalid_input(
     path = tmp_path / "bad.json"
     path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
 
-    rc, data = _invoke(["dedup", str(path)], capsys)
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
 
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_an_element_that_is_not_an_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hit that is not a JSON object is rejected by index, without a traceback."""
+    path = tmp_path / "hits.json"
+    path.write_text(json.dumps([{"pub": "US.1.A1"}, 2]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_an_element_without_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hit missing "pub" is invalid input rather than an uncaught KeyError."""
+    path = tmp_path / "hits.json"
+    path.write_text(json.dumps([{"x": 1}]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[0]" in data["error"]["message"]
+    assert "pub" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_dedup_rejects_more_hits_than_the_batch_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A payload over MAX_BATCH_RECORDS is refused before any work is done."""
+    path = tmp_path / "hits.json"
+    hits = [{"pub": "US.1.A1"}] * (service.MAX_BATCH_RECORDS + 1)
+    path.write_text(json.dumps(hits), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert str(service.MAX_BATCH_RECORDS) in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_batch_limit_is_shared_with_the_mcp_server() -> None:
+    """The CLI and the MCP server refuse an oversized batch at the same size."""
+    assert server_tools.MAX_RECORDS == service.MAX_BATCH_RECORDS
 
 
 def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -482,6 +593,84 @@ def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
     assert data["ok"] is True
     assert data["input_count"] == 2
     assert data["output_count"] == 2
+
+
+def _write_verify_files(tmp_path: Path, input_data: Any, output_data: Any) -> list[str]:
+    """Write both verify payloads and return the argv tail naming them."""
+    input_path = tmp_path / "input.json"
+    output_path = tmp_path / "output.json"
+    input_path.write_text(json.dumps(input_data), encoding="utf-8")
+    output_path.write_text(json.dumps(output_data), encoding="utf-8")
+    return ["--input", str(input_path), "--output", str(output_path)]
+
+
+def test_verify_rejects_an_input_element_that_is_not_a_string(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--input must hold publication-number strings; anything else is invalid input."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1", 2], [])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_an_output_element_that_is_neither_string_nor_record(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--output takes strings or objects carrying "pub"; a number is neither."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [7])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "[0]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_an_output_record_without_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An output object missing "pub" is invalid input rather than an uncaught KeyError."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [{"family_id": "1"}])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "pub" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_more_records_than_the_batch_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same MAX_BATCH_RECORDS ceiling applies to both verify payloads."""
+    oversized = ["US.1.A1"] * (service.MAX_BATCH_RECORDS + 1)
+    argv = ["verify", *_write_verify_files(tmp_path, oversized, [])]
+
+    rc, data, err = _invoke_with_stderr(argv, capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert str(service.MAX_BATCH_RECORDS) in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_accepts_output_records_carrying_a_pub_key(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The validation does not reject the documented record shape."""
+    argv = ["verify", *_write_verify_files(tmp_path, ["US.1.A1"], [{"pub": "US.1.A1"}])]
+
+    rc, data = _invoke(argv, capsys)
+
+    assert rc == 0
+    assert data["ok"] is True
 
 
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -704,6 +893,412 @@ def test_serve_invalid_transport_is_invalid_input(capsys: pytest.CaptureFixture[
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- cache -----------------------------------------------------------------
+
+
+def _files_under(root: Path) -> set[Path]:
+    """Return every regular file under *root*, or an empty set if *root* does not exist."""
+    if not root.exists():
+        return set()
+    return {path for path in root.rglob("*") if path.is_file()}
+
+
+def test_cache_status_on_empty_cache_reports_zero_totals_and_dirs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status on a cache with nothing written reports zero entries and its directories."""
+    shared = tmp_path / "shared"
+    local = tmp_path / "local"
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(shared, local))
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    assert data["shared_dir"] == str(shared)
+    assert data["local_dir"] == str(local)
+    assert data["same_root"] is False
+    assert data["totals"]["entries"] == 0
+
+
+def test_cache_status_reports_per_kind_counts_and_same_root_when_one_root(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status reflects entries written via Cache.put, per kind and in total."""
+    cache = Cache(tmp_path / "cache")  # local defaults to shared -> one root
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("search", "abc123", b"<xml/>", ident="ti=drone")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    assert data["same_root"] is True
+    assert data["totals"]["entries"] == 2
+    assert data["kinds"]["biblio"]["entries"] == 1
+    assert data["kinds"]["search"]["entries"] == 1
+    assert data["kinds"]["claims"]["entries"] == 0
+
+
+def test_cache_status_config_error_from_cache_ttl_is_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ConfigError raised by _cache() (a malformed cache TTL) is reported as config_error."""
+
+    def _raise() -> Cache:
+        raise ConfigError("PATENT_CHECKER_CACHE_TTL: invalid TTL 'bogus'")
+
+    monkeypatch.setattr(cli_main, "_cache", _raise)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 4
+    assert data["error"]["type"] == "config_error"
+
+
+def test_cache_without_subcommand_is_invalid_input(capsys: pytest.CaptureFixture[str]) -> None:
+    """'cache' with no status/clear child is an argparse-level invalid_input error."""
+    rc, data = _invoke(["cache"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_default_is_a_dry_run_that_deletes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache clear without --yes lists the selection but leaves every file in place."""
+    root = tmp_path / "cache"
+    cache = Cache(root)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+    before = _files_under(root)
+
+    rc, data = _invoke(["cache", "clear"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert data["selected"] == 2
+    assert {entry["kind"] for entry in data["entries"]} == {"biblio", "legal"}
+    assert _files_under(root) == before
+
+
+def test_cache_clear_with_yes_deletes_only_the_selected_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache clear --kind biblio --yes deletes only the biblio entry's files."""
+    root = tmp_path / "cache"
+    cache = Cache(root)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--kind", "biblio", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is False
+    assert data["selected"] == 1
+    assert data["removed"] == 2  # body file + sidecar
+    assert data["errors"] == []
+    assert cache.content_path("biblio", "US.1.A1").exists() is False
+    assert cache.content_path("legal", "US.1.A1").exists() is True
+
+
+def test_cache_clear_kind_filter_accepts_repeated_flags(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--kind may be repeated to select more than one kind."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("family", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--kind", "biblio", "--kind", "legal"], capsys)
+
+    assert rc == 0
+    assert data["selected"] == 2
+    assert {entry["kind"] for entry in data["entries"]} == {"biblio", "legal"}
+
+
+def test_cache_clear_older_than_selects_by_age_boundary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--older-than N keeps entries fetched at least N days before the check (boundary included)."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="old")  # exactly 2 days old at check time
+
+    clock_value = datetime(2026, 9, 2, 12, 0, 0)
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="new")  # 1 day old at check time
+
+    clock_value = datetime(2026, 9, 3, 12, 0, 0)
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--older-than", "2"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["biblio"]
+
+
+def test_cache_clear_pub_selects_only_that_publications_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--pub restricts the selection to the entries keyed by that publication number."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.put("biblio", "EP.2.A1", b"<xml/>", ident="EP.2.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--pub", "US1A1"], capsys)
+
+    assert rc == 0
+    assert [entry["key"] for entry in data["entries"]] == ["US.1.A1"]
+
+
+def test_cache_clear_expired_flag_selects_only_expired_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--expired keeps only entries whose TTL has elapsed."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")  # legal TTL is 7 days
+    cache.put("claims", "US.1.A1", b"<xml/>", ident="US.1.A1")  # claims never expires
+
+    clock_value = datetime(2026, 9, 1, 12, 0, 0) + timedelta(days=8)
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--expired"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["legal"]
+
+
+def test_cache_clear_broken_flag_selects_only_broken_entries(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--broken keeps only entries that cannot be served for a structural reason."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    cache.content_path("biblio", "US.1.A1").unlink()  # body now missing -> broken
+    cache.put("legal", "US.1.A1", b"<xml/>", ident="US.1.A1")
+    monkeypatch.setattr(cli_main, "_cache", lambda: cache)
+
+    rc, data = _invoke(["cache", "clear", "--broken"], capsys)
+
+    assert rc == 0
+    assert [entry["kind"] for entry in data["entries"]] == ["biblio"]
+    assert data["entries"][0]["problem"] == "missing body"
+
+
+def test_cache_clear_negative_older_than_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A negative --older-than is rejected as invalid_input, exit code 2."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--older-than", "-1"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_unknown_kind_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """An unknown --kind is rejected (via Cache.select's ValueError) as invalid_input."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--kind", "bogus"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_cache_clear_unparseable_pub_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A --pub value that is not a parseable publication number is invalid_input."""
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+
+    rc, data = _invoke(["cache", "clear", "--pub", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+# --- clean -----------------------------------------------------------------
+
+
+def _clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
+    """Point ``clean`` and ``cache status`` at a throwaway tree; return its paths.
+
+    Every location the command can reach (project data base, shared cache,
+    the server's data directory and the per-user consent record) is
+    redirected under *tmp_path*, so no test can touch a real one.
+    """
+    project = tmp_path / "project"
+    shared = tmp_path / "shared"
+    user_data = tmp_path / "userdata"
+    user_consent = tmp_path / "userconfig" / "consent.json"
+    for path, text in (
+        (project / "cache" / "ops" / "search" / "aaaa.xml", "<search/>"),
+        (project / "cache" / "ops" / "biblio" / "US.1.A1.xml", "<biblio/>"),
+        (project / "raw" / "ops" / "headers.jsonl", "{}\n"),
+        (project / "raw" / "ops" / "20260101-120000_biblio_US1.xml", "<legacy/>"),
+        (project / "raw" / "gp" / "US1A1.html", "<html></html>"),
+        (project / "reports" / "report-x-20260101-1200.md", "# report"),
+        (project / "consent.json", '{"notice_version": "1"}'),
+        (shared / "ops" / "biblio" / "EP.2.A1.xml", "<biblio/>"),
+        (user_data / "raw" / "ops" / "headers.jsonl", "{}\n"),
+        (user_consent, '{"notice_version": "1"}'),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(cli_main.config, "data_base", lambda: project)
+    monkeypatch.setattr(cli_main.config, "user_data_dir", lambda: user_data)
+    monkeypatch.setattr(cli_main.consent, "user_consent_path", lambda: user_consent)
+    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(shared, project / "cache"))
+    return {
+        "project": project,
+        "shared": shared,
+        "user_data": user_data,
+        "user_consent": user_consent,
+    }
+
+
+def test_clean_default_is_a_dry_run_that_deletes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """clean without --yes lists this project's leftovers and leaves every file in place."""
+    paths = _clean_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc, data = _invoke(["clean"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert data["scope"] == {"project": str(paths["project"]), "shared": None, "user_data": None}
+    assert {item["category"] for item in data["items"]} == {
+        "search-cache",
+        "request-log",
+        "legacy-raw",
+        "legacy-cache",
+    }
+    assert data["total_files"] == 5
+    assert data["total_bytes"] > 0
+    assert "removed_files" not in data
+    assert _files_under(tmp_path) == before
+
+
+def test_clean_with_yes_removes_the_project_leftovers_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """clean --yes empties the cache and raw directories, sparing everything else."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["dry_run"] is False
+    assert data["removed_files"] == data["total_files"]
+    assert data["bytes"] == data["total_bytes"]
+    assert data["errors"] == []
+    # The removed paths are only counted: the list itself would be unbounded.
+    assert "paths" not in data
+    assert _files_under(paths["project"] / "cache") == set()
+    assert _files_under(paths["project"] / "raw") == set()
+    assert (paths["project"] / "reports" / "report-x-20260101-1200.md").exists()
+    assert (paths["project"] / "consent.json").exists()
+    assert _files_under(paths["shared"]) != set()
+    assert _files_under(paths["user_data"]) != set()
+    assert paths["user_consent"].exists()
+
+
+def test_clean_include_artifacts_also_removes_what_the_agent_wrote(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--include-artifacts adds the reports, but still not the consent record."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--include-artifacts", "--yes"], capsys)
+
+    assert rc == 0
+    assert "artifact" in {item["category"] for item in data["items"]}
+    assert not (paths["project"] / "reports").exists()
+    assert (paths["project"] / "consent.json").exists()
+
+
+def test_clean_include_consent_removes_the_project_record_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--include-consent alone leaves the per-user record in place."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--include-consent", "--yes"], capsys)
+
+    assert rc == 0
+    assert not (paths["project"] / "consent.json").exists()
+    assert paths["user_consent"].exists()
+    assert (paths["project"] / "reports" / "report-x-20260101-1200.md").exists()
+
+
+def test_clean_shared_targets_the_shared_cache_and_the_server_data(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """--shared names both extra scopes and, with --yes, empties them too."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["clean", "--shared", "--include-consent", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["scope"]["shared"] == str(paths["shared"])
+    assert data["scope"]["user_data"] == str(paths["user_data"])
+    assert {"shared", "user"} <= {item["scope"] for item in data["items"]}
+    assert _files_under(paths["shared"]) == set()
+    assert _files_under(paths["user_data"]) == set()
+    assert not paths["user_consent"].exists()
+
+
+def test_clean_reports_removal_errors_and_still_exits_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A path that could not be removed is reported in the JSON, not as a failure."""
+    _clean_env(monkeypatch, tmp_path)
+    failure = {
+        "removed_files": 0,
+        "bytes": 0,
+        "paths": [],
+        "errors": [{"path": "/elsewhere", "error": "outside the cleanup roots"}],
+    }
+    monkeypatch.setattr(cli_main.cleanup, "execute", lambda plan: failure)
+
+    rc, data = _invoke(["clean", "--yes"], capsys)
+
+    assert rc == 0
+    assert data["removed_files"] == 0
+    assert data["errors"] == failure["errors"]
+
+
+def test_cache_status_reports_the_legacy_layout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """cache status carries a legacy section counting what the v0.3 layout still holds."""
+    paths = _clean_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    legacy = data["legacy"]
+    assert legacy["raw_ops_bodies"]["dir"] == str(paths["project"] / "raw" / "ops")
+    assert legacy["raw_ops_bodies"]["files"] == 1  # headers.jsonl is not a leftover
+    assert legacy["raw_gp"]["files"] == 1
+    assert legacy["cache_pub_kinds"]["files"] == 1
+    assert legacy["total_files"] == 3
+    assert legacy["total_bytes"] > 0
+
+
 # --- general CLI behavior -------------------------------------------------
 
 
@@ -728,6 +1323,8 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "usage",
         "consent",
         "serve",
+        "cache",
+        "clean",
     ):
         assert name in out
 

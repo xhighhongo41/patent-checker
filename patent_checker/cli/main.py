@@ -18,8 +18,9 @@ code encodes the same distinction:
 - ``3``: an external API call failed (``httpx.HTTPError``).
 - ``4``: configuration is missing or invalid (``patent_checker.config.
   ConfigError``): EPO OPS credentials for an OPS-backed command (error type
-  ``ops_not_configured``), or MCP server settings for ``serve`` (error type
-  ``config_error``).
+  ``ops_not_configured``), or any other invalid configuration -- MCP server
+  settings for ``serve``, or a malformed ``$PATENT_CHECKER_CACHE_TTL`` for a
+  cache-backed command (error type ``config_error``).
 
 Every subcommand handler is a thin adapter over :mod:`patent_checker.service`,
 which holds the actual logic and is shared with the MCP server.
@@ -30,13 +31,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from patent_checker import __version__, consent, service
-from patent_checker.cache import Cache, default_cache
+from patent_checker import __version__, cleanup, config, consent, service
+from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
 
@@ -83,7 +86,7 @@ def _ops_client() -> OpsClient:
 
 
 def _cache() -> Cache:
-    """Return the file cache rooted in this run's data base directory."""
+    """Return the file cache: the shared cache root plus this project's search cache."""
     return default_cache()
 
 
@@ -104,6 +107,76 @@ def _read_json_array(path: str, *, allow_stdin: bool = False) -> list[Any]:
     return data
 
 
+def _check_batch_size(items: Sequence[Any], label: str) -> None:
+    """Reject a batch larger than :data:`patent_checker.service.MAX_BATCH_RECORDS`.
+
+    Raises:
+        ValueError: If *items* holds more entries than the shared limit.
+    """
+    if len(items) > service.MAX_BATCH_RECORDS:
+        raise ValueError(
+            f"{label} holds {len(items)} entries: at most {service.MAX_BATCH_RECORDS} are accepted"
+        )
+
+
+def _check_hits(hits: Sequence[Any], label: str) -> None:
+    """Check a ``dedup`` payload: a bounded list of objects carrying ``"pub"``.
+
+    Validating here keeps a malformed payload on the invalid_input path
+    (exit code 2, JSON envelope) instead of surfacing as a ``KeyError``
+    traceback from the dedup logic.
+
+    Raises:
+        ValueError: If the payload is too large, or an element is not an
+            object or has no ``"pub"`` key. The message names the offending
+            index.
+    """
+    _check_batch_size(hits, label)
+    for index, hit in enumerate(hits):
+        if not isinstance(hit, dict):
+            raise ValueError(
+                f'{label}[{index}] must be an object carrying "pub", got {type(hit).__name__}'
+            )
+        if "pub" not in hit:
+            raise ValueError(f'{label}[{index}] has no "pub" key')
+
+
+def _check_pub_strings(pubs: Sequence[Any], label: str) -> None:
+    """Check a ``verify --input`` payload: a bounded list of publication strings.
+
+    Raises:
+        ValueError: If the payload is too large or an element is not a
+            string. The message names the offending index.
+    """
+    _check_batch_size(pubs, label)
+    for index, pub in enumerate(pubs):
+        if not isinstance(pub, str):
+            raise ValueError(
+                f"{label}[{index}] must be a publication-number string, got {type(pub).__name__}"
+            )
+
+
+def _check_output_records(records: Sequence[Any], label: str) -> None:
+    """Check a ``verify --output`` payload: strings or objects carrying ``"pub"``.
+
+    Raises:
+        ValueError: If the payload is too large, or an element is neither a
+            string nor an object with a ``"pub"`` key. The message names the
+            offending index.
+    """
+    _check_batch_size(records, label)
+    for index, record in enumerate(records):
+        if isinstance(record, str):
+            continue
+        if not isinstance(record, dict):
+            raise ValueError(
+                f"{label}[{index}] must be a publication-number string or an object "
+                f'carrying "pub", got {type(record).__name__}'
+            )
+        if "pub" not in record:
+            raise ValueError(f'{label}[{index}] has no "pub" key')
+
+
 def _read_query_file(path: str) -> list[str]:
     """Return the CQL queries in *path*, one per non-empty, non-comment line."""
     lines = Path(path).read_text(encoding="utf-8").splitlines()
@@ -117,7 +190,12 @@ def _cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     """Run a published-data CQL search and return one page of hits."""
     with _ops_client() as client:
         return service.search(
-            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+            args.cql,
+            begin=args.begin,
+            end=args.end,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
         )
 
 
@@ -125,7 +203,12 @@ def _cmd_search_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Run a biblio-constituent CQL search and return one page of full biblio records."""
     with _ops_client() as client:
         return service.search_biblio(
-            args.cql, begin=args.begin, end=args.end, client=client, cache=_cache()
+            args.cql,
+            begin=args.begin,
+            end=args.end,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
         )
 
 
@@ -135,7 +218,13 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
     if args.file:
         queries.extend(_read_query_file(args.file))
     with _ops_client() as client:
-        return service.plan_check(queries, max_total=args.max_total, client=client)
+        return service.plan_check(
+            queries,
+            max_total=args.max_total,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
+        )
 
 
 # --- single-document lookups --------------------------------------------
@@ -144,7 +233,7 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch bibliographic data for one publication."""
     with _ops_client() as client:
-        return service.biblio(args.pub, client=client, cache=_cache())
+        return service.biblio(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
@@ -157,20 +246,20 @@ def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
     # taken; the Google Patents route needs no credentials.
     if service.ops_fulltext_candidate(args.pub) and ops_configured():
         with OpsClient() as client:
-            return service.claims(args.pub, client=client, cache=_cache())
-    return service.claims(args.pub, cache=_cache())
+            return service.claims(args.pub, client=client, cache=_cache(), refresh=args.refresh)
+    return service.claims(args.pub, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_legal(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication."""
     with _ops_client() as client:
-        return service.legal(args.pub, client=client, cache=_cache())
+        return service.legal(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch the simple patent family of one publication."""
     with _ops_client() as client:
-        return service.family(args.pub, client=client, cache=_cache())
+        return service.family(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 # --- offline helpers -----------------------------------------------------
@@ -182,14 +271,28 @@ def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
-    """Collapse a list of search hits into one record per patent family."""
-    return service.dedup(_read_json_array(args.path, allow_stdin=True))
+    """Collapse a list of search hits into one record per patent family.
+
+    Raises:
+        ValueError: If the payload is not a well-formed, bounded list of
+            hits (see :func:`_check_hits`).
+    """
+    hits = _read_json_array(args.path, allow_stdin=True)
+    _check_hits(hits, "hits")
+    return service.dedup(hits)
 
 
 def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
-    """Cross-check a delegated batch's output against its input publication list."""
+    """Cross-check a delegated batch's output against its input publication list.
+
+    Raises:
+        ValueError: If either payload is not well-formed or is over the
+            shared batch limit.
+    """
     input_pubs = _read_json_array(args.input)
+    _check_pub_strings(input_pubs, "--input")
     output_records = _read_json_array(args.output)
+    _check_output_records(output_records, "--output")
     return service.verify(input_pubs, output_records)
 
 
@@ -259,7 +362,128 @@ def _cmd_consent_record(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+# --- cache -------------------------------------------------------------
+
+
+def _cache_entry_summary(entry: CacheEntry) -> dict[str, Any]:
+    """Return the JSON-serializable summary of one ``CacheEntry`` for ``cache clear``."""
+    return {
+        "kind": entry.kind,
+        "key": entry.key,
+        "root": entry.root,
+        "path": str(entry.path),
+        "fetched_at": entry.fetched_at,
+        "expired": entry.expired,
+        "broken": entry.broken,
+        "problem": entry.problem,
+    }
+
+
+def _cmd_cache_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Report cache entry counts and byte totals, per kind, in total, and for the old layout."""
+    cache = _cache()
+    return {
+        **cache.stats(),
+        "legacy": cleanup.legacy_summary(config.data_base(), cache),
+    }
+
+
+def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
+    """Select cache entries matching the given filters and, only with ``--yes``, delete them.
+
+    Without ``--yes`` this is a dry run: nothing is deleted, and the
+    selected entries are listed so a caller can review them first.
+
+    Raises:
+        ValueError: If ``--older-than`` is negative, an unknown ``--kind``
+            is given, or ``--pub`` is not a parseable publication number
+            (all propagated from :meth:`Cache.select`, except the
+            ``--older-than`` sign check done here).
+    """
+    if args.older_than is not None and args.older_than < 0:
+        raise ValueError(f"--older-than must not be negative, got {args.older_than}")
+    older_than = timedelta(days=args.older_than) if args.older_than is not None else None
+
+    cache = _cache()
+    selected = cache.select(
+        kinds=args.kind,
+        older_than=older_than,
+        pub=args.pub,
+        expired=args.expired,
+        broken=args.broken,
+    )
+
+    if not args.yes:
+        return {
+            "dry_run": True,
+            "selected": len(selected),
+            "bytes": sum(entry.size for entry in selected),
+            "entries": [_cache_entry_summary(entry) for entry in selected],
+        }
+
+    removal = cache.remove(selected)
+    return {
+        "dry_run": False,
+        "selected": len(selected),
+        "removed": removal["removed"],
+        "bytes": removal["bytes"],
+        "paths": removal["paths"],
+        "errors": removal["errors"],
+    }
+
+
+# --- clean -------------------------------------------------------------
+
+
+def _cmd_clean(args: argparse.Namespace) -> dict[str, Any]:
+    """Report, and only with ``--yes`` remove, what this project left on disk.
+
+    Without ``--yes`` this is a dry run: the plan is listed and not one file
+    is deleted. A path that could not be removed is reported under
+    ``errors`` and does not fail the command, since the rest of the cleanup
+    did happen.
+    """
+    data_base = config.data_base()
+    user_data_dir = config.user_data_dir()
+    cache = _cache()
+    plan = cleanup.plan_cleanup(
+        data_base=data_base,
+        cache=cache,
+        shared=args.shared,
+        include_artifacts=args.include_artifacts,
+        include_consent=args.include_consent,
+        user_data_dir=user_data_dir,
+        user_consent_path=consent.user_consent_path(),
+    )
+    result: dict[str, Any] = {
+        "dry_run": not args.yes,
+        "scope": {
+            "project": str(data_base),
+            # Named only when they are actually in scope, so a reader cannot
+            # mistake a listed directory for one that will be touched.
+            "shared": str(cache.shared) if args.shared else None,
+            "user_data": str(user_data_dir) if args.shared else None,
+        },
+        **plan.to_dict(),
+    }
+    if not args.yes:
+        return result
+
+    removal = cleanup.execute(plan)
+    # The removed paths themselves are left out: they are as long as the
+    # plan, which the caller already has above.
+    result["removed_files"] = removal["removed_files"]
+    result["bytes"] = removal["bytes"]
+    result["errors"] = removal["errors"]
+    return result
+
+
 # --- argument parser -------------------------------------------------------
+
+
+def _add_refresh_flag(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``--refresh`` flag to a cache-backed subcommand."""
+    parser.add_argument("--refresh", action="store_true", help="Ignore cached data and fetch again")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -275,6 +499,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("cql", help="CQL query expression")
     search_parser.add_argument("--begin", type=int, default=1)
     search_parser.add_argument("--end", type=int, default=25)
+    _add_refresh_flag(search_parser)
     search_parser.set_defaults(handler=_cmd_search)
 
     search_biblio_parser = subparsers.add_parser(
@@ -283,6 +508,7 @@ def _build_parser() -> argparse.ArgumentParser:
     search_biblio_parser.add_argument("cql", help="CQL query expression")
     search_biblio_parser.add_argument("--begin", type=int, default=1)
     search_biblio_parser.add_argument("--end", type=int, default=25)
+    _add_refresh_flag(search_biblio_parser)
     search_biblio_parser.set_defaults(handler=_cmd_search_biblio)
 
     plan_check_parser = subparsers.add_parser(
@@ -293,24 +519,29 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     plan_check_parser.add_argument("--file", help="File with one CQL query per line")
     plan_check_parser.add_argument("--max-total", type=int, default=None)
+    _add_refresh_flag(plan_check_parser)
     plan_check_parser.set_defaults(handler=_cmd_plan_check)
 
     biblio_parser = subparsers.add_parser("biblio", help="Fetch bibliographic data")
     biblio_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(biblio_parser)
     biblio_parser.set_defaults(handler=_cmd_biblio)
 
     claims_parser = subparsers.add_parser(
         "claims", help="Fetch claims (GP, OPS fallback for EP/WO)"
     )
     claims_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(claims_parser)
     claims_parser.set_defaults(handler=_cmd_claims)
 
     legal_parser = subparsers.add_parser("legal", help="Fetch INPADOC legal-status events")
     legal_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(legal_parser)
     legal_parser.set_defaults(handler=_cmd_legal)
 
     family_parser = subparsers.add_parser("family", help="Fetch the simple patent family")
     family_parser.add_argument("pub", help="Publication number")
+    _add_refresh_flag(family_parser)
     family_parser.set_defaults(handler=_cmd_family)
 
     normalize_parser = subparsers.add_parser("normalize", help="Normalize a publication number")
@@ -344,8 +575,71 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.set_defaults(handler=_cmd_serve)
 
     _add_consent_parser(subparsers)
+    _add_cache_parser(subparsers)
+    _add_clean_parser(subparsers)
 
     return parser
+
+
+def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``clean`` subcommand and its opt-in scope flags."""
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove this project's cache and exploration residue (dry run unless --yes)",
+    )
+    clean_parser.add_argument(
+        "--shared",
+        action="store_true",
+        help="Also the shared cache and the MCP server's data directory",
+    )
+    clean_parser.add_argument(
+        "--include-artifacts",
+        action="store_true",
+        help="Also the data-directory entries this tool does not write (reports, notes)",
+    )
+    clean_parser.add_argument(
+        "--include-consent",
+        action="store_true",
+        help="Also the recorded consent (the per-user record needs --shared too)",
+    )
+    clean_parser.add_argument(
+        "--yes", action="store_true", help="Actually delete the listed paths (default: dry run)"
+    )
+    clean_parser.set_defaults(handler=_cmd_clean)
+
+
+def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``cache`` subcommand and its ``status``/``clear`` children."""
+    cache_parser = subparsers.add_parser("cache", help="Inspect and clear the file cache")
+    cache_subparsers = cache_parser.add_subparsers(dest="cache_command", required=True)
+
+    status_parser = cache_subparsers.add_parser(
+        "status", help="Report cache entry counts and byte totals"
+    )
+    status_parser.set_defaults(handler=_cmd_cache_status)
+
+    clear_parser = cache_subparsers.add_parser(
+        "clear", help="Delete cache entries matching filters (dry run unless --yes)"
+    )
+    clear_parser.add_argument(
+        "--kind", action="append", default=None, help="Restrict to this cache kind (repeatable)"
+    )
+    clear_parser.add_argument(
+        "--older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Only entries at least this many days old",
+    )
+    clear_parser.add_argument(
+        "--pub", default=None, help="Only the entry for this publication number"
+    )
+    clear_parser.add_argument("--expired", action="store_true", help="Only expired entries")
+    clear_parser.add_argument("--broken", action="store_true", help="Only broken entries")
+    clear_parser.add_argument(
+        "--yes", action="store_true", help="Actually delete the selected entries (default: dry run)"
+    )
+    clear_parser.set_defaults(handler=_cmd_cache_clear)
 
 
 def _add_consent_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -395,7 +689,16 @@ def main(argv: list[str] | None = None) -> int:
         _print_json(_error_result("invalid_input", str(exc)))
         return 2
     except ConfigError as exc:
-        _print_json(_error_result("ops_not_configured", str(exc)))
+        # OPS credential problems keep their own error type, since a Skill/
+        # agent may special-case them (e.g. point the user at `consent`
+        # instead of the operator's environment); every other ConfigError
+        # (a malformed $PATENT_CHECKER_CACHE_TTL, in practice) is generic.
+        error_type = (
+            "ops_not_configured"
+            if str(exc) == service.OPS_NOT_CONFIGURED_MESSAGE
+            else "config_error"
+        )
+        _print_json(_error_result(error_type, str(exc)))
         return 4
     except httpx.HTTPError as exc:
         _print_json(_error_result("external_api_error", str(exc)))

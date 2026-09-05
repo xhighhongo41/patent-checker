@@ -1,8 +1,16 @@
 """EPO OPS client.
 
-Observation-first design (plan section 4.1): every request saves the raw
-response body under ``raw/ops/`` and appends the response headers to
+Every method returns the raw response body and nothing else: storing it is
+the caller's job (:mod:`patent_checker.cache` keeps the single copy), so
+one response is never written to disk twice.
+
+What this module does keep is the request log of the observation-first
+design (plan section 4.1): every call appends its response headers to
 ``raw/ops/headers.jsonl`` so throttling behaviour can be analyzed later.
+A request served from the caller's cache never reaches this module and is
+therefore absent from that log, which keeps it an accurate record of real
+upstream usage.
+
 Requests are spaced per OPS service; the ``X-Throttling-Control`` header is
 recorded on every call: a non-green service state triggers a cool-down, and
 an "overloaded" system state tightens the per-service spacing to the
@@ -12,12 +20,10 @@ per-minute limits the header reports.
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import re
 import time
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 
@@ -113,7 +119,11 @@ def _validate_range(begin: int, end: int) -> None:
 
 
 class OpsClient:
-    """Minimal OPS client: authenticated GETs with raw-response capture."""
+    """Minimal OPS client: authenticated GETs returning the raw response body.
+
+    The bodies themselves are not stored here; only the request log under
+    ``<data_dir>/raw/ops/headers.jsonl`` is written.
+    """
 
     def __init__(self, transport: httpx.BaseTransport | None = None) -> None:
         self._client = httpx.Client(timeout=30.0, transport=transport)
@@ -195,14 +205,6 @@ class OpsClient:
         elif system in ("idle", "busy"):
             self._effective_interval.clear()
 
-    def _save_raw(self, kind: str, ident: str, content: bytes) -> Path:
-        """Save a raw response body as ``<timestamp>_<kind>_<ident>.xml``."""
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        safe_ident = re.sub(r"[^A-Za-z0-9_.-]", "-", ident)[:60]
-        path = self._data_dir / f"{stamp}_{kind}_{safe_ident}.xml"
-        path.write_bytes(content)
-        return path
-
     def _log_headers(self, kind: str, url: str, resp: httpx.Response) -> None:
         """Append one JSON line describing the response headers."""
         record = {
@@ -222,10 +224,12 @@ class OpsClient:
         *,
         service: str,
         kind: str,
-        ident: str,
         accept_not_found: bool = False,
-    ) -> tuple[bytes, Path]:
-        """Authenticated GET; returns ``(body, saved_raw_path)``.
+    ) -> bytes:
+        """Authenticated GET; returns the response body and logs its headers.
+
+        The body is handed back unsaved: the caller (the cache layer) keeps
+        the only copy on disk.
 
         With ``accept_not_found``, an HTTP 404 carrying the
         ``SERVER.EntityNotFound`` fault is returned like a normal response
@@ -239,13 +243,12 @@ class OpsClient:
         self._note_throttling(service, resp.headers.get("X-Throttling-Control", ""))
         if not (accept_not_found and _is_entity_not_found(resp)):
             resp.raise_for_status()
-        saved = self._save_raw(kind, ident, resp.content)
-        return resp.content, saved
+        return resp.content
 
     # -- endpoints ---------------------------------------------------------
 
-    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> tuple[bytes, Path]:
-        """Run a published-data CQL search; returns raw XML and its saved path.
+    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
+        """Run a published-data CQL search; returns the raw XML.
 
         The range is checked by :func:`_validate_range` first, and a zero-hit
         404 is returned as its fault body (see :meth:`_get`).
@@ -254,17 +257,15 @@ class OpsClient:
             ValueError: If the requested range is not accepted by OPS.
         """
         _validate_range(begin, end)
-        ident = hashlib.sha1(cql.encode()).hexdigest()[:10]
         query = httpx.QueryParams({"q": cql, "Range": f"{begin}-{end}"})
         return self._get(
             f"published-data/search?{query}",
             service="search",
             kind="search",
-            ident=ident,
             accept_not_found=True,
         )
 
-    def search_biblio(self, cql: str, *, begin: int = 1, end: int = 25) -> tuple[bytes, Path]:
+    def search_biblio(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
         """Run a CQL search with the biblio constituent (hits include biblio+abstract).
 
         Range checking and zero-hit handling are the same as in :meth:`search`.
@@ -273,28 +274,25 @@ class OpsClient:
             ValueError: If the requested range is not accepted by OPS.
         """
         _validate_range(begin, end)
-        ident = hashlib.sha1(cql.encode()).hexdigest()[:10] + f"_{begin}-{end}"
         query = httpx.QueryParams({"q": cql, "Range": f"{begin}-{end}"})
         return self._get(
             f"published-data/search/biblio?{query}",
             service="search",
             kind="searchbib",
-            ident=ident,
             accept_not_found=True,
         )
 
-    def biblio(self, pub: str) -> tuple[bytes, Path]:
-        """Fetch bibliographic data (docdb reference); returns raw XML and path."""
+    def biblio(self, pub: str) -> bytes:
+        """Fetch bibliographic data (docdb reference); returns the raw XML."""
         ref = parse_pubnum(pub).docdb()
         return self._get(
             f"published-data/publication/docdb/{ref}/biblio",
             service="retrieval",
             kind="biblio",
-            ident=ref,
         )
 
-    def legal(self, pub: str) -> tuple[bytes, Path]:
-        """Fetch INPADOC legal data (docdb reference); returns raw XML and path.
+    def legal(self, pub: str) -> bytes:
+        """Fetch INPADOC legal data (docdb reference); returns the raw XML.
 
         GB A publications frequently answer with an event-less body while the
         matching B publication carries the events (measured in v0.1: legal
@@ -302,39 +300,37 @@ class OpsClient:
         For such a document the B publication is queried once more, and its
         body is preferred when it does contain events; otherwise the original
         A response is returned. The retry goes through the normal rate
-        control, raw capture and header logging, and a missing B publication
-        (404) leaves the A response untouched.
+        control and header logging, and a missing B publication (404) leaves
+        the A response untouched.
         """
         parsed = parse_pubnum(pub)
         ref = parsed.docdb()
-        body, path = self._get(
+        body = self._get(
             f"legal/publication/docdb/{ref}",
             service="inpadoc",
             kind="legal",
-            ident=ref,
         )
         if parsed.country != "GB" or not parsed.kind.startswith("A"):
-            return body, path
+            return body
         if _LEGAL_EVENT_MARKER in body:
-            return body, path
+            return body
 
         granted_ref = PubNumber(country=parsed.country, number=parsed.number, kind="B").docdb()
         try:
-            granted_body, granted_path = self._get(
+            granted_body = self._get(
                 f"legal/publication/docdb/{granted_ref}",
                 service="inpadoc",
                 kind="legal",
-                ident=granted_ref,
             )
         except httpx.HTTPStatusError:
             # No B publication (or it is unavailable): keep the A response.
-            return body, path
+            return body
         if _LEGAL_EVENT_MARKER in granted_body:
-            return granted_body, granted_path
-        return body, path
+            return granted_body
+        return body
 
-    def claims(self, pub: str) -> tuple[bytes, Path]:
-        """Fetch the full-text claims (docdb reference); returns raw XML and path.
+    def claims(self, pub: str) -> bytes:
+        """Fetch the full-text claims (docdb reference); returns the raw XML.
 
         A 404 is *not* swallowed here: OPS has no full text for many offices,
         and the caller needs to see that in order to fall back to another
@@ -348,15 +344,13 @@ class OpsClient:
             f"published-data/publication/docdb/{ref}/claims",
             service="retrieval",
             kind="claims",
-            ident=ref,
         )
 
-    def family(self, pub: str) -> tuple[bytes, Path]:
-        """Fetch the simple patent family (docdb reference); returns raw XML and path."""
+    def family(self, pub: str) -> bytes:
+        """Fetch the simple patent family (docdb reference); returns the raw XML."""
         ref = parse_pubnum(pub).docdb()
         return self._get(
             f"family/publication/docdb/{ref}",
             service="other",
             kind="family",
-            ident=ref,
         )

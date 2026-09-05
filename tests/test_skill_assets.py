@@ -6,10 +6,12 @@ and must stay byte-identical. These tests also guard the notice-version
 bump discipline and the skill frontmatter.
 """
 
+import re
 from pathlib import Path
 
 import pytest
 
+from patent_checker.cleanup import CODE_OWNED_NAMES
 from patent_checker.consent import NOTICE_VERSION, notice_text
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +83,31 @@ def test_skill_keeps_consent_on_the_cli_and_names_the_error_prefixes() -> None:
     assert "server_status" in text
 
 
+def test_skill_artifact_directories_survive_the_default_cleanup() -> None:
+    """Where SKILL.md tells the agent to write must not be a name `clean` owns.
+
+    ``patent-checker clean`` removes the data-base entries the package
+    itself writes (:data:`patent_checker.cleanup.CODE_OWNED_NAMES`) and
+    spares everything else. If SKILL.md ever pointed the agent's artifacts
+    at one of those names, the default cleanup would silently delete a
+    report.
+    """
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    named = set(re.findall(r"\.patent-checker/([A-Za-z0-9_.-]+)", text))
+
+    assert "reports" in named, "SKILL.md no longer names .patent-checker/reports/"
+    for name in named:
+        assert name not in CODE_OWNED_NAMES, (
+            f"SKILL.md writes artifacts to .patent-checker/{name}, which the "
+            "default cleanup deletes"
+        )
+
+
+def test_consent_record_is_owned_by_the_package() -> None:
+    """The consent record is the package's own file, so it is only removed on request."""
+    assert "consent.json" in CODE_OWNED_NAMES
+
+
 @pytest.mark.parametrize("lang", ["en", "ja"])
 def test_operator_notice_files_carry_the_current_version(lang: str) -> None:
     from patent_checker.server.settings import OPERATOR_NOTICE_VERSION, operator_notice_text
@@ -88,3 +115,13 @@ def test_operator_notice_files_carry_the_current_version(lang: str) -> None:
     effective, text = operator_notice_text(lang)
     assert effective == lang
     assert OPERATOR_NOTICE_VERSION in text.splitlines()[0]
+
+
+def test_skill_documents_the_cache_and_cleanup_commands() -> None:
+    """SKILL.md must tell the agent how caching shows up and how traces are removed (v0.4)."""
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    assert "`patent-checker clean`" in text
+    assert "`patent-checker cache status`" in text
+    assert "--yes" in text
+    assert "`search_cache_dir`" in text
+    assert "--refresh" in text

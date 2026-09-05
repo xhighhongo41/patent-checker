@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from patent_checker.cache import Cache, search_key
 from patent_checker.config import data_dir
 from patent_checker.ops.client import OpsClient, parse_throttling_header
 from patent_checker.ops.parse import parse_search_xml
@@ -184,6 +185,8 @@ def search_plan_check(
     *,
     client: OpsClient | None = None,
     max_total: int | None = None,
+    cache: Cache | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     """Measure the hit count of every candidate CQL query in a search plan.
 
@@ -199,16 +202,35 @@ def search_plan_check(
     :class:`httpx.HTTPError`) does not stop the plan: it is recorded as an
     error entry and the remaining queries are still measured.
 
+    Each query's count is stored under the same cache entry a
+    ``Range=1-2`` search of that query would use (:func:`patent_checker.
+    cache.search_key`), so it is shared with (and can be served by) the
+    cache written by an ``ops_search``/``search`` call for the same query
+    and range. When *cache* is given and *refresh* is False, a fresh hit is
+    served without calling *client*, and the matching result entry carries
+    ``"cached": True``. A query that ends up as an error entry is never
+    written to the cache.
+
+    Args:
+        queries: CQL query expressions to measure.
+        client: Caller-owned OPS client; see above for the owned-client
+            case.
+        max_total: Hit-count budget the summed totals are compared against.
+        cache: Optional file cache; a fresh hit is served without calling
+            the client.
+        refresh: Ignore any cached entry and fetch again, replacing it.
+
     Returns:
-        ``{"results": [{"query": str, "total": int} or {"query": str,
-        "error": str}, ...], "total_sum": int (sum of "total" over the
-        queries that did not error), "exceeded": bool (True when *max_total*
-        is given and total_sum exceeds it), "max_total": int | None}``.
+        ``{"results": [{"query": str, "total": int} (plus "cached": True
+        when served from *cache*) or {"query": str, "error": str}, ...],
+        "total_sum": int (sum of "total" over the queries that did not
+        error), "exceeded": bool (True when *max_total* is given and
+        total_sum exceeds it), "max_total": int | None}``.
     """
     if client is not None:
-        return _run_search_plan_check(queries, client, max_total)
+        return _run_search_plan_check(queries, client, max_total, cache, refresh)
     with OpsClient() as owned_client:
-        return _run_search_plan_check(queries, owned_client, max_total)
+        return _run_search_plan_check(queries, owned_client, max_total, cache, refresh)
 
 
 def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
@@ -381,19 +403,35 @@ def _normalize_or_raw(pub: str) -> tuple[str, bool]:
 
 
 def _run_search_plan_check(
-    queries: Sequence[str], client: OpsClient, max_total: int | None
+    queries: Sequence[str],
+    client: OpsClient,
+    max_total: int | None,
+    cache: Cache | None,
+    refresh: bool,
 ) -> dict[str, Any]:
     """Probe every query in *queries* against *client* (see :func:`search_plan_check`)."""
     results: list[dict[str, Any]] = []
     total_sum = 0
     for query in queries:
+        key = search_key(query, 1, 2)
+        cache_hit = cache.get("search", key) if cache is not None and not refresh else None
         try:
-            xml, _path = client.search(query, begin=1, end=2)
+            xml = (
+                cache_hit.content if cache_hit is not None else client.search(query, begin=1, end=2)
+            )
             total = parse_search_xml(xml).total_count
         except (ValueError, httpx.HTTPError) as exc:
             results.append({"query": query, "error": str(exc)})
             continue
-        results.append({"query": query, "total": total})
+        # Only a freshly fetched (never a cached) response is written back, and
+        # only once it has been parsed successfully, so a query that ends up as
+        # an error entry above is never cached.
+        if cache_hit is None and cache is not None:
+            cache.put("search", key, xml, ident=query)
+        entry: dict[str, Any] = {"query": query, "total": total}
+        if cache_hit is not None:
+            entry["cached"] = True
+        results.append(entry)
         total_sum += total
 
     return {

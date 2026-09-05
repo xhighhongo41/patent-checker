@@ -36,9 +36,11 @@ moves the data access to MCP tools without changing the procedure.
   (fix the argument), `external_api_error:` (the upstream service failed;
   retry later or record the gap), `ops_not_configured:` (the server has no
   OPS credentials — the degraded-mode signal, see step 11). A result
-  carrying `"cached": true` was served from the server's same-day or
-  per-publication cache instead of a fresh upstream request; treat it
-  exactly like a fresh result.
+  carrying `"cached": true` was served from the server's cache instead of
+  a fresh upstream request; treat it exactly like a fresh result. Each kind
+  of data has its own expiry (claim and description bodies never expire;
+  family 30 days, biblio 90 days, legal status 7 days, search results and
+  plan counts 1 day), so a cached legal status is at most a week old.
 - Steps 0 and 0.5 use the local `patent-checker` CLI on the developer's
   machine (consent is recorded where the developer works, not on the
   server). Every other step uses the MCP tools; if the server cannot be
@@ -69,16 +71,19 @@ records of awareness (willful-infringement context). Record the choice and
 the date in the report's findings section. Report files must carry the
 date and target version in their name, e.g.
 `.patent-checker/reports/report-<target>-<YYYYMMDD-HHMM>.md` — never
-overwrite an earlier report. Note that the server keeps its own raw
-responses and cache in the server's data directory (per-user by default);
-the project's `.patent-checker/` holds only the exploration artifacts you
-write.
+overwrite an earlier report. Fetched patent documents are kept once, in a
+per-user shared cache (the server's `cache_dir`, reused across projects);
+search results and the request log stay in the data directory of whoever
+ran them (the server's, or the project's `.patent-checker/` when the CLI
+is used from the project). The project's `.patent-checker/` otherwise
+holds only the exploration artifacts you write.
 
 ## Step 0.7 — Server connection check
 
 Call `server_status` (no arguments). It returns `version`,
-`ops_configured`, `transport`, `data_dir`, `cache_dir` and
-`operator_notice_version`. Record `version` in the exploration artifacts.
+`ops_configured`, `transport`, `data_dir`, `cache_dir` (shared document
+cache), `search_cache_dir`, `cache_ttl` (expiry per kind), `cache_entries`
+(entries per kind) and `operator_notice_version`. Record `version` in the exploration artifacts.
 If `ops_configured` is `false`, the server runs without OPS credentials:
 skip to the degraded mode of step 11 (only `get_claims` and the offline
 helpers work). If the call itself fails because no `patent-checker` MCP
@@ -194,7 +199,20 @@ Confirm the target repository's `git status` is clean. Record token usage
 and API usage (`usage_report()`, which summarizes the server's request
 log; cached results do not appear in it) in the exploration artifacts.
 `normalize_pubnum(text)` returns every spelling of a publication number
-when you need to reconcile identifiers across sources.
+when you need to reconcile identifiers across sources (US published
+applications are spelled with 10 digits through 2025 and 11 digits from
+2026 on the OPS side; Google Patents always uses 11 — the tool reconciles
+both, so compare the `docdb` spelling).
+
+When the exploration is over and the developer wants its traces gone,
+`patent-checker clean` (local CLI; deliberately not an MCP tool — the
+server never deletes files) lists what would be removed from the
+project's `.patent-checker/`: the search cache, the request log and
+leftovers from earlier versions. Nothing is deleted without `--yes`.
+Reports, exploration artifacts and the consent record are kept unless
+`--include-artifacts` / `--include-consent` are given; the shared document
+cache is kept unless `--shared` is given. `patent-checker cache status`
+shows what the caches hold.
 
 ### 11. Degraded mode (no OPS credentials)
 If `server_status` reports `ops_configured: false`, or OPS-backed tools
@@ -249,8 +267,9 @@ The `patent-checker` CLI installed with the server offers the same
 operations with the same JSON shapes, so the procedure above can be run
 unchanged from a shell. CLI errors come as `{"error": {"type", "message"}}`
 with exit codes 0 = success, 2 = invalid input, 3 = external API error,
-4 = OPS not configured (the CLI equivalent of the three tool-error
-prefixes).
+4 = configuration error: OPS not configured (`ops_not_configured`, the
+CLI equivalent of that tool-error prefix) or an invalid cache setting
+(`config_error`).
 
 | MCP tool | CLI subcommand |
 |---|---|
@@ -266,3 +285,7 @@ prefixes).
 | `dedup_families` | `patent-checker dedup <hits.json>` (or `-` for stdin) |
 | `verify_batch` | `patent-checker verify --input <pubs.json> --output <records.json>` |
 | `usage_report` | `patent-checker usage` |
+
+The fetch subcommands accept `--refresh` to bypass the cache for one call.
+`patent-checker cache status`, `patent-checker cache clear` and
+`patent-checker clean` have no MCP counterpart by design (see step 10).

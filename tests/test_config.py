@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from patent_checker import config
+
+VALID_CACHE_KINDS = ("biblio", "claims", "legal", "family", "gp", "search", "searchbib")
 
 
 @pytest.fixture(autouse=True)
@@ -138,3 +141,170 @@ def test_user_data_dir_windows_falls_back_when_localappdata_unset(monkeypatch, t
 def test_allowed_hosts_constant() -> None:
     """``ALLOWED_HOSTS`` is exactly the two upstream hosts patent-checker may contact."""
     assert config.ALLOWED_HOSTS == frozenset({"ops.epo.org", "patents.google.com"})
+
+
+def test_cache_base_defaults_to_user_data_dir_cache(monkeypatch, tmp_path) -> None:
+    """With nothing set, the cache root is ``<user_data_dir()>/cache``."""
+    monkeypatch.delenv("PATENT_CHECKER_CACHE_DIR", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_DATA_DIR", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert config.cache_base() == config.user_data_dir() / "cache"
+
+
+def test_cache_base_uses_cache_dir_env_when_set(monkeypatch, tmp_path) -> None:
+    """``PATENT_CHECKER_CACHE_DIR`` wins even when ``PATENT_CHECKER_DATA_DIR`` is also set."""
+    cache_dir = tmp_path / "cache-dir"
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data-dir"))
+
+    assert config.cache_base() == cache_dir
+
+
+def test_cache_base_uses_data_dir_subdir_when_data_dir_env_set(monkeypatch, tmp_path) -> None:
+    """With only ``PATENT_CHECKER_DATA_DIR`` set, the cache lives under it."""
+    monkeypatch.delenv("PATENT_CHECKER_CACHE_DIR", raising=False)
+    data_dir = tmp_path / "data-dir"
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    assert config.cache_base() == data_dir / "cache"
+
+
+def test_cache_base_uses_data_base_subdir_when_override_set(monkeypatch, tmp_path) -> None:
+    """With only ``set_data_base`` set, the cache lives under the overridden data base."""
+    monkeypatch.delenv("PATENT_CHECKER_CACHE_DIR", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_DATA_DIR", raising=False)
+    override = tmp_path / "override-base"
+    config.set_data_base(override)
+
+    assert config.cache_base() == override / "cache"
+
+
+def test_cache_base_empty_cache_dir_env_is_treated_as_unset(monkeypatch, tmp_path) -> None:
+    """An empty ``PATENT_CHECKER_CACHE_DIR`` falls through to the next resolution step."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_DIR", "")
+    data_dir = tmp_path / "data-dir"
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    assert config.cache_base() == data_dir / "cache"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("0", None),
+        ("30d", timedelta(days=30)),
+        ("12h", timedelta(hours=12)),
+        (" 7d ", timedelta(days=7)),
+        ("007d", timedelta(days=7)),
+    ],
+)
+def test_parse_ttl_accepts_valid_spellings(text, expected) -> None:
+    """``parse_ttl`` accepts ``0``, ``<n>d``, and ``<n>h``, with optional whitespace."""
+    assert config.parse_ttl(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "7", "7m", "-1d", "1.5d", "0d", "1 d", "d"],
+)
+def test_parse_ttl_rejects_invalid_spellings(text) -> None:
+    """``parse_ttl`` rejects anything that is not ``0``, ``<n>d``, or ``<n>h``."""
+    with pytest.raises(config.ConfigError):
+        config.parse_ttl(text)
+
+
+def test_parse_ttl_error_message_lists_accepted_formats() -> None:
+    """The error message documents the accepted spellings for callers."""
+    with pytest.raises(config.ConfigError, match=r"0.*<n>d.*<n>h"):
+        config.parse_ttl("bogus")
+
+
+def test_cache_ttl_overrides_returns_empty_when_unset(monkeypatch) -> None:
+    """With no ``PATENT_CHECKER_CACHE_TTL``, there are no overrides."""
+    monkeypatch.delenv("PATENT_CHECKER_CACHE_TTL", raising=False)
+
+    assert config.cache_ttl_overrides(VALID_CACHE_KINDS) == {}
+
+
+def test_cache_ttl_overrides_returns_empty_when_blank(monkeypatch) -> None:
+    """A whitespace-only ``PATENT_CHECKER_CACHE_TTL`` behaves like unset."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "   ")
+
+    assert config.cache_ttl_overrides(VALID_CACHE_KINDS) == {}
+
+
+def test_cache_ttl_overrides_parses_multiple_kinds(monkeypatch) -> None:
+    """Multiple ``kind=ttl`` pairs are parsed, including ``0`` for no expiry."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=7d,search=0")
+
+    assert config.cache_ttl_overrides(VALID_CACHE_KINDS) == {
+        "legal": timedelta(days=7),
+        "search": None,
+    }
+
+
+def test_cache_ttl_overrides_allows_surrounding_whitespace(monkeypatch) -> None:
+    """Whitespace around kinds, TTLs, and entries is ignored."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", " legal = 7d , search=1h ")
+
+    assert config.cache_ttl_overrides(VALID_CACHE_KINDS) == {
+        "legal": timedelta(days=7),
+        "search": timedelta(hours=1),
+    }
+
+
+def test_cache_ttl_overrides_rejects_unknown_kind(monkeypatch) -> None:
+    """A kind that is not in ``valid_kinds`` is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "bogus=1d")
+
+    with pytest.raises(config.ConfigError, match="biblio"):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_rejects_duplicate_kind(monkeypatch) -> None:
+    """The same kind appearing twice is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=1d,legal=2d")
+
+    with pytest.raises(config.ConfigError):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_rejects_missing_equals(monkeypatch) -> None:
+    """An entry without ``=`` is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal")
+
+    with pytest.raises(config.ConfigError):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_rejects_multiple_equals(monkeypatch) -> None:
+    """An entry with more than one ``=`` is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=1d=2d")
+
+    with pytest.raises(config.ConfigError):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_rejects_empty_kind(monkeypatch) -> None:
+    """An entry with an empty kind is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "=1d")
+
+    with pytest.raises(config.ConfigError):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_rejects_empty_entry(monkeypatch) -> None:
+    """An empty entry between two commas is rejected."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=7d,,search=1d")
+
+    with pytest.raises(config.ConfigError):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+def test_cache_ttl_overrides_error_mentions_env_var_and_failing_entry(monkeypatch) -> None:
+    """The error message names the environment variable and the offending entry."""
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=bogus")
+
+    with pytest.raises(config.ConfigError, match=r"legal=bogus.*PATENT_CHECKER_CACHE_TTL"):
+        config.cache_ttl_overrides(VALID_CACHE_KINDS)

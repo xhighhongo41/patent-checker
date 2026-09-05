@@ -141,7 +141,7 @@ def build_state(
         settings=settings,
         ops_client=ops_client,
         gp_client=gp_client,
-        cache=Cache(settings.data_base / "cache" / "ops"),
+        cache=Cache(settings.cache_base, settings.data_base / "cache", ttls=settings.cache_ttls),
     )
 
 

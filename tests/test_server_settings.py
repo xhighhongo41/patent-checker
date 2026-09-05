@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from patent_checker import config
@@ -17,6 +19,8 @@ _ENV_VARS = (
     "PATENT_CHECKER_SERVER_RPS",
     "PATENT_CHECKER_SERVER_BURST",
     "PATENT_CHECKER_DATA_DIR",
+    "PATENT_CHECKER_CACHE_DIR",
+    "PATENT_CHECKER_CACHE_TTL",
 )
 
 
@@ -331,6 +335,82 @@ def test_data_base_env_override(monkeypatch, tmp_path) -> None:
     result = server_settings.load_settings()
 
     assert result.data_base == override
+
+
+# --- cache_base / cache_ttls -------------------------------------------------
+
+
+def test_cache_base_defaults_to_user_data_dir_cache(monkeypatch) -> None:
+    """With no cache/data env vars, the cache base is ``user_data_dir()/cache``."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+
+    result = server_settings.load_settings()
+
+    assert result.cache_base == config.user_data_dir() / "cache"
+
+
+def test_cache_base_follows_explicit_data_dir(monkeypatch, tmp_path) -> None:
+    """``PATENT_CHECKER_DATA_DIR`` puts the cache under ``<DATA_DIR>/cache``."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    override = tmp_path / "custom-data"
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(override))
+
+    result = server_settings.load_settings()
+
+    assert result.cache_base == override / "cache"
+
+
+def test_cache_base_env_override_wins(monkeypatch, tmp_path) -> None:
+    """``PATENT_CHECKER_CACHE_DIR`` overrides the cache base directly."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    cache_override = tmp_path / "custom-cache"
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_DIR", str(cache_override))
+
+    result = server_settings.load_settings()
+
+    assert result.cache_base == cache_override
+
+
+def test_cache_ttl_override_is_parsed(monkeypatch) -> None:
+    """``PATENT_CHECKER_CACHE_TTL`` parses into a per-kind timedelta mapping."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=1d")
+
+    result = server_settings.load_settings()
+
+    assert result.cache_ttls == {"legal": timedelta(days=1)}
+
+
+def test_invalid_cache_ttl_refuses_to_start(monkeypatch) -> None:
+    """A malformed ``PATENT_CHECKER_CACHE_TTL`` is a ``ConfigError``, like other bad config."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=notaduration")
+
+    with pytest.raises(config.ConfigError):
+        server_settings.load_settings()
+
+
+def test_describe_includes_cache_settings_without_token(monkeypatch, tmp_path) -> None:
+    """``describe`` reports the cache directory and effective TTLs, never the token."""
+    _consent(monkeypatch)
+    _token(monkeypatch, "super-secret-token")
+    cache_override = tmp_path / "custom-cache"
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_DIR", str(cache_override))
+    monkeypatch.setenv("PATENT_CHECKER_CACHE_TTL", "legal=1d")
+
+    result = server_settings.load_settings()
+    described = server_settings.describe(result)
+
+    assert described["cache_dir"] == str(cache_override)
+    assert described["cache_ttl"]["legal"] == "1d"
+    assert described["cache_ttl"]["biblio"] == "90d"
+    assert "token" not in described
+    assert "super-secret-token" not in str(described)
 
 
 # --- operator notice loader --------------------------------------------------

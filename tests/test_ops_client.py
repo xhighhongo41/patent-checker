@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -86,6 +87,19 @@ def _ok(content: bytes) -> Callable[[httpx.Request], httpx.Response]:
     return lambda request: httpx.Response(200, content=content)
 
 
+def _written_files(data_dir: Path) -> list[Path]:
+    """Return every file the client wrote below *data_dir*."""
+    return sorted(path for path in data_dir.rglob("*") if path.is_file())
+
+
+def _header_records(data_dir: Path) -> list[dict[str, object]]:
+    """Return the request-log lines of ``raw/ops/headers.jsonl`` (empty when absent)."""
+    log_path = data_dir / "raw" / "ops" / "headers.jsonl"
+    if not log_path.exists():
+        return []
+    return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
 @pytest.fixture(autouse=True)
 def ops_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Use dummy credentials, a temp data directory, and never sleep for real."""
@@ -143,10 +157,9 @@ def test_search_accepts_the_maximum_span_at_the_paging_end() -> None:
     """A 100-wide Range ending exactly at 2000 is legal and is sent out."""
     client, recorder = _make_client(_ok(b"<search-result/>"))
     with client:
-        body, saved = client.search("ta=computer", begin=1901, end=2000)
+        body = client.search("ta=computer", begin=1901, end=2000)
 
     assert body == b"<search-result/>"
-    assert saved.exists()
     assert len(recorder.api_requests) == 1
     assert "Range=1901-2000" in str(recorder.api_requests[0].url)
 
@@ -155,14 +168,13 @@ def test_search_accepts_the_maximum_span_at_the_paging_end() -> None:
 
 
 def test_search_treats_entity_not_found_404_as_an_empty_page() -> None:
-    """A zero-hit search answers 404 + SERVER.EntityNotFound; the body is kept."""
+    """A zero-hit search answers 404 + SERVER.EntityNotFound; the body is returned."""
     fault = _load_fixture("20260829-capture_search_zero-hit-404.xml")
     client, recorder = _make_client(lambda request: httpx.Response(404, content=fault))
     with client:
-        body, saved = client.search("ta=nothingmatchesthis", begin=1, end=25)
+        body = client.search("ta=nothingmatchesthis", begin=1, end=25)
 
     assert body == fault
-    assert saved.read_bytes() == fault
     assert len(recorder.api_requests) == 1
 
 
@@ -171,7 +183,7 @@ def test_search_biblio_treats_entity_not_found_404_as_an_empty_page() -> None:
     fault = _load_fixture("20260829-capture_search_zero-hit-404.xml")
     client, _ = _make_client(lambda request: httpx.Response(404, content=fault))
     with client:
-        body, _saved = client.search_biblio("ta=nothingmatchesthis", begin=1, end=25)
+        body = client.search_biblio("ta=nothingmatchesthis", begin=1, end=25)
 
     assert body == fault
 
@@ -203,17 +215,33 @@ def test_search_still_raises_on_server_errors() -> None:
 
 
 def test_claims_requests_the_fulltext_claims_endpoint(ops_env: Path) -> None:
-    """claims() hits ``.../publication/docdb/<ref>/claims`` and saves the raw body."""
+    """claims() hits ``.../publication/docdb/<ref>/claims`` and returns the raw body."""
     payload = b"<claims-response/>"
     client, recorder = _make_client(_ok(payload))
     with client:
-        body, saved = client.claims("EP4645156A1")
+        body = client.claims("EP4645156A1")
 
     assert body == payload
     request_path = recorder.api_requests[0].url.path
     assert request_path.endswith("/published-data/publication/docdb/EP.4645156.A1/claims")
-    assert saved.name.split("_")[1] == "claims"
-    assert list((ops_env / "raw" / "ops").glob("*_claims_EP.4645156.A1.xml")) == [saved]
+
+
+def test_a_request_writes_no_body_file_and_logs_one_header_line(ops_env: Path) -> None:
+    """The client keeps no copy of the body: only the request log is written.
+
+    Since v0.4 the response body is persisted exactly once, by the cache
+    layer; ``headers.jsonl`` stays the client's own record of real upstream
+    usage (a cache hit never reaches this code and is therefore not logged).
+    """
+    client, _ = _make_client(_ok(b"<claims-response/>"))
+    with client:
+        client.claims("EP4645156A1")
+
+    assert _written_files(ops_env) == [ops_env / "raw" / "ops" / "headers.jsonl"]
+    records = _header_records(ops_env)
+    assert len(records) == 1
+    assert records[0]["kind"] == "claims"
+    assert records[0]["status"] == 200
 
 
 def test_claims_404_raises() -> None:
@@ -238,7 +266,7 @@ def _gb_legal_responder(a_body: bytes, b_body: bytes) -> Callable[[httpx.Request
     return responder
 
 
-def test_gb_legal_retries_the_b_publication_when_a_has_no_events() -> None:
+def test_gb_legal_retries_the_b_publication_when_a_has_no_events(ops_env: Path) -> None:
     """GB A publications often carry no legal events; the B publication is retried."""
     empty_a = _load_fixture("20260828-125143_legal_GB.2553053.A.xml")
     # Stand-in for a populated GB B response: a real GB legal body that does
@@ -249,14 +277,16 @@ def test_gb_legal_retries_the_b_publication_when_a_has_no_events() -> None:
 
     client, recorder = _make_client(_gb_legal_responder(empty_a, populated_b))
     with client:
-        body, saved = client.legal("GB2553053A")
+        body = client.legal("GB2553053A")
 
     assert body == populated_b
-    assert saved.read_bytes() == populated_b
     paths = [req.url.path for req in recorder.api_requests]
     assert len(paths) == 2
     assert paths[0].endswith("GB.2553053.A")
     assert paths[1].endswith("GB.2553053.B")
+    # Both calls are real upstream usage, so both are logged and no body is kept.
+    assert len(_header_records(ops_env)) == 2
+    assert _written_files(ops_env) == [ops_env / "raw" / "ops" / "headers.jsonl"]
 
 
 def test_gb_legal_keeps_the_a_result_when_the_b_publication_is_empty_too() -> None:
@@ -266,7 +296,7 @@ def test_gb_legal_keeps_the_a_result_when_the_b_publication_is_empty_too() -> No
 
     client, recorder = _make_client(_gb_legal_responder(empty_a, empty_b))
     with client:
-        body, _saved = client.legal("GB2553053A")
+        body = client.legal("GB2553053A")
 
     assert body == empty_a
     # Exactly one retry: no further kind codes are tried.
@@ -284,7 +314,7 @@ def test_gb_legal_keeps_the_a_result_when_the_b_publication_is_missing() -> None
 
     client, recorder = _make_client(responder)
     with client:
-        body, _saved = client.legal("GB2553053A")
+        body = client.legal("GB2553053A")
 
     assert body == empty_a
     assert len(recorder.api_requests) == 2
@@ -296,7 +326,7 @@ def test_non_gb_legal_is_never_retried() -> None:
     empty = _load_fixture("20260828-125143_legal_GB.2553053.A.xml")
     client, recorder = _make_client(_ok(empty))
     with client:
-        body, _saved = client.legal("US2007016547A1")
+        body = client.legal("US2007016547A1")
 
     assert body == empty
     assert len(recorder.api_requests) == 1

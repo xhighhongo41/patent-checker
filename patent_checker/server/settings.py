@@ -16,11 +16,15 @@ included in ``repr()``, in log output, or in :func:`describe`.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 from patent_checker import config
+from patent_checker.cache import KINDS as CACHE_KINDS
+from patent_checker.cache import Cache, format_ttl
 from patent_checker.config import ConfigError, load_env, user_data_dir
 
 # The operator-notice version is independent of both the package release
@@ -70,6 +74,12 @@ class ServerSettings:
             after the gate has passed).
         token: The bearer token (http only; ``None`` for stdio). Never
             included in ``repr()``.
+        cache_base: The resolved shared cache root (see
+            :func:`patent_checker.config.cache_base`). Not created here.
+        cache_ttls: Per-kind cache TTL overrides resolved from
+            ``$PATENT_CHECKER_CACHE_TTL`` (see
+            :func:`patent_checker.config.cache_ttl_overrides`); kinds absent
+            from this mapping keep their default TTL.
     """
 
     transport: str
@@ -81,6 +91,8 @@ class ServerSettings:
     burst: int
     operator_notice_version: str
     token: str | None = field(default=None, repr=False)
+    cache_base: Path = field(default_factory=Path)
+    cache_ttls: Mapping[str, timedelta | None] = field(default_factory=dict)
 
 
 def operator_notice_languages() -> tuple[str, ...]:
@@ -161,6 +173,12 @@ def load_settings(
     rps = _resolve_rps()
     burst = _resolve_burst()
     data_base = _resolve_data_base()
+    # Resolved ahead of config.set_data_base() (called later by
+    # server.app.build_state()), so PATENT_CHECKER_CACHE_DIR and
+    # PATENT_CHECKER_DATA_DIR are still the only inputs config.cache_base()
+    # sees; see its docstring for the full resolution order.
+    resolved_cache_base = config.cache_base()
+    cache_ttls = config.cache_ttl_overrides(CACHE_KINDS)
 
     return ServerSettings(
         transport=transport,
@@ -172,6 +190,8 @@ def load_settings(
         burst=burst,
         operator_notice_version=OPERATOR_NOTICE_VERSION,
         token=token,
+        cache_base=resolved_cache_base,
+        cache_ttls=cache_ttls,
     )
 
 
@@ -180,6 +200,7 @@ def describe(settings: ServerSettings) -> dict[str, Any]:
 
     The bearer token is deliberately excluded.
     """
+    effective_ttls = Cache(settings.cache_base, ttls=settings.cache_ttls).ttls
     return {
         "transport": settings.transport,
         "host": settings.host,
@@ -189,6 +210,8 @@ def describe(settings: ServerSettings) -> dict[str, Any]:
         "rps": settings.rps,
         "burst": settings.burst,
         "operator_notice_version": settings.operator_notice_version,
+        "cache_dir": str(settings.cache_base),
+        "cache_ttl": {kind: format_ttl(ttl) for kind, ttl in effective_ttls.items()},
     }
 
 

@@ -90,7 +90,7 @@ def state(http_settings: ServerSettings, tmp_path: Path) -> Iterator[ServerState
         settings=http_settings,
         ops_client=None,
         gp_client=gp_client,
-        cache=Cache(tmp_path / "cache" / "ops"),
+        cache=Cache(tmp_path / "cache"),
     )
     gp_client.close()
 

@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from patent_checker.cache import Cache
 from patent_checker.utils import (
     dedup_families,
     search_plan_check,
@@ -238,6 +239,32 @@ def test_verify_batch_dict_output_record_without_pub_key_raises_key_error() -> N
         verify_batch(["US.1.A1"], [{"not_pub": "US.1.A1"}])
 
 
+def test_verify_batch_treats_google_and_docdb_spellings_of_us_application_as_same() -> None:
+    """Regression test fixing a v0.4 defect ahead of the implementation (T2).
+
+    Google Patents spells a US published application with an 11-digit
+    number (year + 7-digit serial) while docdb spells the same publication
+    with a 10-digit number (year + 6-digit serial); verify_batch must treat
+    them as the same publication instead of reporting a false mismatch.
+    """
+    result = verify_batch(["US.2007016547.A1"], ["US20070016547A1"])
+    assert result["ok"] is True
+    assert result["missing"] == []
+    assert result["unexpected"] == []
+
+
+def test_verify_batch_keeps_eleven_digit_spelling_for_us_applications_from_2026() -> None:
+    """Guard test: both spellings already use 11 digits from 2026 onward.
+
+    docdb assigned 11-digit serials to US published applications starting in
+    2026, so both sides already spell the number the same way; this must
+    stay green even after the T2 fix normalizes the 10-digit vs. 11-digit
+    case above, so a future fix cannot regress this already-matching case.
+    """
+    result = verify_batch(["US.20260024003.A1"], ["US20260024003A1"])
+    assert result["ok"] is True
+
+
 # --- search_plan_check -----------------------------------------------------
 
 
@@ -249,13 +276,13 @@ class _StubOpsClient:
         self.closed = False
         self.calls: list[tuple[str, int, int]] = []
 
-    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> tuple[bytes, Path]:
+    def search(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
         """Record the call and replay the canned response for *cql*."""
         self.calls.append((cql, begin, end))
         response = self._responses[cql]
         if isinstance(response, BaseException):
             raise response
-        return response, Path("unused.xml")
+        return response
 
     def close(self) -> None:
         """Mark the stub as closed, so tests can assert it was (not) called."""
@@ -321,6 +348,83 @@ def test_search_plan_check_does_not_close_an_injected_client() -> None:
     client = _StubOpsClient(responses)
     search_plan_check(["q1"], client=client)
     assert client.closed is False
+
+
+# --- search_plan_check caching (T8-core) ------------------------------------
+
+
+def test_search_plan_check_second_identical_query_is_served_from_cache(tmp_path: Path) -> None:
+    """A repeated query is answered from the cache, without calling the client again."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = search_plan_check(["q1"], client=client, cache=cache)
+    second = search_plan_check(["q1"], client=client, cache=cache)
+
+    assert first["results"] == [{"query": "q1", "total": 1}]
+    assert second["results"] == [{"query": "q1", "total": 1, "cached": True}]
+    assert len(client.calls) == 1
+
+
+def test_search_plan_check_a_different_query_still_calls_the_client(tmp_path: Path) -> None:
+    """Caching one query does not serve a different query from the cache."""
+    responses = {
+        "q1": _load_fixture("20260827-074259_search_5214adad8e.xml"),  # total=1
+        "q2": _load_fixture("20260827-074307_search_03be517d21.xml"),  # total=10
+    }
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    search_plan_check(["q1"], client=client, cache=cache)
+    result = search_plan_check(["q1", "q2"], client=client, cache=cache)
+
+    assert result["results"][0] == {"query": "q1", "total": 1, "cached": True}
+    assert result["results"][1] == {"query": "q2", "total": 10}
+    assert [call[0] for call in client.calls] == ["q1", "q2"]
+
+
+def test_search_plan_check_refresh_ignores_and_overwrites_the_cache(tmp_path: Path) -> None:
+    """refresh=True re-fetches even a fresh cache hit and replaces the stored entry."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    search_plan_check(["q1"], client=client, cache=cache)
+    result = search_plan_check(["q1"], client=client, cache=cache, refresh=True)
+
+    assert result["results"] == [{"query": "q1", "total": 1}]
+    assert len(client.calls) == 2
+
+    # The overwritten entry is served (as a hit) by a later, non-refreshing call.
+    third = search_plan_check(["q1"], client=client, cache=cache)
+    assert third["results"] == [{"query": "q1", "total": 1, "cached": True}]
+    assert len(client.calls) == 2
+
+
+def test_search_plan_check_without_cache_always_calls_the_client() -> None:
+    """Passing no cache preserves the pre-v0.4 behavior: every call reaches the client."""
+    responses = {"q1": _load_fixture("20260827-074259_search_5214adad8e.xml")}  # total=1
+    client = _StubOpsClient(responses)
+
+    search_plan_check(["q1"], client=client)
+    search_plan_check(["q1"], client=client)
+
+    assert len(client.calls) == 2
+
+
+def test_search_plan_check_error_is_not_cached(tmp_path: Path) -> None:
+    """A query that ends up as an error entry is never cached, so it is retried next time."""
+    responses: dict[str, bytes | BaseException] = {"q1": ValueError("invalid Range")}
+    client = _StubOpsClient(responses)
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = search_plan_check(["q1"], client=client, cache=cache)
+    second = search_plan_check(["q1"], client=client, cache=cache)
+
+    assert "error" in first["results"][0]
+    assert "error" in second["results"][0]
+    assert len(client.calls) == 2
 
 
 # --- usage_report -----------------------------------------------------------
