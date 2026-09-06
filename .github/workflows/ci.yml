@@ -42,6 +42,9 @@ jobs:
       - name: Lint, format check and unit tests
         run: tools/check.sh
 
+      - name: Bootstrap script dry run
+        run: sh install.sh --dry-run
+
   check-macos:
     runs-on: macos-latest
     timeout-minutes: 20
@@ -60,6 +63,9 @@ jobs:
       - name: Unit tests
         run: uv run pytest -q
 
+      - name: Bootstrap script dry run
+        run: sh install.sh --dry-run
+
   check-windows:
     runs-on: windows-latest
     timeout-minutes: 30
@@ -77,6 +83,9 @@ jobs:
 
       - name: Unit tests
         run: uv run pytest -q
+
+      - name: Bootstrap script dry run
+        run: pwsh -NoProfile -File install.ps1 -DryRun
 
   container:
     runs-on: ubuntu-latest

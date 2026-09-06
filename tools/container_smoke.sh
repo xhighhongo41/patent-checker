@@ -150,7 +150,7 @@ echo "PASS: fixtures prepared (empty OPS credentials, generated bearer token)"
 # --- 3. bring the stack up --------------------------------------------------
 
 STACK_UP=1
-compose up --detach --no-build --wait --wait-timeout 120
+compose up --detach --wait --wait-timeout 120
 echo "PASS: the stack started and its healthcheck reports healthy"
 
 # --- 4. GET /health is unauthenticated --------------------------------------
