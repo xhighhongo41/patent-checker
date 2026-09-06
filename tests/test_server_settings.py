@@ -21,6 +21,7 @@ _ENV_VARS = (
     "PATENT_CHECKER_DATA_DIR",
     "PATENT_CHECKER_CACHE_DIR",
     "PATENT_CHECKER_CACHE_TTL",
+    "PATENT_CHECKER_LOG_LEVEL",
 )
 
 
@@ -139,6 +140,17 @@ def test_token_env_and_file_both_set_is_ambiguous(monkeypatch, tmp_path) -> None
     _token(monkeypatch)
 
     with pytest.raises(config.ConfigError):
+        server_settings.load_settings()
+
+
+def test_token_via_empty_file_refuses_to_start(monkeypatch, tmp_path) -> None:
+    """An empty ``_FILE`` token refuses to start with an actionable ``ConfigError``."""
+    _consent(monkeypatch)
+    token_file = tmp_path / "token.txt"
+    token_file.write_text("", encoding="utf-8")
+    monkeypatch.setenv("PATENT_CHECKER_SERVER_TOKEN_FILE", str(token_file))
+
+    with pytest.raises(config.ConfigError, match="empty"):
         server_settings.load_settings()
 
 
@@ -411,6 +423,52 @@ def test_describe_includes_cache_settings_without_token(monkeypatch, tmp_path) -
     assert described["cache_ttl"]["biblio"] == "90d"
     assert "token" not in described
     assert "super-secret-token" not in str(described)
+
+
+# --- log_level ------------------------------------------------------------
+
+
+def test_log_level_defaults_to_info(monkeypatch) -> None:
+    """With no ``PATENT_CHECKER_LOG_LEVEL``, ``ServerSettings.log_level`` is ``"info"``."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+
+    result = server_settings.load_settings()
+
+    assert result.log_level == "info"
+
+
+def test_log_level_env_override_is_resolved(monkeypatch) -> None:
+    """``PATENT_CHECKER_LOG_LEVEL`` is resolved into ``ServerSettings.log_level``."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", "DEBUG")
+
+    result = server_settings.load_settings()
+
+    assert result.log_level == "debug"
+
+
+def test_invalid_log_level_refuses_to_start(monkeypatch) -> None:
+    """A malformed ``PATENT_CHECKER_LOG_LEVEL`` is a ``ConfigError``, like other bad config."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", "verbose")
+
+    with pytest.raises(config.ConfigError):
+        server_settings.load_settings()
+
+
+def test_describe_includes_log_level(monkeypatch) -> None:
+    """``describe`` reports the resolved log level."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", "warning")
+
+    result = server_settings.load_settings()
+    described = server_settings.describe(result)
+
+    assert described["log_level"] == "warning"
 
 
 # --- operator notice loader --------------------------------------------------

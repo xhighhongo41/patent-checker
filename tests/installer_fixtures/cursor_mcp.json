@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "notes": {
+      "url": "https://notes.example/mcp",
+      "headers": {
+        "Authorization": "Bearer notes-token"
+      }
+    },
+    "local-tools": {
+      "command": "notes-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}

@@ -48,7 +48,9 @@ moves the data access to MCP tools without changing the procedure.
 
 ## Step 0 — Consent gate (mandatory, before anything else)
 
-1. Run `patent-checker consent status`.
+1. Run `patent-checker consent status`. (`patent-checker install` records
+   consent for the current notice version when it is run, so the record
+   may already exist.)
 2. If `consented` is true, proceed. If it is false, or `needs_reconsent`
    is true (the notice version changed):
    - Pick the notice language: the user's conversation language if it is

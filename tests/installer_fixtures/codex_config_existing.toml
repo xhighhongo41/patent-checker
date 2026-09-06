@@ -1,0 +1,5 @@
+model = "gpt-5-codex"
+
+[mcp_servers.patent-checker]
+url = "http://127.0.0.1:9999/mcp"
+bearer_token_env_var = "PATENT_CHECKER_SERVER_TOKEN"

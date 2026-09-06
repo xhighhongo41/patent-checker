@@ -1,0 +1,39 @@
+# Build-context exclusions.
+#
+# What must NOT be listed here, because hatchling needs it to build the
+# wheel the image installs: README.md, LICENSE, pyproject.toml, uv.lock,
+# patent_checker/ and skills/.
+
+# Recipes and VCS metadata: BuildKit receives the Dockerfile out of band, and
+# a copied .git would both bloat the context and bake history into a layer.
+.git
+.gitignore
+.dockerignore
+Dockerfile
+compose.yaml
+
+# Local state and credentials must never reach a layer, not even a discarded
+# builder one.
+.venv
+.env
+.env.*
+secrets/
+.patent-checker/
+
+# Developer-only material: not part of the shipped package.
+PROJECT.md
+開発資料/
+tests/
+tools/
+.github/
+install.sh
+install.ps1
+
+# Caches and build outputs: host artefacts, rebuilt inside the image anyway.
+.pytest_cache
+.ruff_cache
+__pycache__
+**/__pycache__
+dist/
+build/
+*.egg-info

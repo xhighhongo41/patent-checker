@@ -1,0 +1,7 @@
+# Codex configuration.
+model = "gpt-5-codex"
+approval_policy = "on-request"
+
+[mcp_servers.notes]
+url = "https://notes.example/mcp"
+bearer_token_env_var = "NOTES_TOKEN"

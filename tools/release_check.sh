@@ -7,6 +7,8 @@
 # Places checked for version agreement with <version>:
 #   (a) pyproject.toml       -- the `version = "X.Y.Z"` declaration.
 #   (b) README.md            -- the status line's `vX.Y` (major.minor only).
+#   (f) compose.yaml         -- the default image tag `ghcr.io/.../patent-checker:X.Y`
+#                               (major.minor only) in the `image:` line.
 # Places intentionally NOT checked:
 #   - patent_checker/__init__.py: `__version__` is derived at import time
 #     from installed package metadata (importlib.metadata), it is not a
@@ -77,6 +79,21 @@ else
     README_CURRENT=$(echo "$README_LINE" | sed -E 's/^[0-9]+://' | grep -oE 'v[0-9]+\.[0-9]+' | head -n 1)
     if [ "$README_CURRENT" != "v$MAJOR_MINOR" ]; then
         echo "README.md:$README_LINENO -> $README_CURRENT -> v$MAJOR_MINOR" >>"$FAILURES_FILE"
+    fi
+fi
+
+# --- (f) compose.yaml: default image tag X.Y --------------------------------
+# The image line reads `image: ${PATENT_CHECKER_IMAGE:-ghcr.io/<owner>/patent-checker:X.Y}`;
+# the default tag tracks major.minor so that `docker compose pull` follows
+# patch releases of the same minor.
+COMPOSE_LINE=$(grep -nE '^\s*image:.*patent-checker:[0-9]+\.[0-9]+' compose.yaml | head -n 1)
+if [ -z "$COMPOSE_LINE" ]; then
+    echo "compose.yaml:? -> (image line not found) -> patent-checker:$MAJOR_MINOR" >>"$FAILURES_FILE"
+else
+    COMPOSE_LINENO=$(echo "$COMPOSE_LINE" | cut -d: -f1)
+    COMPOSE_CURRENT=$(echo "$COMPOSE_LINE" | sed -E 's/^[0-9]+://' | grep -oE 'patent-checker:[0-9]+\.[0-9]+' | head -n 1)
+    if [ "$COMPOSE_CURRENT" != "patent-checker:$MAJOR_MINOR" ]; then
+        echo "compose.yaml:$COMPOSE_LINENO -> $COMPOSE_CURRENT -> patent-checker:$MAJOR_MINOR" >>"$FAILURES_FILE"
     fi
 fi
 

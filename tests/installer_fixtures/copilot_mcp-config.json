@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "notes": {
+      "type": "http",
+      "url": "https://notes.example/mcp",
+      "headers": {
+        "Authorization": "Bearer notes-token"
+      }
+    }
+  }
+}

@@ -80,6 +80,10 @@ class ServerSettings:
             ``$PATENT_CHECKER_CACHE_TTL`` (see
             :func:`patent_checker.config.cache_ttl_overrides`); kinds absent
             from this mapping keep their default TTL.
+        log_level: The server log level resolved from
+            ``$PATENT_CHECKER_LOG_LEVEL`` (see
+            :func:`patent_checker.config.log_level`); ``"debug"``,
+            ``"info"``, ``"warning"``, or ``"error"``.
     """
 
     transport: str
@@ -93,6 +97,7 @@ class ServerSettings:
     token: str | None = field(default=None, repr=False)
     cache_base: Path = field(default_factory=Path)
     cache_ttls: Mapping[str, timedelta | None] = field(default_factory=dict)
+    log_level: str = "info"
 
 
 def operator_notice_languages() -> tuple[str, ...]:
@@ -144,8 +149,9 @@ def load_settings(
     Raises:
         ConfigError: If the transport is invalid, the operator has not
             acknowledged the current operator notice, the host/port/token/
-            allowed-hosts/rps/burst configuration is invalid, or (http only)
-            a non-loopback bind is requested without allowed hosts.
+            allowed-hosts/rps/burst/log-level configuration is invalid, or
+            (http only) a non-loopback bind is requested without allowed
+            hosts.
     """
     load_env()
 
@@ -179,6 +185,7 @@ def load_settings(
     # sees; see its docstring for the full resolution order.
     resolved_cache_base = config.cache_base()
     cache_ttls = config.cache_ttl_overrides(CACHE_KINDS)
+    resolved_log_level = config.log_level()
 
     return ServerSettings(
         transport=transport,
@@ -192,6 +199,7 @@ def load_settings(
         token=token,
         cache_base=resolved_cache_base,
         cache_ttls=cache_ttls,
+        log_level=resolved_log_level,
     )
 
 
@@ -212,6 +220,7 @@ def describe(settings: ServerSettings) -> dict[str, Any]:
         "operator_notice_version": settings.operator_notice_version,
         "cache_dir": str(settings.cache_base),
         "cache_ttl": {kind: format_ttl(ttl) for kind, ttl in effective_ttls.items()},
+        "log_level": settings.log_level,
     }
 
 

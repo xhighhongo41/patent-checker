@@ -25,6 +25,7 @@ here and what the startup banner says:
 
 from __future__ import annotations
 
+import copy
 import importlib.metadata
 import sys
 import threading
@@ -33,11 +34,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+import uvicorn.config
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.server.lifespan import lifespan
 from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from patent_checker import config
 from patent_checker.cache import Cache
@@ -45,7 +49,7 @@ from patent_checker.config import ConfigError
 from patent_checker.net import AllowlistTransport
 from patent_checker.ops.client import OpsClient
 from patent_checker.server import tools
-from patent_checker.server.settings import LOOPBACK_HOSTS, ServerSettings, describe
+from patent_checker.server.settings import ServerSettings, describe
 
 SERVER_NAME = "patent-checker"
 
@@ -169,8 +173,8 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
             builds its own state on startup and closes it on shutdown.
 
     Returns:
-        The configured server, with the rate-limiting middleware and all
-        tools registered.
+        The configured server, with the rate-limiting middleware, all tools,
+        and an unauthenticated ``GET /health`` route registered.
 
     Raises:
         ConfigError: If the http transport is requested without a token.
@@ -207,6 +211,22 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
         )
     )
     tools.register(mcp)
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> JSONResponse:
+        """Report basic liveness, deliberately excluding secrets, paths, and settings.
+
+        FastMCP places custom routes outside the auth middleware, so this
+        route is reachable without a bearer token by design.
+        """
+        return JSONResponse(
+            {
+                "status": "ok",
+                "version": importlib.metadata.version("patent-checker"),
+                "transport": settings.transport,
+            }
+        )
+
     return mcp
 
 
@@ -279,13 +299,45 @@ def banner_lines(settings: ServerSettings, *, ops_configured: bool) -> list[str]
         lines.append(f"listening on: http://{info['host']}:{info['port']}")
         lines.append(f"allowed hosts: {', '.join(http_allowed_hosts(settings))}")
         lines.append("authentication: bearer token (configured value is never printed)")
-        if settings.host.lower() not in LOOPBACK_HOSTS:
-            lines.append("TLS: put a reverse proxy in front when binding beyond loopback")
+        lines.append(
+            "TLS: not provided by this server; put a reverse proxy in front if the port is "
+            "reachable from other machines"
+        )
     else:
         lines.append(
             "stdio transport: no authentication, runs with the invoking user's permissions"
         )
     return lines
+
+
+def uvicorn_log_config(log_level: str) -> dict[str, Any]:
+    """Build the uvicorn ``log_config`` used when serving the http transport.
+
+    Starts from uvicorn's own default logging config
+    (``uvicorn.config.LOGGING_CONFIG``, deep-copied so the module-level
+    default is never mutated), redirects both the default and access-log
+    handlers to stderr, and applies *log_level* to the ``uvicorn``,
+    ``uvicorn.error`` and ``uvicorn.access`` loggers. Stdout is left free of
+    log output even though this config is only ever used for http, so that
+    it stays consistent with the stdio transport, whose protocol messages
+    require stdout to carry nothing else. The access-log message format is
+    left at uvicorn's default.
+
+    Args:
+        log_level: The resolved server log level (``"debug"``, ``"info"``,
+            ``"warning"``, or ``"error"``).
+
+    Returns:
+        The uvicorn ``log_config`` dict, to be passed as
+        ``uvicorn_config={"log_config": ...}`` to ``mcp.run()``.
+    """
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    level = log_level.upper()
+    log_config["handlers"]["default"]["stream"] = "ext://sys.stderr"
+    log_config["handlers"]["access"]["stream"] = "ext://sys.stderr"
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        log_config["loggers"][logger_name]["level"] = level
+    return log_config
 
 
 def run(settings: ServerSettings) -> None:
@@ -309,6 +361,8 @@ def run(settings: ServerSettings) -> None:
             host_origin_protection=True,
             allowed_hosts=http_allowed_hosts(settings),
             show_banner=False,
+            log_level=settings.log_level,
+            uvicorn_config={"log_config": uvicorn_log_config(settings.log_level)},
         )
     else:
         mcp.run(transport="stdio", show_banner=False)

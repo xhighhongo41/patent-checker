@@ -22,7 +22,7 @@ import pytest
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 import patent_checker.server.tools as server_tools
-from patent_checker import consent, service
+from patent_checker import consent, installer, service
 from patent_checker.cache import Cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
@@ -1325,6 +1325,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "serve",
         "cache",
         "clean",
+        "install",
     ):
         assert name in out
 
@@ -1344,3 +1345,150 @@ def test_unknown_subcommand_is_invalid_input_error(capsys: pytest.CaptureFixture
 
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
+
+
+# --- install ---------------------------------------------------------------
+
+
+def _install_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """Point ``install`` at a throwaway machine and return ``(home, project)``.
+
+    The home directory, the working directory, the consent record, the
+    locale and the ``PATH`` lookup are all redirected, so the command can
+    neither read nor write anything belonging to the person running the
+    tests, and the notice's language does not depend on their environment.
+    """
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    home.mkdir()
+    project.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(cli_main, "_home", lambda: home)
+    monkeypatch.setattr(cli_main, "_cwd", lambda: project)
+    monkeypatch.setattr(cli_main, "_which", lambda program: None)
+    monkeypatch.setattr(cli_main, "_stdin_is_tty", lambda: False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.chdir(project)
+    return home, project
+
+
+def test_install_list_agents_prints_every_known_agent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """install --list-agents prints the agent table and touches nothing."""
+    _install_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc = cli_main.main(["install", "--list-agents"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    for key in installer.AGENT_KEYS:
+        assert key in out
+    assert _files_under(tmp_path) == before
+
+
+def test_install_dry_run_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """install --dry-run reports the plan without creating a single file."""
+    _install_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc = cli_main.main(["install", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "dry run" in out
+    assert _files_under(tmp_path) == before
+
+
+def test_install_writes_the_agent_configuration_without_printing_the_token(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The token reaches the agent's configuration file, never the report."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+    token_file = tmp_path / "token"
+    token_file.write_text("s3cret-token\n", encoding="utf-8")
+
+    rc = cli_main.main(
+        [
+            "install",
+            "--agree",
+            "--agent",
+            "cursor",
+            "--no-skill",
+            "--token-file",
+            str(token_file),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    entry = json.loads((home / ".cursor" / "mcp.json").read_text(encoding="utf-8"))["mcpServers"][
+        "patent-checker"
+    ]
+    assert entry["headers"] == {"Authorization": "Bearer s3cret-token"}
+    assert "s3cret-token" not in captured.out
+    assert "s3cret-token" not in captured.err
+
+
+def test_install_without_a_terminal_and_without_agree_exits_two(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Consent cannot be assumed: the notice is shown and the run stops with code 2."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--agent", "cursor", "--no-mcp"])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert "Important Notice" in captured.out
+    assert captured.err.startswith("error: ")
+    assert not (home / ".config" / "patent-checker").exists()
+
+
+def test_install_with_an_unknown_agent_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """An agent argparse does not know is rejected through the JSON envelope."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["install", "--agent", "emacs"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_install_shows_the_japanese_notice_for_a_japanese_locale(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Without --lang the notice follows the locale environment."""
+    _install_env(monkeypatch, tmp_path)
+    monkeypatch.delenv("LC_ALL", raising=False)
+    monkeypatch.setenv("LANG", "ja_JP.UTF-8")
+
+    rc = cli_main.main(["install", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "重要なお知らせ" in out
+
+
+@pytest.mark.parametrize(
+    ("environ", "expected"),
+    [
+        ({}, "en"),
+        ({"LANG": "ja_JP.UTF-8"}, "ja"),
+        ({"LANG": "en_US.UTF-8"}, "en"),
+        ({"LC_ALL": "ja_JP.UTF-8", "LANG": "en_US.UTF-8"}, "ja"),
+        ({"LC_ALL": "C", "LANG": "ja_JP.UTF-8"}, "en"),
+    ],
+)
+def test_default_lang_follows_the_locale_environment(
+    environ: dict[str, str], expected: str
+) -> None:
+    """LC_ALL wins over LANG, and only a ja* value selects Japanese."""
+    assert cli_main._default_lang(environ) == expected

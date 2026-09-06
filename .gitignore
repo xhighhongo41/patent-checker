@@ -226,3 +226,6 @@ PROJECT.md
 # Patent Checker artifacts and local test fixtures (never tracked)
 .patent-checker/
 tests/fixtures/
+
+# Container secrets mounted by compose.yaml (secrets/README.md stays tracked)
+secrets/*.txt

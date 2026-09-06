@@ -61,9 +61,10 @@ def server_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
-    # python-dotenv searches upwards from patent_checker/config.py, so chdir
-    # alone would not stop the repository's real .env (which holds actual OPS
-    # credentials) from being loaded into the test environment.
+    # load_env() now searches upwards from the current working directory (see
+    # config.load_env), so chdir alone already keeps the repository's real
+    # .env (which holds actual OPS credentials) out of reach; load_dotenv is
+    # still replaced with a no-op as a second, load_env()-independent guard.
     monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
     monkeypatch.setenv("PATENT_CHECKER_OPERATOR_CONSENT", OPERATOR_NOTICE_VERSION)
     monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path))
@@ -235,3 +236,49 @@ def test_http_transport_without_a_token_refuses_to_build(
 
     with pytest.raises(ConfigError):
         build_server(tokenless)
+
+
+# --- /health ---------------------------------------------------------------
+
+
+def _get(
+    app: Any,
+    headers: dict[str, str] | None = None,
+    *,
+    base_url: str = "http://127.0.0.1:8642",
+) -> httpx.Response:
+    """GET one path (default ``/health``) through the ASGI app, no socket involved."""
+
+    async def run() -> httpx.Response:
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url=base_url) as client:
+                return await client.get("/health", headers=headers or {})
+
+    return asyncio.run(run())
+
+
+def test_health_is_reachable_without_a_token(
+    http_settings: ServerSettings, state: ServerState
+) -> None:
+    """``/health`` answers 200 with exactly the three documented, non-secret keys."""
+    app = build_http_app(http_settings, state=state)
+
+    response = _get(app)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"status", "version", "transport"}
+    assert body["status"] == "ok"
+    assert body["transport"] == "http"
+
+
+def test_health_still_enforces_the_host_guard(
+    http_settings: ServerSettings, state: ServerState
+) -> None:
+    """The Host guard still protects ``/health``: an unexpected Host is refused."""
+    app = build_http_app(http_settings, state=state)
+
+    response = _get(app, {"Host": "evil.example"})
+
+    assert response.status_code == 421

@@ -1,0 +1,75 @@
+# Patent Checker -- single-service deployment.
+#
+# Before the first start, read the operator notice and record that you
+# accepted it:
+#
+#   docker compose run --rm patent-checker serve --show-operator-notice --lang ja
+#   echo 'PATENT_CHECKER_OPERATOR_CONSENT=1.0' >> .env
+#
+# The `.env` file next to this one is read by Compose itself to fill the
+# ${...} placeholders below; it is not handed to the container as a file.
+# Leaving the acknowledgement empty is not an error here on purpose: the
+# server then prints what to read and how to accept it, and exits with code 4.
+#
+# The three secret files are created by hand once; see secrets/README.md.
+#
+# The port is published on the host's loopback only, which is what lets the
+# container accept just the `localhost` and `127.0.0.1` Host headers. To serve
+# a LAN, drop the `127.0.0.1:` prefix below, override
+# PATENT_CHECKER_SERVER_ALLOWED_HOSTS with the names clients will really use,
+# and put a TLS-terminating reverse proxy in front -- this transport is plain
+# HTTP and the bearer token would otherwise travel in the clear.
+#
+# `docker compose down` keeps the search cache and the request log;
+# `docker compose down -v` deletes the patent-checker-data volume with them.
+
+services:
+  patent-checker:
+    # No `build:` here on purpose: with both `image` and `build` present,
+    # Compose builds a missing image instead of pulling it, which breaks the
+    # "download this one file and run it" path. To run a locally built image
+    # instead: docker build -t patent-checker:dev . && PATENT_CHECKER_IMAGE=patent-checker:dev docker compose up -d
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:0.5}
+    ports:
+      - "127.0.0.1:${PATENT_CHECKER_PORT:-8642}:8642"
+    environment:
+      PATENT_CHECKER_OPERATOR_CONSENT: ${PATENT_CHECKER_OPERATOR_CONSENT:-}
+      # Credentials arrive as files, never as environment values: an
+      # environment variable is visible to anything that can inspect the
+      # container. Empty files are read as "not configured", and the server
+      # then runs in degraded mode instead of refusing to start.
+      PATENT_CHECKER_OPS_KEY_FILE: /run/secrets/ops_key
+      PATENT_CHECKER_OPS_SECRET_FILE: /run/secrets/ops_secret
+      PATENT_CHECKER_SERVER_TOKEN_FILE: /run/secrets/server_token
+      PATENT_CHECKER_LOG_LEVEL: ${PATENT_CHECKER_LOG_LEVEL:-info}
+    secrets:
+      - ops_key
+      - ops_secret
+      - server_token
+    volumes:
+      - patent-checker-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # Same probe as the image's HEALTHCHECK, repeated so that the timings
+      # stay visible next to the deployment they belong to and so that
+      # `docker compose up --wait` has something to wait for.
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+secrets:
+  ops_key:
+    file: ./secrets/ops_key.txt
+  ops_secret:
+    file: ./secrets/ops_secret.txt
+  server_token:
+    file: ./secrets/server_token.txt
+
+volumes:
+  patent-checker-data: {}

@@ -1,0 +1,12 @@
+{
+  "theme": "GitHub",
+  "selectedAuthType": "oauth-personal",
+  "mcpServers": {
+    "notes": {
+      "httpUrl": "https://notes.example/mcp",
+      "headers": {
+        "Authorization": "Bearer notes-token"
+      }
+    }
+  }
+}

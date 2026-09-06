@@ -1,9 +1,11 @@
 """Command-line entry point for patent-checker.
 
 Every subcommand prints one JSON object to stdout (``json.dumps(...,
-ensure_ascii=False, indent=2)``); two subcommands are exceptions: like
+ensure_ascii=False, indent=2)``); three subcommands are exceptions: like
 ``consent show``, ``serve --show-operator-notice`` prints the raw notice
-Markdown so it can be shown to a human as-is, and ``serve`` on success prints
+Markdown so it can be shown to a human as-is, ``install`` prints the notice
+and its own report as text and reports a failure as ``error: <message>`` on
+stderr (exit code 2), and ``serve`` on success prints
 nothing to stdout at all -- its startup banner goes to stderr (stdout is the
 protocol channel of the stdio transport) and it then blocks serving until the
 process is stopped. Errors are reported the same way, as
@@ -29,16 +31,19 @@ which holds the actual logic and is shared with the MCP server.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
+import os
+import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 
-from patent_checker import __version__, cleanup, config, consent, service
+from patent_checker import __version__, cleanup, config, consent, installer, service
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
@@ -478,6 +483,100 @@ def _cmd_clean(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+# --- install ---------------------------------------------------------------
+
+
+def _home() -> Path:
+    """Return the user's home directory (indirection: tests replace this)."""
+    return Path.home()
+
+
+def _cwd() -> Path:
+    """Return the working directory (indirection: tests replace this)."""
+    return Path.cwd()
+
+
+def _which(program: str) -> str | None:
+    """Return the path of *program* on ``PATH`` (indirection: tests replace this)."""
+    return shutil.which(program)
+
+
+def _stdin_is_tty() -> bool:
+    """Return whether questions can be asked (indirection: tests replace this)."""
+    return sys.stdin.isatty()
+
+
+def _prompt_secret(prompt: str) -> str:
+    """Ask for a secret without echoing it (indirection: tests replace this)."""
+    return getpass.getpass(prompt)
+
+
+def _confirm(question: str) -> bool:
+    """Ask *question* and return whether the answer was yes.
+
+    Anything other than ``y``/``yes`` (case-insensitive) is a no, and so is
+    a closed stdin: consent must be given, never assumed.
+    """
+    try:
+        answer = input(question)
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _default_lang(environ: Mapping[str, str]) -> str:
+    """Return the notice language implied by the locale environment.
+
+    ``LC_ALL`` wins over ``LANG`` (as POSIX prescribes); a value starting
+    with ``ja`` selects Japanese and everything else English, which is the
+    notice's controlling language.
+    """
+    locale = environ.get("LC_ALL") or environ.get("LANG") or ""
+    return "ja" if locale.startswith("ja") else "en"
+
+
+def _cmd_install(args: argparse.Namespace) -> None:
+    """Install the Skill and register the MCP server with the chosen agents.
+
+    Prints a human-readable report rather than JSON (like ``consent show``),
+    and asks for consent before anything is written; see the module
+    docstring.
+    """
+    if args.list_agents:
+        print(installer.list_agents(home=_home(), cwd=_cwd(), which=_which, scope=args.scope))
+        return None
+
+    options = installer.InstallOptions(
+        agents=tuple(args.agent) if args.agent else None,
+        scope=args.scope,
+        lang=args.lang or _default_lang(os.environ),
+        url=args.url,
+        token_file=Path(args.token_file) if args.token_file else None,
+        token_env=args.token_env,
+        skill=not args.no_skill,
+        mcp=not args.no_mcp,
+        agree=args.agree,
+        dry_run=args.dry_run,
+    )
+    report = installer.install(
+        options,
+        home=_home(),
+        cwd=_cwd(),
+        environ=os.environ,
+        stdin_is_tty=_stdin_is_tty(),
+        confirm=_confirm,
+        prompt_secret=_prompt_secret,
+        which=_which,
+        runner=None,
+        out=sys.stdout,
+    )
+    print(installer.format_report(report))
+    code = report.exit_code()
+    if code != 0:
+        raise SystemExit(code)
+    return None
+
+
 # --- argument parser -------------------------------------------------------
 
 
@@ -577,8 +676,63 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_consent_parser(subparsers)
     _add_cache_parser(subparsers)
     _add_clean_parser(subparsers)
+    _add_install_parser(subparsers)
 
     return parser
+
+
+def _add_install_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``install`` subcommand and its client-side wiring flags."""
+    install_parser = subparsers.add_parser(
+        "install", help="Install the Agent Skill and register the MCP server"
+    )
+    install_parser.add_argument(
+        "--agent",
+        action="append",
+        choices=(*installer.AGENT_KEYS, "all"),
+        default=None,
+        help="Agent to install for (repeatable; default: the detected agents)",
+    )
+    install_parser.add_argument(
+        "--scope",
+        choices=("user", "project"),
+        default="user",
+        help="Install for this user (default) or for the current project",
+    )
+    install_parser.add_argument(
+        "--lang", default=None, help="Language of the notice (default: from LC_ALL/LANG)"
+    )
+    install_parser.add_argument(
+        "--url", default=installer.DEFAULT_URL, help="MCP endpoint of the server"
+    )
+    install_parser.add_argument(
+        "--token-file",
+        default=None,
+        help=f"File holding the server token (or set ${installer.ENV_TOKEN})",
+    )
+    install_parser.add_argument(
+        "--token-env",
+        action="store_true",
+        help=f"Reference ${installer.ENV_TOKEN} in the configuration instead of writing the token",
+    )
+    install_parser.add_argument(
+        "--no-skill", action="store_true", help="Do not install the Agent Skill"
+    )
+    install_parser.add_argument(
+        "--no-mcp", action="store_true", help="Do not register the MCP server"
+    )
+    install_parser.add_argument(
+        "--agree",
+        action="store_true",
+        help="Agree to the notice without being asked (required without a terminal)",
+    )
+    install_parser.add_argument(
+        "--dry-run", action="store_true", help="Report what would happen and write nothing"
+    )
+    install_parser.add_argument(
+        "--list-agents", action="store_true", help="List the known agents and exit"
+    )
+    install_parser.set_defaults(handler=_cmd_install)
 
 
 def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -685,6 +839,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         result = handler(args)
+    except installer.InstallerError as exc:
+        # `install` writes a report for a person, so its stdout is not JSON
+        # and an error envelope there would be unparseable anyway.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         _print_json(_error_result("invalid_input", str(exc)))
         return 2

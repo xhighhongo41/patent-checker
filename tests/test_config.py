@@ -308,3 +308,132 @@ def test_cache_ttl_overrides_error_mentions_env_var_and_failing_entry(monkeypatc
 
     with pytest.raises(config.ConfigError, match=r"legal=bogus.*PATENT_CHECKER_CACHE_TTL"):
         config.cache_ttl_overrides(VALID_CACHE_KINDS)
+
+
+# --- load_env ----------------------------------------------------------
+
+
+_LOAD_ENV_VAR = "PATENT_CHECKER_TEST_LOAD_ENV_MARKER"
+
+
+def test_load_env_finds_dotenv_in_a_parent_directory(monkeypatch, tmp_path) -> None:
+    """``load_env`` searches upward from the current working directory for ``.env``."""
+    (tmp_path / ".env").write_text(f"{_LOAD_ENV_VAR}=from-dotenv\n", encoding="utf-8")
+    working_dir = tmp_path / "sub" / "deeper"
+    working_dir.mkdir(parents=True)
+    monkeypatch.chdir(working_dir)
+    monkeypatch.delenv(_LOAD_ENV_VAR, raising=False)
+
+    config.load_env()
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-dotenv"
+
+
+def test_load_env_does_not_override_an_existing_environment_variable(monkeypatch, tmp_path) -> None:
+    """A variable already set in the environment wins over the ``.env`` file's value."""
+    (tmp_path / ".env").write_text(f"{_LOAD_ENV_VAR}=from-dotenv\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(_LOAD_ENV_VAR, "from-process-env")
+
+    config.load_env()
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-process-env"
+
+
+def test_load_env_does_nothing_when_no_dotenv_file_is_found(monkeypatch, tmp_path) -> None:
+    """With no reachable ``.env`` file, ``load_env`` raises nothing and sets nothing."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    monkeypatch.chdir(empty_dir)
+    monkeypatch.delenv(_LOAD_ENV_VAR, raising=False)
+
+    config.load_env()
+
+    assert _LOAD_ENV_VAR not in os.environ
+
+
+# --- _resolve_secret: empty _FILE variant -------------------------------
+
+
+def test_resolve_secret_rejects_an_empty_file(monkeypatch, tmp_path) -> None:
+    """An empty ``_FILE`` variant is a ``ConfigError``, not an empty secret."""
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("", encoding="utf-8")
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY_FILE", str(secret_file))
+
+    with pytest.raises(config.ConfigError, match="empty"):
+        config._resolve_secret("OPS_KEY")
+
+
+def test_resolve_secret_rejects_a_whitespace_only_file(monkeypatch, tmp_path) -> None:
+    """A file holding only whitespace/newlines is treated the same as an empty file."""
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("   \n\n  \n", encoding="utf-8")
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY_FILE", str(secret_file))
+
+    with pytest.raises(config.ConfigError, match="empty"):
+        config._resolve_secret("OPS_KEY")
+
+
+def test_resolve_secret_strips_trailing_whitespace_from_a_normal_file(
+    monkeypatch, tmp_path
+) -> None:
+    """A normal (non-empty) ``_FILE`` value is returned with trailing whitespace stripped."""
+    secret_file = tmp_path / "secret.txt"
+    secret_file.write_text("actual-value\n", encoding="utf-8")
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY_FILE", str(secret_file))
+
+    assert config._resolve_secret("OPS_KEY") == "actual-value"
+
+
+def test_ops_configured_is_false_when_both_ops_files_are_empty(monkeypatch, tmp_path) -> None:
+    """``ops_configured`` is False when both OPS ``_FILE`` secrets point at empty files."""
+    key_file = tmp_path / "key.txt"
+    secret_file = tmp_path / "secret.txt"
+    key_file.write_text("", encoding="utf-8")
+    secret_file.write_text("", encoding="utf-8")
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_OPS_SECRET", raising=False)
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY_FILE", str(key_file))
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET_FILE", str(secret_file))
+    monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
+
+    assert config.ops_configured() is False
+
+
+# --- log_level -----------------------------------------------------------
+
+
+def test_log_level_defaults_to_info(monkeypatch) -> None:
+    """With no ``PATENT_CHECKER_LOG_LEVEL``, the default level is ``"info"``."""
+    monkeypatch.delenv("PATENT_CHECKER_LOG_LEVEL", raising=False)
+
+    assert config.log_level() == "info"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("debug", "debug"),
+        ("DEBUG", "debug"),
+        ("Warning", "warning"),
+        ("ERROR", "error"),
+        ("info", "info"),
+    ],
+)
+def test_log_level_accepts_valid_values_case_insensitively(monkeypatch, raw, expected) -> None:
+    """Accepted values are matched regardless of case and returned in lowercase."""
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", raw)
+
+    assert config.log_level() == expected
+
+
+def test_log_level_rejects_an_invalid_value(monkeypatch) -> None:
+    """A value outside the accepted set is a ``ConfigError``."""
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", "verbose")
+
+    with pytest.raises(config.ConfigError):
+        config.log_level()

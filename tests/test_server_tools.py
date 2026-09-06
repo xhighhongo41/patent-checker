@@ -42,6 +42,7 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
+from patent_checker.server import app as server_app
 from patent_checker.server import tools
 from patent_checker.server.app import (
     ServerState,
@@ -71,6 +72,7 @@ _ENV_VARS = (
     "PATENT_CHECKER_OPS_SECRET",
     "PATENT_CHECKER_OPS_KEY_FILE",
     "PATENT_CHECKER_OPS_SECRET_FILE",
+    "PATENT_CHECKER_LOG_LEVEL",
 )
 
 _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
@@ -89,9 +91,10 @@ def server_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
-    # python-dotenv searches upwards from patent_checker/config.py, so chdir
-    # alone would not stop the repository's real .env (which holds actual OPS
-    # credentials) from being loaded into the test environment.
+    # load_env() now searches upwards from the current working directory (see
+    # config.load_env), so chdir alone already keeps the repository's real
+    # .env (which holds actual OPS credentials) out of reach; load_dotenv is
+    # still replaced with a no-op as a second, load_env()-independent guard.
     monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
     monkeypatch.setenv("PATENT_CHECKER_OPERATOR_CONSENT", OPERATOR_NOTICE_VERSION)
     monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path))
@@ -557,6 +560,7 @@ def test_server_status_reports_the_running_configuration(
         "cache_ttl": {kind: cache.format_ttl(ttl) for kind, ttl in cache.DEFAULT_TTLS.items()},
         "cache_entries": {kind: 0 for kind in cache.KINDS},
         "operator_notice_version": OPERATOR_NOTICE_VERSION,
+        "log_level": "info",
     }
 
 
@@ -575,6 +579,20 @@ def test_server_status_reports_cache_entries_and_ttl_overrides(
     assert data["cache_entries"]["biblio"] == 1
     assert data["cache_ttl"]["legal"] == "1d"
     assert data["cache_ttl"]["biblio"] == "90d"
+
+
+def test_server_status_reports_the_configured_log_level(
+    monkeypatch: pytest.MonkeyPatch, make_state: Any
+) -> None:
+    """server_status reflects a non-default ``PATENT_CHECKER_LOG_LEVEL``."""
+    monkeypatch.setenv("PATENT_CHECKER_LOG_LEVEL", "debug")
+    overridden_settings = load_settings(transport="stdio")
+    state = make_state(ops_client=_StubOpsClient(), state_settings=overridden_settings)
+    mcp = build_server(overridden_settings, state=state)
+
+    data = _call(mcp, "server_status")
+
+    assert data["log_level"] == "debug"
 
 
 # --- error mapping -------------------------------------------------------
@@ -1005,3 +1023,78 @@ def test_banner_lines_warn_about_the_stdio_trust_model(settings: ServerSettings)
     assert "stdio" in joined
     assert "no authentication" in joined
     assert "ops_configured: False" in joined
+
+
+def test_banner_lines_show_the_tls_notice_even_for_a_loopback_bind(
+    settings: ServerSettings,
+) -> None:
+    """The TLS notice is unconditional for http, unlike the old loopback-only wording."""
+    http_settings = dataclasses.replace(
+        settings, transport="http", host="127.0.0.1", token="tok-secret-value"
+    )
+
+    lines = banner_lines(http_settings, ops_configured=True)
+
+    joined = "\n".join(lines)
+    assert (
+        "TLS: not provided by this server; put a reverse proxy in front if the port is "
+        "reachable from other machines" in joined
+    )
+
+
+# --- uvicorn logging configuration ----------------------------------------
+
+
+def test_uvicorn_log_config_redirects_both_handlers_to_stderr() -> None:
+    """Both the default and access-log uvicorn handlers write to stderr."""
+    result = server_app.uvicorn_log_config("info")
+
+    assert result["handlers"]["default"]["stream"] == "ext://sys.stderr"
+    assert result["handlers"]["access"]["stream"] == "ext://sys.stderr"
+
+
+def test_uvicorn_log_config_applies_the_level_to_the_three_loggers() -> None:
+    """The resolved level is applied to the uvicorn/uvicorn.error/uvicorn.access loggers."""
+    result = server_app.uvicorn_log_config("warning")
+
+    assert result["loggers"]["uvicorn"]["level"] == "WARNING"
+    assert result["loggers"]["uvicorn.error"]["level"] == "WARNING"
+    assert result["loggers"]["uvicorn.access"]["level"] == "WARNING"
+
+
+def test_uvicorn_log_config_does_not_mutate_uvicorn_s_own_default() -> None:
+    """The shared ``uvicorn.config.LOGGING_CONFIG`` default is never mutated."""
+    import copy
+
+    import uvicorn.config
+
+    before = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+
+    server_app.uvicorn_log_config("error")
+
+    assert uvicorn.config.LOGGING_CONFIG == before
+
+
+# --- run() ------------------------------------------------------------------
+
+
+def test_run_passes_log_level_and_uvicorn_log_config_for_http(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings
+) -> None:
+    """The http transport's ``mcp.run()`` call carries the resolved log level and log config."""
+    http_settings = dataclasses.replace(
+        settings, transport="http", token="tok-secret-value", log_level="warning"
+    )
+    calls: list[dict[str, Any]] = []
+
+    class _FakeMcp:
+        def run(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(server_app, "build_server", lambda settings: _FakeMcp())
+
+    server_app.run(http_settings)
+
+    assert len(calls) == 1
+    assert calls[0]["log_level"] == "warning"
+    assert calls[0]["uvicorn_config"] == {"log_config": server_app.uvicorn_log_config("warning")}

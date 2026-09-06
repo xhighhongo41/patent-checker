@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "mcp": {
+    "notes": {
+      "type": "remote",
+      "url": "https://notes.example/mcp",
+      "headers": {
+        "Authorization": "Bearer notes-token"
+      }
+    }
+  }
+}
