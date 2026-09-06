@@ -465,11 +465,12 @@ def server_status(*, ctx: Context) -> dict[str, Any]:
 
     Returns ``{"version", "ops_configured", "transport", "data_dir",
     "cache_dir", "search_cache_dir", "cache_ttl", "cache_entries",
-    "operator_notice_version"}``, where "cache_dir" is the shared
-    (publication-keyed) cache root, "search_cache_dir" is the local
+    "operator_notice_version", "log_level"}``, where "cache_dir" is the
+    shared (publication-keyed) cache root, "search_cache_dir" is the local
     (search-keyed) cache root, "cache_ttl" maps each cache kind to its
-    effective time-to-live (e.g. ``"90d"`` or ``"never"``), and
-    "cache_entries" maps each cache kind to its entry count.
+    effective time-to-live (e.g. ``"90d"`` or ``"never"``), "cache_entries"
+    maps each cache kind to its entry count, and "log_level" is the
+    server's resolved log level (e.g. ``"info"``).
     """
     state = _state(ctx)
     with _mapped_errors():
@@ -484,6 +485,7 @@ def server_status(*, ctx: Context) -> dict[str, Any]:
             "cache_ttl": stats["ttls"],
             "cache_entries": {kind: info["entries"] for kind, info in stats["kinds"].items()},
             "operator_notice_version": state.settings.operator_notice_version,
+            "log_level": state.settings.log_level,
         }
 
 

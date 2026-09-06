@@ -12,7 +12,7 @@ from collections.abc import Collection
 from datetime import timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 # The only upstream hosts patent-checker is allowed to contact. Enforced by
 # ``patent_checker.net.AllowlistTransport`` before any connection is made.
@@ -20,6 +20,10 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({"ops.epo.org", "patents.google.com"})
 
 ENV_CACHE_DIR = "PATENT_CHECKER_CACHE_DIR"
 ENV_CACHE_TTL = "PATENT_CHECKER_CACHE_TTL"
+ENV_LOG_LEVEL = "PATENT_CHECKER_LOG_LEVEL"
+
+# Accepted values of ``ENV_LOG_LEVEL``, matched case-insensitively.
+LOG_LEVELS = ("debug", "info", "warning", "error")
 
 # Matches ``<n>d`` / ``<n>h`` TTL spellings; ``"0"`` (no expiry) is handled
 # separately in :func:`parse_ttl` since it takes no unit suffix.
@@ -35,8 +39,17 @@ class ConfigError(RuntimeError):
 
 
 def load_env() -> None:
-    """Load environment variables from a ``.env`` file in the current directory."""
-    load_dotenv()
+    """Load environment variables from the nearest ``.env`` file.
+
+    Searches upward from the current working directory (not from this
+    module's own location) for the first ``.env`` file, so a CLI installed
+    with ``uv tool install`` still picks up the ``.env`` of whatever folder
+    it is invoked from. A variable already present in the environment is
+    never overridden by the ``.env`` file (``override=False``, the default
+    of :func:`dotenv.load_dotenv`). Does nothing if no ``.env`` file is
+    found.
+    """
+    load_dotenv(find_dotenv(usecwd=True))
 
 
 def set_data_base(path: Path | None) -> None:
@@ -202,15 +215,40 @@ def cache_ttl_overrides(valid_kinds: Collection[str]) -> dict[str, timedelta | N
     return overrides
 
 
+def log_level() -> str:
+    """Resolve the server log level from ``$PATENT_CHECKER_LOG_LEVEL``.
+
+    Accepted values are ``debug``, ``info``, ``warning``, and ``error``,
+    matched case-insensitively; the default is ``"info"`` when unset or
+    empty. The returned value is always lowercase.
+
+    Raises:
+        ConfigError: If the environment value is set and is not one of
+            :data:`LOG_LEVELS`.
+    """
+    env_value = os.environ.get(ENV_LOG_LEVEL, "")
+    if not env_value:
+        return "info"
+    normalized = env_value.lower()
+    if normalized not in LOG_LEVELS:
+        raise ConfigError(
+            f"{ENV_LOG_LEVEL}={env_value!r} is invalid; expected one of: {', '.join(LOG_LEVELS)}"
+        )
+    return normalized
+
+
 def _resolve_secret(name: str) -> str:
     """Resolve one secret value from ``PATENT_CHECKER_<name>`` or its ``_FILE`` variant.
 
     Exactly one of ``PATENT_CHECKER_<name>`` and ``PATENT_CHECKER_<name>_FILE``
-    may be set. The ``_FILE`` variant is read from disk and stripped.
+    may be set. The ``_FILE`` variant is read from disk and stripped; an
+    empty (or whitespace-only) file is treated as a configuration error, not
+    as an empty secret.
 
     Raises:
-        ConfigError: If neither variable is set, if both are set, or if the
-            ``_FILE`` variant points to a file that cannot be read.
+        ConfigError: If neither variable is set, if both are set, if the
+            ``_FILE`` variant points to a file that cannot be read, or if
+            that file is empty.
     """
     direct_name = f"PATENT_CHECKER_{name}"
     file_name = f"{direct_name}_FILE"
@@ -225,9 +263,12 @@ def _resolve_secret(name: str) -> str:
 
     if file_path:
         try:
-            return Path(file_path).read_text(encoding="utf-8").strip()
+            value = Path(file_path).read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise ConfigError(f"cannot read {file_name} ({file_path}): {exc}") from exc
+        if not value:
+            raise ConfigError(f"{file_name} ({file_path}) is empty")
+        return value
 
     raise ConfigError(
         f"{direct_name} / {file_name} are not set; copy .env.example to .env and fill them in"
