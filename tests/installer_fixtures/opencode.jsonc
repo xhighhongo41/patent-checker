@@ -1,0 +1,9 @@
+{
+  // The remote servers this machine may talk to.
+  "mcp": {
+    "notes": {
+      "type": "remote",
+      "url": "https://notes.example/mcp",
+    },
+  },
+}

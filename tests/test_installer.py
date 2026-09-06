@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -16,6 +17,24 @@ from typing import Any
 
 import pytest
 
+from patent_checker import consent
+from patent_checker.installer import (
+    CONSENT_PROMPT,
+    InstallAborted,
+    InstallOptions,
+    InstallReport,
+    format_report,
+    install,
+    list_agents,
+)
+from patent_checker.installer.agents import (
+    AGENTS,
+    DEFAULT_URL,
+    SERVER_NAME,
+    Registration,
+    detect_agents,
+    register_mcp,
+)
 from patent_checker.installer.errors import InstallerError
 from patent_checker.installer.skill import AGENT_KEYS, install_skill, skill_source, skill_targets
 from patent_checker.installer.token import (
@@ -28,6 +47,7 @@ from patent_checker.installer.token import (
 )
 from patent_checker.installer.writers import (
     Outcome,
+    Runner,
     WriteResult,
     append_toml_table,
     merge_json,
@@ -181,12 +201,14 @@ def test_merge_json_replaces_an_entry_with_the_same_name(tmp_path: Path) -> None
 
 def test_merge_json_copies_the_original_to_a_bak_sibling(tmp_path: Path) -> None:
     path = tmp_path / "config.json"
-    original = '{\n  "mcpServers": {}\n}\n'
-    path.write_text(original, encoding="utf-8")
+    original = b'{\n  "mcpServers": {}\n}\n'
+    # Written as bytes so the .bak comparison is exact on every platform
+    # (text mode would translate the newlines on Windows).
+    path.write_bytes(original)
 
     merge_json(path, _add_server("patent-checker", {"url": "http://127.0.0.1:8765/mcp"}))
 
-    assert (tmp_path / "config.json.bak").read_bytes() == original.encode("utf-8")
+    assert (tmp_path / "config.json.bak").read_bytes() == original
 
 
 def test_merge_json_writes_a_two_space_indent_by_default(tmp_path: Path) -> None:
@@ -873,3 +895,1188 @@ def test_install_skill_raises_when_the_copy_leaves_no_skill_file(tmp_path: Path)
 
     with pytest.raises(InstallerError):
         install_skill(source, [target])
+
+
+# --- agents ---
+
+#: Token used by the registration tests; must never reach a message.
+TOKEN = "s3cret-token"
+
+FIXTURES = Path(__file__).resolve().parent / "installer_fixtures"
+
+
+def _place(fixture: str, destination: Path) -> Path:
+    """Copy the fixture named *fixture* to *destination* and return it."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text((FIXTURES / fixture).read_text(encoding="utf-8"), encoding="utf-8")
+    return destination
+
+
+def _no_cli(program: str) -> str | None:
+    """``which`` stand-in for a machine with no agent CLI installed."""
+    return None
+
+
+def _cli_named(*programs: str) -> Callable[[str], str | None]:
+    """Return a ``which`` stand-in that only finds *programs*."""
+
+    def which(program: str) -> str | None:
+        return f"/usr/local/bin/{program}" if program in programs else None
+
+    return which
+
+
+def _files_under(root: Path) -> set[Path]:
+    """Return every regular file below *root*, or an empty set if it is missing."""
+    if not root.exists():
+        return set()
+    return {path for path in root.rglob("*") if path.is_file()}
+
+
+def _register(
+    key: str,
+    *,
+    home: Path,
+    cwd: Path,
+    scope: str = "user",
+    url: str = DEFAULT_URL,
+    token: str = TOKEN,
+    token_env: bool = False,
+    which: Callable[[str], str | None] = _no_cli,
+    runner: Runner | None = None,
+    dry_run: bool = False,
+) -> Registration:
+    """Call :func:`register_mcp` with the defaults these tests share."""
+    return register_mcp(
+        key,
+        scope=scope,
+        home=home,
+        cwd=cwd,
+        url=url,
+        token=token,
+        token_env=token_env,
+        which=which,
+        runner=runner,
+        dry_run=dry_run,
+    )
+
+
+def test_agents_table_covers_every_known_agent_key() -> None:
+    assert tuple(AGENTS) == AGENT_KEYS
+
+
+def test_agents_table_names_a_cli_only_for_the_products_that_ship_one() -> None:
+    assert {key: spec.cli for key, spec in AGENTS.items()} == {
+        "claude-code": "claude",
+        "codex": "codex",
+        "opencode": "opencode",
+        "openhands": None,
+        "cursor": None,
+        "gemini-cli": "gemini",
+        "copilot-cli": "copilot",
+        "hermes": "hermes",
+    }
+
+
+def test_agents_table_leaves_the_reference_style_open_for_hosts_that_expand_none() -> None:
+    unsupported = {key for key, spec in AGENTS.items() if spec.reference_style is None}
+
+    assert unsupported == {"openhands", "copilot-cli"}
+
+
+def test_detect_agents_finds_an_agent_by_its_cli_on_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert detect_agents(home=home, which=_cli_named("claude")) == ["claude-code"]
+
+
+def test_detect_agents_finds_an_agent_by_its_configuration_directory(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".cursor").mkdir(parents=True)
+
+    assert detect_agents(home=home, which=_no_cli) == ["cursor"]
+
+
+def test_detect_agents_finds_opencode_below_dot_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".config" / "opencode").mkdir(parents=True)
+
+    assert detect_agents(home=home, which=_no_cli) == ["opencode"]
+
+
+def test_detect_agents_reports_the_keys_in_the_documented_order(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    (home / ".claude").mkdir()
+
+    result = detect_agents(home=home, which=_cli_named("codex"))
+
+    assert result == ["claude-code", "codex", "hermes"]
+
+
+def test_detect_agents_returns_nothing_on_a_machine_without_agents(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    assert detect_agents(home=home, which=_no_cli) == []
+
+
+def test_register_mcp_rejects_an_unknown_agent(tmp_path: Path) -> None:
+    with pytest.raises(InstallerError):
+        _register("emacs", home=tmp_path / "home", cwd=tmp_path / "project")
+
+
+def test_register_mcp_rejects_an_unknown_scope(tmp_path: Path) -> None:
+    with pytest.raises(InstallerError):
+        _register("cursor", home=tmp_path / "home", cwd=tmp_path / "project", scope="machine")
+
+
+def test_register_claude_code_runs_the_documented_vendor_command(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    result = _register(
+        "claude-code",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("claude"),
+        runner=_fake_runner(calls=calls),
+    ).result
+
+    assert result.outcome is Outcome.REGISTERED_BY_CLI
+    assert calls == [
+        [
+            "claude",
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "--scope",
+            "user",
+            SERVER_NAME,
+            DEFAULT_URL,
+            "--header",
+            f"Authorization: Bearer {TOKEN}",
+        ]
+    ]
+
+
+def test_register_claude_code_passes_the_project_scope_to_the_cli(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    _register(
+        "claude-code",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        scope="project",
+        which=_cli_named("claude"),
+        runner=_fake_runner(calls=calls),
+    )
+
+    assert calls[0][calls[0].index("--scope") + 1] == "project"
+
+
+def test_register_claude_code_sends_an_environment_reference_with_token_env(
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+
+    _register(
+        "claude-code",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        token_env=True,
+        which=_cli_named("claude"),
+        runner=_fake_runner(calls=calls),
+    )
+
+    assert calls[0][-1] == f"Authorization: Bearer ${{{ENV_TOKEN}}}"
+    assert TOKEN not in " ".join(calls[0])
+
+
+def test_register_claude_code_asks_for_a_manual_step_when_the_cli_is_missing(
+    tmp_path: Path,
+) -> None:
+    registration = _register("claude-code", home=tmp_path / "home", cwd=tmp_path / "project")
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert "claude" in registration.result.message
+    assert registration.snippet is not None
+    assert "claude mcp add" in registration.snippet
+
+
+def test_register_claude_code_snippet_spells_the_token_as_a_reference(tmp_path: Path) -> None:
+    registration = _register("claude-code", home=tmp_path / "home", cwd=tmp_path / "project")
+
+    assert registration.snippet is not None
+    assert TOKEN not in registration.snippet
+    assert f"${{{ENV_TOKEN}}}" in registration.snippet
+
+
+def test_register_claude_code_project_snippet_shows_the_mcp_json_entry(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    registration = _register("claude-code", home=tmp_path / "home", cwd=cwd, scope="project")
+
+    assert registration.snippet is not None
+    assert str(cwd / ".mcp.json") in registration.snippet
+    assert '"mcpServers"' in registration.snippet
+    assert '"type": "http"' in registration.snippet
+
+
+def test_register_claude_code_asks_for_a_manual_step_when_the_cli_fails(tmp_path: Path) -> None:
+    registration = _register(
+        "claude-code",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("claude"),
+        runner=_fake_runner(returncode=1, stderr="unknown flag --scope\n"),
+    )
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert "unknown flag --scope" in registration.result.message
+    assert registration.snippet is not None
+
+
+def test_register_codex_appends_its_table_to_the_user_configuration(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("codex_config.toml", home / ".codex" / "config.toml")
+
+    result = _register("codex", home=home, cwd=tmp_path / "project").result
+
+    assert (result.outcome, result.path) == (Outcome.WRITTEN, path)
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert data["model"] == "gpt-5-codex"
+    assert data["mcp_servers"]["notes"]["url"] == "https://notes.example/mcp"
+    assert data["mcp_servers"][SERVER_NAME] == {
+        "url": DEFAULT_URL,
+        "http_headers": {"Authorization": f"Bearer {TOKEN}"},
+    }
+
+
+def test_register_codex_writes_the_variable_name_with_token_env(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("codex_config.toml", home / ".codex" / "config.toml")
+
+    _register("codex", home=home, cwd=tmp_path / "project", token_env=True)
+
+    entry = tomllib.loads(path.read_text(encoding="utf-8"))["mcp_servers"][SERVER_NAME]
+    assert entry == {"url": DEFAULT_URL, "bearer_token_env_var": ENV_TOKEN}
+
+
+def test_register_codex_creates_a_missing_configuration(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    result = _register("codex", home=home, cwd=tmp_path / "project").result
+
+    assert result.outcome is Outcome.WRITTEN
+    path = home / ".codex" / "config.toml"
+    assert tomllib.loads(path.read_text(encoding="utf-8"))["mcp_servers"][SERVER_NAME]["url"] == (
+        DEFAULT_URL
+    )
+
+
+def test_register_codex_leaves_an_existing_table_alone(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("codex_config_existing.toml", home / ".codex" / "config.toml")
+    original = path.read_text(encoding="utf-8")
+
+    result = _register("codex", home=home, cwd=tmp_path / "project").result
+
+    assert result.outcome is Outcome.SKIPPED
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_register_codex_project_scope_writes_below_the_working_directory(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    result = _register("codex", home=tmp_path / "home", cwd=cwd, scope="project").result
+
+    assert result.path == cwd / ".codex" / "config.toml"
+    assert "trusted" in result.message
+
+
+def test_register_opencode_keeps_the_other_servers(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("opencode.json", home / ".config" / "opencode" / "opencode.json")
+
+    result = _register("opencode", home=home, cwd=tmp_path / "project").result
+
+    assert (result.outcome, result.path) == (Outcome.WRITTEN, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["$schema"] == "https://opencode.ai/config.json"
+    assert data["theme"] == "system"
+    assert data["mcp"]["notes"]["url"] == "https://notes.example/mcp"
+    assert data["mcp"][SERVER_NAME] == {
+        "type": "remote",
+        "url": DEFAULT_URL,
+        "headers": {"Authorization": f"Bearer {TOKEN}"},
+    }
+
+
+def test_register_opencode_replaces_its_own_entry(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = home / ".config" / "opencode" / "opencode.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"mcp": {SERVER_NAME: {"type": "remote", "url": "http://old.example/mcp"}}}),
+        encoding="utf-8",
+    )
+
+    _register("opencode", home=home, cwd=tmp_path / "project")
+
+    servers = json.loads(path.read_text(encoding="utf-8"))["mcp"]
+    assert list(servers) == [SERVER_NAME]
+    assert servers[SERVER_NAME]["url"] == DEFAULT_URL
+
+
+def test_register_opencode_uses_its_own_environment_reference(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    _register("opencode", home=home, cwd=tmp_path / "project", token_env=True)
+
+    path = home / ".config" / "opencode" / "opencode.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcp"][SERVER_NAME]
+    assert entry["headers"] == {"Authorization": f"Bearer {{env:{ENV_TOKEN}}}"}
+
+
+def test_register_opencode_reports_manual_for_a_jsonc_configuration(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    jsonc = _place("opencode.jsonc", home / ".config" / "opencode" / "opencode.jsonc")
+    original = jsonc.read_text(encoding="utf-8")
+
+    registration = _register("opencode", home=home, cwd=tmp_path / "project")
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert str(jsonc) in registration.result.message
+    assert registration.snippet is not None
+    assert jsonc.read_text(encoding="utf-8") == original
+    assert not (home / ".config" / "opencode" / "opencode.json").exists()
+
+
+def test_register_opencode_project_scope_writes_into_the_working_directory(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    result = _register("opencode", home=tmp_path / "home", cwd=cwd, scope="project").result
+
+    assert result.path == cwd / "opencode.json"
+
+
+def test_register_openhands_always_asks_for_a_manual_edit(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    registration = _register("openhands", home=tmp_path / "home", cwd=cwd)
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert registration.result.path == cwd / "config.toml"
+    assert registration.snippet is not None
+    assert "[mcp]" in registration.snippet
+    assert "shttp_servers" in registration.snippet
+    assert TOKEN not in registration.snippet
+
+
+def test_register_openhands_snippet_flags_the_unverified_api_key(tmp_path: Path) -> None:
+    registration = _register("openhands", home=tmp_path / "home", cwd=tmp_path / "project")
+
+    assert registration.snippet is not None
+    assert "api_key" in registration.snippet
+    assert "not confirmed" in registration.snippet
+
+
+def test_register_openhands_says_that_token_env_is_not_supported(tmp_path: Path) -> None:
+    registration = _register(
+        "openhands", home=tmp_path / "home", cwd=tmp_path / "project", token_env=True
+    )
+
+    assert "--token-env" in registration.result.message
+
+
+def test_register_cursor_keeps_the_other_servers(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("cursor_mcp.json", home / ".cursor" / "mcp.json")
+
+    result = _register("cursor", home=home, cwd=tmp_path / "project").result
+
+    assert (result.outcome, result.path) == (Outcome.WRITTEN, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["notes"]["url"] == "https://notes.example/mcp"
+    assert data["mcpServers"]["local-tools"] == {"command": "notes-mcp", "args": ["--stdio"]}
+
+
+def test_register_cursor_writes_no_type_key(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("cursor_mcp.json", home / ".cursor" / "mcp.json")
+
+    _register("cursor", home=home, cwd=tmp_path / "project")
+
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
+    assert entry == {"url": DEFAULT_URL, "headers": {"Authorization": f"Bearer {TOKEN}"}}
+
+
+def test_register_cursor_uses_the_vscode_environment_reference(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    _register("cursor", home=home, cwd=tmp_path / "project", token_env=True)
+
+    path = home / ".cursor" / "mcp.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
+    assert entry["headers"] == {"Authorization": f"Bearer ${{env:{ENV_TOKEN}}}"}
+
+
+def test_register_cursor_project_scope_writes_below_the_working_directory(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    result = _register("cursor", home=tmp_path / "home", cwd=cwd, scope="project").result
+
+    assert result.path == cwd / ".cursor" / "mcp.json"
+
+
+def test_register_gemini_cli_runs_the_documented_vendor_command(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    result = _register(
+        "gemini-cli",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("gemini"),
+        runner=_fake_runner(calls=calls),
+    ).result
+
+    assert result.outcome is Outcome.REGISTERED_BY_CLI
+    assert calls == [
+        [
+            "gemini",
+            "mcp",
+            "add",
+            "--scope",
+            "user",
+            "--transport",
+            "http",
+            SERVER_NAME,
+            DEFAULT_URL,
+            "--header",
+            f"Authorization: Bearer {TOKEN}",
+        ]
+    ]
+
+
+def test_register_gemini_cli_falls_back_to_the_settings_file_when_the_cli_fails(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    path = _place("gemini_settings.json", home / ".gemini" / "settings.json")
+
+    result = _register(
+        "gemini-cli",
+        home=home,
+        cwd=tmp_path / "project",
+        which=_cli_named("gemini"),
+        runner=_fake_runner(returncode=1, stderr="unknown option --scope\n"),
+    ).result
+
+    assert (result.outcome, result.path) == (Outcome.WRITTEN, path)
+    assert "CLI failed" in result.message
+    assert "fell back to editing" in result.message
+    assert json.loads(path.read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]["httpUrl"] == (
+        DEFAULT_URL
+    )
+
+
+def test_register_gemini_cli_keeps_the_other_settings(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("gemini_settings.json", home / ".gemini" / "settings.json")
+
+    _register("gemini-cli", home=home, cwd=tmp_path / "project")
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["theme"] == "GitHub"
+    assert data["mcpServers"]["notes"]["httpUrl"] == "https://notes.example/mcp"
+    assert data["mcpServers"][SERVER_NAME] == {
+        "httpUrl": DEFAULT_URL,
+        "headers": {"Authorization": f"Bearer {TOKEN}"},
+    }
+
+
+def test_register_gemini_cli_uses_the_dollar_environment_reference(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    _register("gemini-cli", home=home, cwd=tmp_path / "project", token_env=True)
+
+    path = home / ".gemini" / "settings.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
+    assert entry["headers"] == {"Authorization": f"Bearer ${{{ENV_TOKEN}}}"}
+
+
+def test_register_gemini_cli_project_scope_writes_below_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "project"
+
+    result = _register("gemini-cli", home=tmp_path / "home", cwd=cwd, scope="project").result
+
+    assert result.path == cwd / ".gemini" / "settings.json"
+
+
+def test_register_copilot_cli_runs_the_documented_vendor_command(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    result = _register(
+        "copilot-cli",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("copilot"),
+        runner=_fake_runner(calls=calls),
+    ).result
+
+    assert result.outcome is Outcome.REGISTERED_BY_CLI
+    assert calls == [
+        [
+            "copilot",
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            SERVER_NAME,
+            DEFAULT_URL,
+            "--header",
+            f"Authorization: Bearer {TOKEN}",
+        ]
+    ]
+
+
+def test_register_copilot_cli_falls_back_to_the_user_configuration(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    path = _place("copilot_mcp-config.json", home / ".copilot" / "mcp-config.json")
+
+    result = _register(
+        "copilot-cli",
+        home=home,
+        cwd=tmp_path / "project",
+        which=_cli_named("copilot"),
+        runner=_fake_runner(returncode=1, stderr="unknown command mcp\n"),
+    ).result
+
+    assert (result.outcome, result.path) == (Outcome.WRITTEN, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["notes"]["url"] == "https://notes.example/mcp"
+    assert data["mcpServers"][SERVER_NAME] == {
+        "type": "http",
+        "url": DEFAULT_URL,
+        "headers": {"Authorization": f"Bearer {TOKEN}"},
+    }
+
+
+def test_register_copilot_cli_project_scope_uses_the_repository_mcp_json(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    result = _register("copilot-cli", home=tmp_path / "home", cwd=cwd, scope="project").result
+
+    assert result.path == cwd / ".mcp.json"
+
+
+def test_register_copilot_cli_reports_manual_for_token_env(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    registration = _register(
+        "copilot-cli",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        token_env=True,
+        which=_cli_named("copilot"),
+        runner=_fake_runner(calls=calls),
+    )
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert "--token-env" in registration.result.message
+    assert registration.snippet is not None
+    assert calls == []
+    assert _files_under(tmp_path) == set()
+
+
+def test_register_hermes_always_asks_for_a_manual_edit(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    registration = _register("hermes", home=home, cwd=tmp_path / "project")
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert registration.result.path == home / ".hermes" / "config.yaml"
+    assert registration.snippet is not None
+    assert "mcp_servers:" in registration.snippet
+    assert f"${{{ENV_TOKEN}}}" in registration.snippet
+
+
+def test_register_hermes_project_scope_points_at_the_user_configuration(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+
+    registration = _register("hermes", home=home, cwd=tmp_path / "project", scope="project")
+
+    assert registration.result.path == home / ".hermes" / "config.yaml"
+    assert "per user" in registration.result.message
+
+
+@pytest.mark.parametrize("key", AGENT_KEYS)
+def test_register_mcp_never_leaks_the_token_into_a_message_or_snippet(
+    key: str, tmp_path: Path
+) -> None:
+    """Whatever route an agent takes, the token stays out of what we print."""
+    registration = _register(
+        key,
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("claude", "codex", "opencode", "gemini", "copilot", "hermes"),
+        runner=_fake_runner(returncode=1, stderr=f"rejected token {TOKEN}\n"),
+    )
+
+    assert TOKEN not in registration.result.message
+    assert TOKEN not in (registration.snippet or "")
+
+
+@pytest.mark.parametrize("key", AGENT_KEYS)
+def test_register_mcp_dry_run_writes_nothing_and_runs_nothing(key: str, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+
+    registration = _register(
+        key,
+        home=home,
+        cwd=cwd,
+        which=_cli_named("claude", "codex", "opencode", "gemini", "copilot", "hermes"),
+        runner=_fake_runner(calls=calls),
+        dry_run=True,
+    )
+
+    assert calls == []
+    assert _files_under(tmp_path) == set()
+    assert registration.result.message != ""
+
+
+# --- install() ---
+
+
+def _isolate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """Redirect every path the consent gate reads and return ``(home, cwd)``.
+
+    :mod:`patent_checker.consent` resolves its record through
+    ``Path.home()``, ``$XDG_CONFIG_HOME`` and ``Path.cwd()``; all three are
+    pointed below *tmp_path* so no test can read or write a real record.
+    """
+    home = tmp_path / "home"
+    cwd = tmp_path / "project"
+    home.mkdir()
+    cwd.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.chdir(cwd)
+    return home, cwd
+
+
+def _no_prompt(prompt: str) -> str:
+    """Token prompt that fails the test if the installer reaches it."""
+    raise AssertionError("the installer must not ask for a token here")
+
+
+def _run_install(
+    options: InstallOptions,
+    *,
+    home: Path,
+    cwd: Path,
+    environ: dict[str, str] | None = None,
+    stdin_is_tty: bool = False,
+    confirm: Callable[[str], bool] = lambda question: True,
+    prompt_secret: Callable[[str], str] = _no_prompt,
+    which: Callable[[str], str | None] = _no_cli,
+    runner: Runner | None = None,
+    out: io.StringIO | None = None,
+) -> InstallReport:
+    """Call :func:`install` with the defaults these tests share."""
+    return install(
+        options,
+        home=home,
+        cwd=cwd,
+        environ={} if environ is None else environ,
+        stdin_is_tty=stdin_is_tty,
+        confirm=confirm,
+        prompt_secret=prompt_secret,
+        which=which,
+        runner=runner,
+        out=out if out is not None else io.StringIO(),
+    )
+
+
+def test_install_aborts_when_no_agent_is_detected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(InstallAborted) as exc_info:
+        _run_install(InstallOptions(agree=True, mcp=False), home=home, cwd=cwd)
+
+    assert "--agent" in str(exc_info.value)
+
+
+def test_install_uses_the_detected_agents_when_none_are_named(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    (home / ".cursor").mkdir()
+
+    report = _run_install(InstallOptions(agree=True, mcp=False), home=home, cwd=cwd)
+
+    assert report.agents == ["cursor"]
+
+
+def test_install_covers_every_agent_with_the_all_keyword(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("all",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+
+    assert report.agents == list(AGENT_KEYS)
+
+
+def test_install_rejects_an_unknown_agent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(InstallerError):
+        _run_install(InstallOptions(agents=("emacs",), agree=True, mcp=False), home=home, cwd=cwd)
+
+
+def test_install_shows_the_notice_and_records_consent_with_agree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    out = io.StringIO()
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd, out=out
+    )
+
+    assert "Important Notice" in out.getvalue()
+    record = json.loads(
+        (home / ".config" / "patent-checker" / "consent.json").read_text(encoding="utf-8")
+    )
+    assert set(record) == {"notice_version", "agreed_at", "language"}
+    assert record["notice_version"] == consent.NOTICE_VERSION
+    assert record["language"] == "en"
+    assert "recorded" in report.consent
+
+
+def test_install_records_the_language_the_notice_was_shown_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    out = io.StringIO()
+
+    _run_install(
+        InstallOptions(agents=("cursor",), lang="ja", agree=True, mcp=False),
+        home=home,
+        cwd=cwd,
+        out=out,
+    )
+
+    record = json.loads(
+        (home / ".config" / "patent-checker" / "consent.json").read_text(encoding="utf-8")
+    )
+    assert record["language"] == "ja"
+    assert "重要なお知らせ" in out.getvalue()
+
+
+def test_install_skips_the_notice_when_consent_is_already_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    consent.record_consent(language="en", scope="user")
+    out = io.StringIO()
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), mcp=False), home=home, cwd=cwd, out=out
+    )
+
+    assert "Important Notice" not in out.getvalue()
+    assert report.consent.startswith("already recorded on")
+
+
+def test_install_asks_before_recording_on_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    asked: list[str] = []
+
+    def confirm(question: str) -> bool:
+        asked.append(question)
+        return True
+
+    _run_install(
+        InstallOptions(agents=("cursor",), mcp=False),
+        home=home,
+        cwd=cwd,
+        stdin_is_tty=True,
+        confirm=confirm,
+    )
+
+    assert asked == [CONSENT_PROMPT]
+    assert (home / ".config" / "patent-checker" / "consent.json").is_file()
+
+
+def test_install_aborts_when_the_answer_is_no(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(InstallAborted):
+        _run_install(
+            InstallOptions(agents=("cursor",), mcp=False),
+            home=home,
+            cwd=cwd,
+            stdin_is_tty=True,
+            confirm=lambda question: False,
+        )
+
+    assert not (home / ".config" / "patent-checker").exists()
+    assert not (home / ".agents").exists()
+
+
+def test_install_aborts_without_a_terminal_and_without_agree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    out = io.StringIO()
+
+    with pytest.raises(InstallAborted) as exc_info:
+        _run_install(InstallOptions(agents=("cursor",), mcp=False), home=home, cwd=cwd, out=out)
+
+    assert "--agree" in str(exc_info.value)
+    assert "Important Notice" in out.getvalue()
+
+
+def test_install_points_at_the_operator_notice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    out = io.StringIO()
+
+    _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd, out=out
+    )
+
+    assert "serve --show-operator-notice" in out.getvalue()
+
+
+def test_install_copies_the_skill_into_the_shared_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+
+    target = home / ".agents" / "skills" / "patent-checker"
+    assert (target / "SKILL.md").is_file()
+    assert [result.outcome for result in report.skill] == [Outcome.WRITTEN]
+
+
+def test_install_copies_the_skill_into_the_claude_directory_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    _run_install(InstallOptions(agents=("claude-code",), agree=True, mcp=False), home=home, cwd=cwd)
+
+    assert (home / ".claude" / "skills" / "patent-checker" / "SKILL.md").is_file()
+
+
+def test_install_without_the_skill_step_copies_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False, mcp=False),
+        home=home,
+        cwd=cwd,
+    )
+
+    assert report.skill == []
+    assert not (home / ".agents").exists()
+
+
+def test_install_turns_a_failed_skill_copy_into_a_manual_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    def refuse(source: Path, target: Path, dirs_exist_ok: bool = False) -> Path:
+        raise PermissionError(13, "Permission denied", str(target))
+
+    monkeypatch.setattr("patent_checker.installer.skill.shutil.copytree", refuse)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+
+    assert [result.outcome for result in report.skill] == [Outcome.MANUAL]
+    assert "Permission denied" in report.skill[0].message
+
+
+def test_install_registers_the_server_with_the_chosen_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    assert report.mcp["cursor"].result.outcome is Outcome.WRITTEN
+    path = home / ".cursor" / "mcp.json"
+    entry = json.loads(path.read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
+    assert entry["headers"] == {"Authorization": f"Bearer {TOKEN}"}
+
+
+def test_install_aborts_when_no_source_can_provide_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(InstallAborted):
+        _run_install(
+            InstallOptions(agents=("cursor",), agree=True, skill=False), home=home, cwd=cwd
+        )
+
+
+def test_install_asks_for_the_token_only_on_a_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    prompts: list[str] = []
+
+    def prompt_secret(question: str) -> str:
+        prompts.append(question)
+        return TOKEN
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        stdin_is_tty=True,
+        prompt_secret=prompt_secret,
+    )
+
+    assert len(prompts) == 1
+    assert report.mcp["cursor"].result.outcome is Outcome.WRITTEN
+
+
+def test_install_needs_no_token_when_the_mcp_step_is_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False),
+        home=home,
+        cwd=cwd,
+        stdin_is_tty=True,
+    )
+
+    assert report.mcp == {}
+
+
+def test_install_dry_run_leaves_the_directory_untouched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("all",), agree=True, dry_run=True),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude", "gemini", "copilot"),
+        runner=_fake_runner(),
+    )
+
+    assert _files_under(tmp_path) == before
+    assert set(report.mcp) == set(AGENT_KEYS)
+    assert "dry run" in report.consent
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_install_turns_a_write_error_into_a_manual_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    locked = home / ".cursor"
+    locked.mkdir()
+    locked.chmod(0o500)
+    try:
+        report = _run_install(
+            InstallOptions(agents=("cursor",), agree=True, skill=False),
+            home=home,
+            cwd=cwd,
+            environ={ENV_TOKEN: TOKEN},
+        )
+    finally:
+        locked.chmod(0o700)
+
+    result = report.mcp["cursor"].result
+    assert result.outcome is Outcome.MANUAL
+    assert TOKEN not in result.message
+
+
+def test_install_report_exit_code_is_zero_even_with_manual_steps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("hermes",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    assert report.mcp["hermes"].result.outcome is Outcome.MANUAL
+    assert report.exit_code() == 0
+
+
+def test_format_report_never_shows_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("all",), agree=True),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude", "gemini", "copilot"),
+        runner=_fake_runner(returncode=1, stderr=f"rejected token {TOKEN}\n"),
+    )
+
+    assert TOKEN not in format_report(report)
+
+
+def test_format_report_lists_every_agent_and_its_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor", "hermes"), agree=True),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    text = format_report(report)
+
+    assert "cursor" in text
+    assert "hermes" in text
+    assert str(Outcome.WRITTEN) in text
+    assert str(Outcome.MANUAL) in text
+
+
+def test_format_report_includes_the_manual_snippets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("hermes",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    assert "mcp_servers:" in format_report(report)
+
+
+def test_format_report_ends_with_the_next_step(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+
+    assert format_report(report).rstrip().endswith("open a new session in your agent.")
+
+
+def test_list_agents_marks_the_detected_agents(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".cursor").mkdir(parents=True)
+
+    text = list_agents(home=home, cwd=tmp_path / "project", which=_no_cli)
+
+    rows = {line.split()[0]: line for line in text.splitlines() if line.split()}
+    assert "yes" in rows["cursor"]
+    assert "yes" not in rows["hermes"]
+
+
+def test_list_agents_names_the_skill_directories(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+
+    text = list_agents(home=home, cwd=tmp_path / "project", which=_no_cli)
+
+    assert str(home / ".agents" / "skills" / "patent-checker") in text
+    assert str(home / ".claude" / "skills" / "patent-checker") in text
+
+
+def test_list_agents_follows_the_project_scope(tmp_path: Path) -> None:
+    cwd = tmp_path / "project"
+
+    text = list_agents(home=tmp_path / "home", cwd=cwd, which=_no_cli, scope="project")
+
+    assert str(cwd / ".agents" / "skills" / "patent-checker") in text
+
+
+def test_list_agents_rejects_an_unknown_scope(tmp_path: Path) -> None:
+    with pytest.raises(InstallerError):
+        list_agents(home=tmp_path / "home", cwd=tmp_path / "project", which=_no_cli, scope="all")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_install_aborts_when_the_consent_record_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An agreement that cannot be stored stops the run instead of a traceback."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    config_home = home / ".config"
+    config_home.mkdir()
+    config_home.chmod(0o500)
+    try:
+        with pytest.raises(InstallAborted) as exc_info:
+            _run_install(
+                InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+            )
+    finally:
+        config_home.chmod(0o700)
+
+    assert "consent could not be recorded" in str(exc_info.value)
+
+
+def test_format_report_names_the_agents_it_covered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Even with both steps switched off the report says what it was asked to do."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor", "codex"), agree=True, skill=False, mcp=False),
+        home=home,
+        cwd=cwd,
+    )
+
+    assert "Agents:  cursor, codex" in format_report(report)
