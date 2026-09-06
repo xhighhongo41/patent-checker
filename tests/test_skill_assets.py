@@ -125,3 +125,92 @@ def test_skill_documents_the_cache_and_cleanup_commands() -> None:
     assert "--yes" in text
     assert "`search_cache_dir`" in text
     assert "--refresh" in text
+
+
+# --- README.md / README_ja.md ---
+
+README = REPO_ROOT / "README.md"
+README_JA = REPO_ROOT / "README_ja.md"
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
+
+REQUIRED_README_SECTIONS = (
+    "## Important notices",
+    "## How it works",
+    "## Prerequisites",
+    "## Install the server",
+    "## Install the Skill and connect your agent",
+    "## Usage",
+    "## Configuration",
+    "## Cache and clean-up",
+    "## Security model",
+    "## Data sources and fair use",
+    "## Updating",
+    "## Changelog",
+    "## License",
+)
+
+
+def _declared_minor_version() -> str:
+    import tomllib
+
+    with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+        version = tomllib.load(handle)["project"]["version"]
+    major, minor = version.split(".")[:2]
+    return f"v{major}.{minor}"
+
+
+def test_readme_covers_the_required_sections() -> None:
+    text = README.read_text(encoding="utf-8")
+    missing = [heading for heading in REQUIRED_README_SECTIONS if heading not in text]
+    assert not missing, f"README.md lacks sections: {missing}"
+
+
+def test_readme_and_japanese_readme_share_one_structure() -> None:
+    en = README.read_text(encoding="utf-8").splitlines()
+    ja = README_JA.read_text(encoding="utf-8").splitlines()
+    en_headings = [line for line in en if line.startswith("#")]
+    ja_headings = [line for line in ja if line.startswith("#")]
+    assert len(en_headings) == len(ja_headings), (en_headings, ja_headings)
+    en_fences = sum(1 for line in en if line.startswith("```"))
+    ja_fences = sum(1 for line in ja if line.startswith("```"))
+    assert en_fences == ja_fences
+    assert "README_ja.md" in "\n".join(en[:5])
+    assert "README.md" in "\n".join(ja[:5])
+
+
+@pytest.mark.parametrize("path", [README, README_JA], ids=["en", "ja"])
+def test_readme_status_line_names_the_declared_minor_version(path: Path) -> None:
+    status_lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if re.search(r"(Status|状態).*v[0-9]+\.[0-9]+", line)
+    ]
+    assert status_lines, f"{path.name} has no status line"
+    assert _declared_minor_version() in status_lines[0]
+
+
+def test_readme_documents_every_variable_in_env_example() -> None:
+    env_example = ENV_EXAMPLE.read_text(encoding="utf-8")
+    declared = set(re.findall(r"^#?\s*(PATENT_CHECKER_[A-Z_]+)=", env_example, re.M))
+    assert declared, ".env.example declares no variables"
+    text = README.read_text(encoding="utf-8")
+    undocumented = sorted(name for name in declared if name not in text)
+    assert not undocumented, f"README.md does not mention: {undocumented}"
+
+
+def test_readme_states_the_no_verdict_boundary_and_the_installer_flow() -> None:
+    text = README.read_text(encoding="utf-8")
+    assert "does not decide whether anything infringes" in text
+    for needle in (
+        "patent-checker install",
+        "docker compose up",
+        "--token-file",
+        "--token-env",
+        "--dry-run",
+        "--show-operator-notice",
+        "PATENT_CHECKER_OPERATOR_CONSENT=1.0",
+        "401",
+        "cache status",
+        "patent-checker clean",
+    ):
+        assert needle in text, needle
