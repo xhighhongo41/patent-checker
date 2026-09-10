@@ -255,6 +255,37 @@ def test_non_loopback_host_with_allowed_hosts_succeeds(monkeypatch) -> None:
     assert result.allowed_hosts == ("a.example", "b.example")
 
 
+@pytest.mark.parametrize(
+    "entry",
+    ["*", "*.example", "a?.example", "a[0-9].example", "a.example,*"],
+)
+def test_allowed_hosts_with_a_glob_character_are_rejected(monkeypatch, entry) -> None:
+    """FastMCP matches allowed hosts as globs, so a wildcard would silently disable the guard."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("PATENT_CHECKER_SERVER_ALLOWED_HOSTS", entry)
+
+    with pytest.raises(config.ConfigError) as exc_info:
+        server_settings.load_settings()
+
+    message = str(exc_info.value)
+    assert "PATENT_CHECKER_SERVER_ALLOWED_HOSTS" in message
+    assert "glob" in message
+
+
+def test_allowed_hosts_accept_ordinary_names_and_ipv6_literals(monkeypatch) -> None:
+    """Plain host names, ports and bracketed IPv6 literals are not glob patterns."""
+    _consent(monkeypatch)
+    _token(monkeypatch)
+    monkeypatch.setenv("PATENT_CHECKER_SERVER_HOST", "0.0.0.0")
+    monkeypatch.setenv("PATENT_CHECKER_SERVER_ALLOWED_HOSTS", "a.example, host-1.internal, fe80::1")
+
+    result = server_settings.load_settings()
+
+    assert result.allowed_hosts == ("a.example", "host-1.internal", "fe80::1")
+
+
 @pytest.mark.parametrize("host", ["localhost", "::1"])
 def test_loopback_aliases_need_no_allowed_hosts(monkeypatch, host) -> None:
     """``localhost`` and ``::1`` are loopback and do not require allowed hosts."""

@@ -175,15 +175,25 @@ echo "PASS: POST /mcp without a bearer token is refused with 401"
 
 # --- 6. POST /mcp with the token gets past the auth gate --------------------
 
+# The Authorization header is handed to curl in a file (-H @file) instead of
+# on the command line, where every account on the machine could read it out
+# of the process list. The file is created empty, tightened to 600, and only
+# then filled; it lives in $TMP, which cleanup() removes.
+HDR="$TMP/auth_header"
+: > "$HDR"
+chmod 600 "$HDR"
+printf 'Authorization: Bearer %s\n' "$TOKEN" > "$HDR"
+
 # Anything but 401 means the token was accepted; the body is deliberately not
 # a valid JSON-RPC request, so the exact status is the transport's business.
 CODE=$(curl -s -o /dev/null -w '%{http_code}' \
     -X POST \
-    -H "Authorization: Bearer $TOKEN" \
+    -H @"$HDR" \
     -H 'Content-Type: application/json' \
     -H 'Accept: application/json, text/event-stream' \
     -d '{}' \
     "http://127.0.0.1:$PORT/mcp") || fail "POST /mcp with a token did not answer"
+rm -f "$HDR"
 [ "$CODE" != "401" ] || fail "the bearer token was rejected on POST /mcp"
 echo "PASS: POST /mcp with the bearer token passes the auth gate (HTTP $CODE)"
 

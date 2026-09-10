@@ -9,8 +9,10 @@ summarizes what it fetched, so the CLI and the MCP server cannot drift apart.
 Three things happen here that the service layer deliberately does not do:
 
 - **Input validation.** Free-text arguments are checked locally (length,
-  emptiness, control characters, list sizes) before any request leaves the
-  process, so a malformed prompt cannot turn into upstream traffic.
+  emptiness, control characters) and batch payloads are checked against the
+  limits in :mod:`patent_checker.validation` (element count, element shape,
+  element size, total size) before any request leaves the process, so a
+  malformed prompt cannot turn into upstream traffic.
 - **Error mapping.** The service layer's three documented exception types are
   translated into :class:`~fastmcp.exceptions.ToolError` messages prefixed
   with a stable machine-readable code (:data:`ERROR_INVALID_INPUT`,
@@ -43,7 +45,7 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from patent_checker import service
+from patent_checker import service, validation
 from patent_checker.config import ConfigError
 from patent_checker.pubnum import parse_pubnum
 
@@ -72,6 +74,10 @@ TOOL_NAMES: tuple[str, ...] = (
 MAX_CQL_LENGTH = 4000
 MAX_QUERIES = 50
 MAX_RECORDS = service.MAX_BATCH_RECORDS  # shared with the CLI's dedup/verify validation
+# Per-element and per-payload ceilings, shared with the CLI through
+# :mod:`patent_checker.validation`.
+MAX_ITEM_CHARS = validation.MAX_ITEM_CHARS
+MAX_PAYLOAD_CHARS = validation.MAX_PAYLOAD_CHARS
 
 # Stable prefixes of the ToolError messages, so a client can branch on the
 # kind of failure without parsing the human-readable remainder.
@@ -190,13 +196,22 @@ def _validate_queries(queries: Sequence[str]) -> None:
 
 
 def _validate_size(items: Sequence[Any], label: str) -> None:
-    """Check that an offline payload is not larger than :data:`MAX_RECORDS`.
+    """Check an offline payload against the batch limits shared with the CLI.
 
     Raises:
-        ValueError: If *items* holds more than :data:`MAX_RECORDS` entries.
+        ValueError: If *items* is not a list, holds more than
+            :data:`MAX_RECORDS` entries, holds an element that is neither a
+            publication-number string nor a mapping carrying one under
+            ``"pub"``, holds an element longer than :data:`MAX_ITEM_CHARS`,
+            or is longer than :data:`MAX_PAYLOAD_CHARS` in total.
     """
-    if len(items) > MAX_RECORDS:
-        raise ValueError(f"{label} holds {len(items)} entries: at most {MAX_RECORDS} are accepted")
+    validation.validate_batch(
+        items,
+        label=label,
+        max_records=MAX_RECORDS,
+        max_item_chars=MAX_ITEM_CHARS,
+        max_payload_chars=MAX_PAYLOAD_CHARS,
+    )
 
 
 # --- OPS-backed tools ----------------------------------------------------

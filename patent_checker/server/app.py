@@ -17,7 +17,7 @@ Transports differ in their trust model, which is reflected in what is built
 here and what the startup banner says:
 
 - ``http`` binds a TCP port and therefore requires a bearer token
-  (:class:`~fastmcp.server.auth.providers.jwt.StaticTokenVerifier`) plus
+  (:class:`~patent_checker.server.auth.ConstantTimeTokenVerifier`) plus
   Host/Origin protection; TLS is left to a reverse proxy.
 - ``stdio`` has no network surface and no authentication: the server runs
   with the permissions of whoever started it.
@@ -36,7 +36,6 @@ from typing import Any
 import httpx
 import uvicorn.config
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.server.lifespan import lifespan
 from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
@@ -49,6 +48,7 @@ from patent_checker.config import ConfigError
 from patent_checker.net import AllowlistTransport
 from patent_checker.ops.client import OpsClient
 from patent_checker.server import tools
+from patent_checker.server.auth import ConstantTimeTokenVerifier
 from patent_checker.server.settings import ServerSettings, describe
 
 SERVER_NAME = "patent-checker"
@@ -233,15 +233,17 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
 def http_allowed_hosts(settings: ServerSettings) -> list[str]:
     """Return the Host-header values the http transport accepts.
 
-    Clients spell the Host header with or without the port, so both forms of
-    the bind host and of every configured extra host are listed, in
-    configuration order and without duplicates.
+    The bind host followed by every configured extra host, in configuration
+    order and without duplicates. Only bare host names are listed: FastMCP
+    strips a trailing ``:port`` (and the brackets of an IPv6 literal) from
+    both the incoming Host header and each configured entry before comparing
+    them, so a ``host:port`` spelling adds nothing and would be wrong for an
+    IPv6 address, whose own colons are part of the host.
     """
     hosts: list[str] = []
     for host in (settings.host, *settings.allowed_hosts):
-        for entry in (host, f"{host}:{settings.port}"):
-            if entry not in hosts:
-                hosts.append(entry)
+        if host not in hosts:
+            hosts.append(host)
     return hosts
 
 
@@ -368,7 +370,7 @@ def run(settings: ServerSettings) -> None:
         mcp.run(transport="stdio", show_banner=False)
 
 
-def _build_auth(settings: ServerSettings) -> StaticTokenVerifier | None:
+def _build_auth(settings: ServerSettings) -> ConstantTimeTokenVerifier | None:
     """Return the auth provider for *settings* (http only).
 
     Raises:
@@ -381,4 +383,4 @@ def _build_auth(settings: ServerSettings) -> StaticTokenVerifier | None:
         return None
     if not settings.token:
         raise ConfigError("the http transport requires a bearer token, but none is configured")
-    return StaticTokenVerifier(tokens={settings.token: {"client_id": AUTH_CLIENT_ID, "scopes": []}})
+    return ConstantTimeTokenVerifier(settings.token, client_id=AUTH_CLIENT_ID)

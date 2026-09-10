@@ -26,7 +26,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
-from patent_checker import cache, config, service, utils
+from patent_checker import cache, config, service, utils, validation
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
@@ -654,6 +654,46 @@ def test_oversized_offline_payloads_are_rejected(
     assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
+def test_an_oversized_element_is_rejected(settings: ServerSettings, make_state: Any) -> None:
+    """One huge element is refused even when the element count is well within the limit."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(
+            mcp,
+            "verify_batch",
+            {"input_pubs": ["x" * (validation.MAX_ITEM_CHARS + 1)], "output_records": []},
+        )
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
+
+
+def test_an_oversized_total_payload_is_rejected(settings: ServerSettings, make_state: Any) -> None:
+    """Many acceptable elements that together exceed the payload ceiling are refused."""
+    item = "x" * 4000
+    count = validation.MAX_PAYLOAD_CHARS // len(item) + 1
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "verify_batch", {"input_pubs": [item] * count, "output_records": []})
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
+
+
+def test_a_record_with_a_non_string_pub_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """A mapping whose ``pub`` is not a string is the caller's mistake, not an internal error."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "dedup_families", {"hits": [{"pub": 5, "family_id": "1"}]})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_INVALID_INPUT}:")
+    assert "pub" in message
+
+
 def test_records_missing_a_required_key_are_invalid_input(
     settings: ServerSettings, make_state: Any
 ) -> None:
@@ -981,20 +1021,39 @@ def test_build_state_wraps_both_transports_in_the_allowlist_guard(
     assert state.ops_client._client.is_closed
 
 
-def test_http_allowed_hosts_lists_each_host_with_and_without_the_port(
+def test_http_allowed_hosts_lists_the_bind_host_and_the_configured_hosts(
     settings: ServerSettings,
 ) -> None:
-    """Clients may send the Host header with or without the port; both are accepted."""
+    """Only bare host names are listed: FastMCP strips the port before comparing."""
     http_settings = dataclasses.replace(
         settings, transport="http", host="127.0.0.1", port=8642, allowed_hosts=("a.example",)
     )
 
-    assert http_allowed_hosts(http_settings) == [
-        "127.0.0.1",
-        "127.0.0.1:8642",
-        "a.example",
-        "a.example:8642",
-    ]
+    assert http_allowed_hosts(http_settings) == ["127.0.0.1", "a.example"]
+
+
+def test_http_allowed_hosts_does_not_append_the_port(settings: ServerSettings) -> None:
+    """A ``host:port`` entry would be pointless and would break IPv6 literals."""
+    http_settings = dataclasses.replace(
+        settings, transport="http", host="::1", port=8642, allowed_hosts=("a.example",)
+    )
+
+    assert all(":8642" not in entry for entry in http_allowed_hosts(http_settings))
+
+
+def test_http_allowed_hosts_keeps_the_configuration_order_without_duplicates(
+    settings: ServerSettings,
+) -> None:
+    """A configured host equal to the bind host is listed once, in configuration order."""
+    http_settings = dataclasses.replace(
+        settings,
+        transport="http",
+        host="127.0.0.1",
+        port=8642,
+        allowed_hosts=("a.example", "127.0.0.1"),
+    )
+
+    assert http_allowed_hosts(http_settings) == ["127.0.0.1", "a.example"]
 
 
 def test_banner_lines_never_leak_the_token(settings: ServerSettings) -> None:

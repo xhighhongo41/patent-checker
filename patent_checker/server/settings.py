@@ -40,6 +40,11 @@ DEFAULT_BURST = 10
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 TRANSPORTS = ("http", "stdio")
 
+# Characters that make FastMCP's Host-header matching (fnmatch) treat an
+# allowed host as a pattern instead of a name. Refused in configuration so
+# the DNS-rebinding guard cannot be widened by accident.
+GLOB_CHARACTERS = ("*", "?", "[")
+
 ENV_CONSENT = "PATENT_CHECKER_OPERATOR_CONSENT"
 ENV_HOST = "PATENT_CHECKER_SERVER_HOST"
 ENV_PORT = "PATENT_CHECKER_SERVER_PORT"
@@ -308,11 +313,27 @@ def _resolve_token() -> str:
 
 
 def _resolve_allowed_hosts() -> tuple[str, ...]:
-    """Parse ``ENV_ALLOWED_HOSTS`` into a tuple of trimmed, non-empty entries."""
+    """Parse ``ENV_ALLOWED_HOSTS`` into a tuple of trimmed, non-empty entries.
+
+    Raises:
+        ConfigError: If an entry contains a glob character. FastMCP matches
+            allowed hosts as shell patterns, so ``*`` alone would accept any
+            Host header and switch the DNS-rebinding guard off without
+            saying so; the operator has to spell the names out instead.
+    """
     env_value = os.environ.get(ENV_ALLOWED_HOSTS, "")
     if not env_value:
         return ()
-    return tuple(entry.strip() for entry in env_value.split(",") if entry.strip())
+    entries = tuple(entry.strip() for entry in env_value.split(",") if entry.strip())
+    for entry in entries:
+        if any(character in entry for character in GLOB_CHARACTERS):
+            raise ConfigError(
+                f"{ENV_ALLOWED_HOSTS} entry {entry!r} contains a glob character "
+                f"(one of: {' '.join(GLOB_CHARACTERS)}); glob patterns are not accepted: "
+                "list the host names clients will use, writing an IPv6 literal without "
+                "its brackets"
+            )
+    return entries
 
 
 def _resolve_rps() -> float:
