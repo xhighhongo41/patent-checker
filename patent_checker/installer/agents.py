@@ -140,10 +140,12 @@ def register_mcp(
         cwd: The project directory (used by ``"project"`` scope).
         url: The server's MCP endpoint.
         token: The server's bearer token, written into the host's
-            configuration unless *token_env* is set.
+            configuration unless *token_env* is set. It may be empty when
+            *token_env* is set, since no file then receives it.
         token_env: Write a reference to :data:`~.token.ENV_TOKEN` instead
-            of the token itself. Hosts that expand no reference report
-            :attr:`~.writers.Outcome.MANUAL`.
+            of the token itself. Hosts that expand no reference (Copilot
+            CLI, OpenHands) report :attr:`~.writers.Outcome.MANUAL` with
+            the reason and a snippet, not a failure.
         which: :func:`shutil.which`, or a stand-in.
         runner: Runner for a vendor CLI (see :func:`~.writers.run_vendor_cli`).
         dry_run: When ``True``, run and write nothing.
@@ -175,6 +177,55 @@ def register_mcp(
         dry_run=dry_run,
     )
     return _REGISTRARS[key](request)
+
+
+def manual_snippet(agent: str, url: str, reference: bool) -> str:
+    """Return the configuration *agent* needs, ready to be pasted by hand.
+
+    Pure: nothing is read from or written to the machine, so the caller can
+    use it after a write has already failed. Because no directory is looked
+    at, the host's configuration file is named relative to the home
+    directory (``~/...``); the snippets produced by :func:`register_mcp`
+    itself name the real path instead.
+
+    Args:
+        agent: One of :data:`~.skill.AGENT_KEYS`.
+        url: The server's MCP endpoint.
+        reference: Whether the user asked for ``--token-env``. It selects
+            the closing hint only -- a snippet never spells out the token.
+
+    Returns:
+        The snippet, with the credential written as the reference the host
+        expands or as :data:`TOKEN_PLACEHOLDER`.
+
+    Raises:
+        InstallerError: *agent* is not a known agent.
+    """
+    if agent not in AGENTS:
+        raise InstallerError(f"unknown agent {agent!r}: expected one of {', '.join(AGENT_KEYS)}")
+    spec = AGENTS[agent]
+    request = _Request(
+        spec=spec,
+        scope="user",
+        home=Path("~"),
+        cwd=Path("."),
+        url=url,
+        token="",
+        token_env=reference,
+        which=lambda program: None,
+        runner=None,
+        dry_run=True,
+    )
+    if spec.reference_style is None:
+        hint = f"{spec.name} expands no reference: paste the token over {TOKEN_PLACEHOLDER}."
+    elif reference:
+        hint = f"Export {ENV_TOKEN} in the environment {spec.name} starts in."
+    else:
+        hint = (
+            f"Export {ENV_TOKEN} in the environment {spec.name} starts in, or write the "
+            "token in place of the reference."
+        )
+    return f"{_SNIPPETS[agent](request)}\n\n{hint}"
 
 
 AGENTS: dict[str, AgentSpec] = {
@@ -282,6 +333,16 @@ class _Request:
         """Return the values that must not appear in any message."""
         return (self.token,)
 
+    @property
+    def writes_secret(self) -> bool:
+        """Return whether the file this request writes holds the token itself.
+
+        Only ``--token-env`` against a host that expands a reference keeps
+        the token out of the file; every other combination stores it, and
+        such a file must not be left readable by anyone else.
+        """
+        return not (self.token_env and self.spec.reference_style is not None)
+
     def entry(self, **fields: Any) -> dict[str, Any]:
         """Return a server entry made of *fields* plus the Authorization header."""
         return {**fields, "headers": {"Authorization": self.header}}
@@ -305,7 +366,7 @@ def _as_json(container: str, entry: dict[str, Any]) -> str:
 
 
 def _merge_entry(
-    path: Path, container: str, entry: dict[str, Any], *, dry_run: bool
+    path: Path, container: str, entry: dict[str, Any], *, dry_run: bool, sensitive: bool
 ) -> WriteResult:
     """Store *entry* under ``<container>.patent-checker`` in the JSON file *path*.
 
@@ -321,7 +382,7 @@ def _merge_entry(
         servers[SERVER_NAME] = entry
 
     try:
-        return merge_json(path, update, dry_run=dry_run)
+        return merge_json(path, update, dry_run=dry_run, sensitive=sensitive)
     except _UnexpectedShape as error:
         return WriteResult(Outcome.MANUAL, path, str(error))
 
@@ -393,12 +454,53 @@ def _claude_code_snippet(request: _Request) -> str:
     return "\n".join(lines)
 
 
+def _codex_path(request: _Request) -> Path:
+    """Return the ``config.toml`` Codex reads for this scope."""
+    return request.base / ".codex" / "config.toml"
+
+
 def _register_codex(request: _Request) -> Registration:
-    """Register with Codex CLI by appending its ``[mcp_servers.*]`` table."""
-    path = request.base / ".codex" / "config.toml"
+    """Register with Codex CLI, through its command for ``--token-env``, else by file.
+
+    ``codex mcp add`` can only be told the *name* of the variable holding
+    the token (``--bearer-token-env-var``), so it is used exactly when that
+    is what the user asked for; writing the token itself still means
+    appending the ``[mcp_servers.*]`` table, which the command cannot do.
+    """
+    path = _codex_path(request)
+    cli_result: WriteResult | None = None
+    if not request.writes_secret and request.which("codex") is not None:
+        argv = [
+            "codex",
+            "mcp",
+            "add",
+            SERVER_NAME,
+            "--url",
+            request.url,
+            "--bearer-token-env-var",
+            ENV_TOKEN,
+        ]
+        cli_result = _run_cli(request, argv)
+        if cli_result.outcome is not Outcome.MANUAL:
+            return Registration(cli_result)
+
     result = append_toml_table(
-        path, f"mcp_servers.{SERVER_NAME}", _codex_body(request), dry_run=request.dry_run
+        path,
+        f"mcp_servers.{SERVER_NAME}",
+        _codex_body(request),
+        dry_run=request.dry_run,
+        sensitive=request.writes_secret,
     )
+    if result.outcome is Outcome.SKIPPED:
+        # The table is only ever appended, so an existing one is left as it
+        # is; say where to change it rather than only that nothing happened.
+        result = replace(
+            result,
+            message=(
+                f"{result.message}: edit [mcp_servers.{SERVER_NAME}] in {path} to update "
+                "the registration"
+            ),
+        )
     if request.scope == "project":
         # Codex reads a project config only after the project is trusted, so a
         # successful write is not yet a working registration.
@@ -406,7 +508,9 @@ def _register_codex(request: _Request) -> Registration:
             result,
             message=f"{result.message} (Codex loads project config only for trusted projects)",
         )
-    snippet = _codex_snippet(request, path) if result.outcome is Outcome.MANUAL else None
+    if cli_result is not None:
+        result = _after_cli_failure(cli_result, result)
+    snippet = _codex_snippet(request) if result.outcome is not Outcome.WRITTEN else None
     return Registration(result, snippet)
 
 
@@ -422,8 +526,9 @@ def _codex_body(request: _Request) -> str:
     return "\n".join(lines)
 
 
-def _codex_snippet(request: _Request, path: Path) -> str:
+def _codex_snippet(request: _Request) -> str:
     """Return Codex's table written with the environment variable's name."""
+    path = _codex_path(request)
     body = (
         f"[mcp_servers.{SERVER_NAME}]\n"
         f"url = {json.dumps(request.url)}\n"
@@ -437,13 +542,18 @@ def _codex_snippet(request: _Request, path: Path) -> str:
     )
 
 
-def _register_opencode(request: _Request) -> Registration:
-    """Register with OpenCode by merging its JSON config (never its JSONC one)."""
-    path = (
+def _opencode_path(request: _Request) -> Path:
+    """Return the ``opencode.json`` OpenCode reads for this scope."""
+    return (
         request.home / ".config" / "opencode" / "opencode.json"
         if request.scope == "user"
         else request.cwd / "opencode.json"
     )
+
+
+def _register_opencode(request: _Request) -> Registration:
+    """Register with OpenCode by merging its JSON config (never its JSONC one)."""
+    path = _opencode_path(request)
     entry = request.entry(type="remote", url=request.url)
     jsonc = path.with_suffix(".jsonc")
     if jsonc.exists():
@@ -457,29 +567,43 @@ def _register_opencode(request: _Request) -> Registration:
             ),
             _opencode_snippet(request, jsonc),
         )
-    result = _merge_entry(path, "mcp", entry, dry_run=request.dry_run)
+    result = _merge_entry(
+        path, "mcp", entry, dry_run=request.dry_run, sensitive=request.writes_secret
+    )
     snippet = _opencode_snippet(request, path) if result.outcome is Outcome.MANUAL else None
     return Registration(result, snippet)
 
 
-def _opencode_snippet(request: _Request, path: Path) -> str:
+def _opencode_snippet(request: _Request, path: Path | None = None) -> str:
     """Return OpenCode's ``mcp`` entry with the token spelled as a reference."""
     entry = request.safe_entry(type="remote", url=request.url)
-    return _paste_into(path, _as_json("mcp", entry), "Merge it with the entries already there.")
+    return _paste_into(
+        path if path is not None else _opencode_path(request),
+        _as_json("mcp", entry),
+        "Merge it with the entries already there.",
+    )
+
+
+def _openhands_path(request: _Request) -> Path:
+    """Return the ``config.toml`` OpenHands reads in the project directory."""
+    return request.cwd / "config.toml"
 
 
 def _register_openhands(request: _Request) -> Registration:
     """Report OpenHands as manual: it has neither a CLI nor a JSON config."""
-    path = request.cwd / "config.toml"
+    path = _openhands_path(request)
     message = f"{path}: OpenHands has no registration command; add the server by hand"
     if request.token_env:
-        message = f"{message} (--token-env is not supported by OpenHands)"
-    return Registration(
-        WriteResult(Outcome.MANUAL, path, message), _openhands_snippet(request, path)
-    )
+        # Not a failure: the run goes on and the snippet carries a
+        # placeholder instead of the reference the user asked for.
+        message = (
+            f"{message} (--token-env is not supported by OpenHands, which expands no "
+            "environment reference)"
+        )
+    return Registration(WriteResult(Outcome.MANUAL, path, message), _openhands_snippet(request))
 
 
-def _openhands_snippet(request: _Request, path: Path) -> str:
+def _openhands_snippet(request: _Request, path: Path | None = None) -> str:
     """Return OpenHands' ``[mcp]`` table, with the token left for the user to paste."""
     body = (
         "[mcp]\n"
@@ -487,31 +611,53 @@ def _openhands_snippet(request: _Request, path: Path) -> str:
         f'api_key = "{TOKEN_PLACEHOLDER}" }}]'
     )
     return _paste_into(
-        path,
+        path if path is not None else _openhands_path(request),
         body,
         "Note: it is not confirmed by the OpenHands documentation that api_key is sent as an "
         "Authorization: Bearer header, and no environment reference is expanded here.",
     )
 
 
+def _cursor_path(request: _Request) -> Path:
+    """Return the ``mcp.json`` Cursor reads for this scope."""
+    return request.base / ".cursor" / "mcp.json"
+
+
 def _register_cursor(request: _Request) -> Registration:
     """Register with Cursor by merging its ``mcp.json``."""
-    path = request.base / ".cursor" / "mcp.json"
+    path = _cursor_path(request)
     # Cursor infers the transport from the keys: a remote server carries a
     # url and no type (type is for stdio servers only).
     entry = request.entry(url=request.url)
-    result = _merge_entry(path, "mcpServers", entry, dry_run=request.dry_run)
-    snippet = None
-    if result.outcome is Outcome.MANUAL:
-        snippet = _paste_into(path, _as_json("mcpServers", request.safe_entry(url=request.url)))
+    result = _merge_entry(
+        path, "mcpServers", entry, dry_run=request.dry_run, sensitive=request.writes_secret
+    )
+    snippet = _cursor_snippet(request) if result.outcome is Outcome.MANUAL else None
     return Registration(result, snippet)
+
+
+def _cursor_snippet(request: _Request) -> str:
+    """Return Cursor's ``mcpServers`` entry with the token as a reference."""
+    entry = request.safe_entry(url=request.url)
+    return _paste_into(_cursor_path(request), _as_json("mcpServers", entry))
+
+
+def _gemini_cli_path(request: _Request) -> Path:
+    """Return the ``settings.json`` Gemini CLI reads for this scope."""
+    return request.base / ".gemini" / "settings.json"
+
+
+def _gemini_cli_snippet(request: _Request) -> str:
+    """Return Gemini CLI's ``mcpServers`` entry with the token as a reference."""
+    entry = request.safe_entry(httpUrl=request.url)
+    return _paste_into(_gemini_cli_path(request), _as_json("mcpServers", entry))
 
 
 def _register_gemini_cli(request: _Request) -> Registration:
     """Register with Gemini CLI through its command, falling back to settings.json."""
-    path = request.base / ".gemini" / "settings.json"
+    path = _gemini_cli_path(request)
     entry = request.entry(httpUrl=request.url)
-    snippet = _paste_into(path, _as_json("mcpServers", request.safe_entry(httpUrl=request.url)))
+    snippet = _gemini_cli_snippet(request)
 
     cli_result: WriteResult | None = None
     if request.which("gemini") is not None:
@@ -532,23 +678,36 @@ def _register_gemini_cli(request: _Request) -> Registration:
         if cli_result.outcome is not Outcome.MANUAL:
             return Registration(cli_result)
 
-    result = _merge_entry(path, "mcpServers", entry, dry_run=request.dry_run)
+    result = _merge_entry(
+        path, "mcpServers", entry, dry_run=request.dry_run, sensitive=request.writes_secret
+    )
     if cli_result is not None:
         result = _after_cli_failure(cli_result, result)
     return Registration(result, snippet if result.outcome is Outcome.MANUAL else None)
 
 
-def _register_copilot_cli(request: _Request) -> Registration:
-    """Register with Copilot CLI through its command, falling back to a JSON file."""
-    path = (
+def _copilot_cli_path(request: _Request) -> Path:
+    """Return the JSON file Copilot CLI reads for this scope."""
+    return (
         request.home / ".copilot" / "mcp-config.json"
         if request.scope == "user"
         else request.cwd / ".mcp.json"
     )
-    snippet = _paste_into(
-        path, _as_json("mcpServers", request.safe_entry(type="http", url=request.url))
-    )
+
+
+def _copilot_cli_snippet(request: _Request) -> str:
+    """Return Copilot CLI's ``mcpServers`` entry, with a placeholder token."""
+    entry = request.safe_entry(type="http", url=request.url)
+    return _paste_into(_copilot_cli_path(request), _as_json("mcpServers", entry))
+
+
+def _register_copilot_cli(request: _Request) -> Registration:
+    """Register with Copilot CLI through its command, falling back to a JSON file."""
+    path = _copilot_cli_path(request)
+    snippet = _copilot_cli_snippet(request)
     if request.token_env:
+        # Not a failure: writing the token here is exactly what --token-env
+        # asked us not to do, so the work is handed back with instructions.
         return Registration(
             WriteResult(
                 Outcome.MANUAL,
@@ -577,20 +736,38 @@ def _register_copilot_cli(request: _Request) -> Registration:
             return Registration(cli_result)
 
     entry = request.entry(type="http", url=request.url)
-    result = _merge_entry(path, "mcpServers", entry, dry_run=request.dry_run)
+    result = _merge_entry(
+        path, "mcpServers", entry, dry_run=request.dry_run, sensitive=request.writes_secret
+    )
     if cli_result is not None:
         result = _after_cli_failure(cli_result, result)
     return Registration(result, snippet if result.outcome is Outcome.MANUAL else None)
 
 
+def _hermes_path(request: _Request) -> Path:
+    """Return Hermes' ``config.yaml``.
+
+    Hermes documents no project-scoped configuration, so both scopes point
+    at the per-user file.
+    """
+    return request.home / ".hermes" / "config.yaml"
+
+
 def _register_hermes(request: _Request) -> Registration:
     """Report Hermes as manual: its config is YAML, which we do not rewrite."""
-    # Hermes documents no project-scoped configuration, so both scopes point
-    # at the per-user file.
-    path = request.home / ".hermes" / "config.yaml"
+    path = _hermes_path(request)
     message = f"{path}: Hermes stores its servers in YAML; add the server by hand"
     if request.scope == "project":
         message = f"{message} (Hermes has no project scope: this entry is per user)"
+    return Registration(WriteResult(Outcome.MANUAL, path, message), _hermes_snippet(request))
+
+
+def _hermes_snippet(request: _Request) -> str:
+    """Return Hermes' ``mcp_servers`` block with the token as a ``${VAR}`` reference.
+
+    Hermes expands ``${VAR}`` in its configuration (official documentation,
+    2026-09-10), so the user never has to paste the token itself.
+    """
     body = (
         "mcp_servers:\n"
         f"  {SERVER_NAME}:\n"
@@ -598,8 +775,24 @@ def _register_hermes(request: _Request) -> Registration:
         "    headers:\n"
         f"      Authorization: {json.dumps(request.safe_header)}"
     )
-    return Registration(WriteResult(Outcome.MANUAL, path, message), _paste_into(path, body))
+    return _paste_into(
+        _hermes_path(request),
+        body,
+        f"Hermes expands ${{VAR}}, so export {ENV_TOKEN} in the environment it runs in.",
+    )
 
+
+#: Snippet builder per agent key; every one is pure and hides the token.
+_SNIPPETS: dict[str, Callable[[_Request], str]] = {
+    "claude-code": _claude_code_snippet,
+    "codex": _codex_snippet,
+    "opencode": _opencode_snippet,
+    "openhands": _openhands_snippet,
+    "cursor": _cursor_snippet,
+    "gemini-cli": _gemini_cli_snippet,
+    "copilot-cli": _copilot_cli_snippet,
+    "hermes": _hermes_snippet,
+}
 
 #: Handler per agent key; every one returns a :class:`Registration`.
 _REGISTRARS: dict[str, Callable[[_Request], Registration]] = {

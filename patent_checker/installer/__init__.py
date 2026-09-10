@@ -1,14 +1,20 @@
 """Installer package: wiring the bundled Agent Skill and the MCP server in.
 
 :func:`install` is the entry point behind ``patent-checker install``. It
-performs three steps for one or more host applications, in this order:
+performs the following steps for one or more host applications, in this
+order:
 
 1. **Consent.** The legal notice is shown and agreement is recorded (see
    :mod:`patent_checker.consent`), unless the current version is already
    on record. Without consent nothing is installed.
-2. **Skill.** The bundled Skill directory is copied into every location
+2. **Token.** The bearer token is obtained (file, environment or prompt),
+   but only when the MCP step runs and the token is to be written out;
+   ``--token-env`` writes a reference and needs no value. This happens
+   before anything is copied, so a run that stops here leaves no
+   half-installed Skill behind.
+3. **Skill.** The bundled Skill directory is copied into every location
    the chosen agents read (:mod:`.skill`).
-3. **MCP server.** Each agent is pointed at the running server, through
+4. **MCP server.** Each agent is pointed at the running server, through
    its own CLI or configuration file (:mod:`.agents`).
 
 Every dependency on the outside world -- the home directory, the working
@@ -30,7 +36,14 @@ from typing import TextIO
 
 from patent_checker import consent
 
-from .agents import AGENTS, DEFAULT_URL, Registration, detect_agents, register_mcp
+from .agents import (
+    AGENTS,
+    DEFAULT_URL,
+    Registration,
+    detect_agents,
+    manual_snippet,
+    register_mcp,
+)
 from .errors import InstallerError
 from .skill import AGENT_KEYS, SCOPES, install_skill, skill_source, skill_targets
 from .token import ENV_TOKEN, resolve_token
@@ -59,6 +72,11 @@ OPERATOR_NOTICE_HINT = (
 
 #: Closing line of the report.
 NEXT_STEP = "Next: start the server (see README) and open a new session in your agent."
+
+#: Warning shown when a file below the working directory holds the token.
+TOKEN_IN_PROJECT_WARNING = (
+    "Warning: these files below the working directory contain the token itself; do not commit them"
+)
 
 
 class InstallAborted(InstallerError):
@@ -115,22 +133,32 @@ class InstallReport:
             was switched off).
         mcp: One registration per agent (empty when the MCP step was
             switched off).
+        token_files: Files below the working directory that now hold the
+            token itself, so the report can warn against committing them.
     """
 
     consent: str
     agents: list[str] = field(default_factory=list)
     skill: list[WriteResult] = field(default_factory=list)
     mcp: dict[str, Registration] = field(default_factory=dict)
+    token_files: list[Path] = field(default_factory=list)
+
+    def results(self) -> list[WriteResult]:
+        """Return every result of the run, Skill and MCP alike."""
+        return [*self.skill, *(item.result for item in self.mcp.values())]
 
     def exit_code(self) -> int:
         """Return the process exit code for this report.
 
-        Always ``0``: a step that asks the user to paste a snippet is a
-        reported outcome, not a failure, and the problems that do stop the
-        installation are raised as :class:`InstallAborted` before a report
-        exists.
+        ``1`` when any step ended in :attr:`~.writers.Outcome.ERROR`, and
+        ``0`` otherwise: a step that hands the user a snippet
+        (:attr:`~.writers.Outcome.MANUAL`) or that left an existing
+        configuration alone (:attr:`~.writers.Outcome.SKIPPED`) is a
+        reported outcome, not a failure. The problems that stop the
+        installation altogether are raised as :class:`InstallAborted`
+        before a report exists.
         """
-        return 0
+        return 1 if any(result.outcome is Outcome.ERROR for result in self.results()) else 0
 
 
 def install(
@@ -174,22 +202,31 @@ def install(
         )
     agents = _resolve_agents(options.agents, home=home, which=which)
     consent_line = _consent_step(options, stdin_is_tty=stdin_is_tty, confirm=confirm, out=out)
+    # The token is resolved before anything is copied: a run that ends here
+    # because no source has the token must not leave a Skill behind, half
+    # installed and pointing at a server nobody is registered with.
+    token = (
+        _token_step(
+            options, environ=environ, stdin_is_tty=stdin_is_tty, prompt_secret=prompt_secret
+        )
+        if options.mcp
+        else ""
+    )
     skill_results = _skill_step(agents, options, home=home, cwd=cwd) if options.skill else []
 
     registrations: dict[str, Registration] = {}
     if options.mcp:
-        # The token is only needed for this step, and only asked for once
-        # every agent is known, so a rejected option cannot cost a prompt.
-        token = _token_step(
-            options, environ=environ, stdin_is_tty=stdin_is_tty, prompt_secret=prompt_secret
-        )
         for key in agents:
             registrations[key] = _mcp_step(
                 key, options, home=home, cwd=cwd, token=token, which=which, runner=runner
             )
 
     return InstallReport(
-        consent=consent_line, agents=agents, skill=skill_results, mcp=registrations
+        consent=consent_line,
+        agents=agents,
+        skill=skill_results,
+        mcp=registrations,
+        token_files=_token_files(registrations, options, cwd=cwd),
     )
 
 
@@ -216,6 +253,11 @@ def format_report(report: InstallReport) -> str:
         lines += ["", "Left for you to do"]
         for key, snippet in manual:
             lines += ["", f"--- {AGENTS[key].name} ({key}) ---", snippet]
+    if report.token_files:
+        # Written below the working directory, which is normally a checkout:
+        # the file names are safe to print, the token they hold is not.
+        names = ", ".join(str(path) for path in report.token_files)
+        lines += ["", f"{TOKEN_IN_PROJECT_WARNING} ({names})"]
     lines += ["", NEXT_STEP]
     return "\n".join(lines)
 
@@ -365,20 +407,30 @@ def _skill_step(
     try:
         source = skill_source()
     except InstallerError as error:
-        # A broken package must not cost the user the MCP registration.
-        return [WriteResult(Outcome.MANUAL, None, str(error))]
+        # A broken package must not cost the user the MCP registration, but
+        # there is nothing to paste either: this is a failure (exit code 1).
+        return [WriteResult(Outcome.ERROR, None, str(error))]
 
     results: list[WriteResult] = []
     for target in skill_targets(agents, scope=options.scope, home=home, cwd=cwd):
         try:
             results.extend(install_skill(source, [target], dry_run=options.dry_run))
         except OSError as error:
-            results.append(
-                WriteResult(Outcome.MANUAL, target, f"{target}: {error.strerror or error}")
-            )
+            results.append(_skill_by_hand(source, target, error.strerror or str(error)))
         except InstallerError as error:
-            results.append(WriteResult(Outcome.MANUAL, target, f"{target}: {error}"))
+            results.append(_skill_by_hand(source, target, str(error)))
     return results
+
+
+def _skill_by_hand(source: Path, target: Path, reason: str) -> WriteResult:
+    """Return the manual step for a Skill directory that could not be copied.
+
+    Like every manual outcome, it says what to do by hand -- here, which
+    directory to copy where.
+    """
+    return WriteResult(
+        Outcome.MANUAL, target, f"{target}: {reason}; copy {source} to {target} by hand"
+    )
 
 
 def _token_step(
@@ -390,9 +442,16 @@ def _token_step(
 ) -> str:
     """Return the server token, or abort with the reason none could be found.
 
+    Returns the empty string for ``--token-env``: only the *name* of the
+    variable is written then, so asking the user for a value they asked us
+    not to store would be a pointless prompt (and a needless copy of a
+    credential in this process's memory).
+
     Raises:
         InstallAborted: No source could provide a token.
     """
+    if options.token_env:
+        return ""
     try:
         return resolve_token(
             token_file=options.token_file,
@@ -428,9 +487,36 @@ def _mcp_step(
             dry_run=options.dry_run,
         )
     except OSError as error:
+        # Manual, not an error: the user can still paste the entry, so the
+        # snippet is attached here exactly as the agent handlers do.
         message = f"{key}: the configuration could not be written ({error.strerror or error})"
-        return Registration(WriteResult(Outcome.MANUAL, None, redact(message, [token])))
+        return Registration(
+            WriteResult(Outcome.MANUAL, None, redact(message, [token])),
+            redact(manual_snippet(key, options.url, options.token_env), [token]),
+        )
     return _redacted(registration, token)
+
+
+def _token_files(
+    registrations: Mapping[str, Registration], options: InstallOptions, *, cwd: Path
+) -> list[Path]:
+    """Return the files below *cwd* this run wrote the token itself into.
+
+    Only literal tokens count: ``--token-env`` writes a reference, and a
+    host that cannot expand one is reported as a manual step instead of
+    being written to. The working directory is usually a checkout, so these
+    files are the ones that must not be committed.
+    """
+    if options.token_env:
+        return []
+    files: list[Path] = []
+    for registration in registrations.values():
+        result = registration.result
+        if result.outcome is not Outcome.WRITTEN or result.dry_run or result.path is None:
+            continue
+        if result.path.is_relative_to(cwd):
+            files.append(result.path)
+    return files
 
 
 def _redacted(registration: Registration, token: str) -> Registration:

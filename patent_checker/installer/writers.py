@@ -64,12 +64,18 @@ class Outcome(StrEnum):
 
     A :class:`enum.StrEnum`, so a member compares equal to its wire value
     (``Outcome.WRITTEN == "written"``) and renders as that value.
+
+    :attr:`MANUAL` and :attr:`ERROR` differ by what the user can do about
+    it: a manual step always comes with the exact text or command to apply
+    by hand, while an error is a failure nobody can paste their way out of
+    (a broken package, for instance) and makes the command exit non-zero.
     """
 
     WRITTEN = "written"
     REGISTERED_BY_CLI = "registered-by-cli"
     MANUAL = "manual"
     SKIPPED = "skipped"
+    ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -140,25 +146,57 @@ def _read_text(path: Path) -> tuple[str | None, str]:
         return None, "not valid UTF-8"
 
 
-def _back_up(path: Path) -> Path:
-    """Copy *path* to its ``.bak`` sibling and return the backup's path."""
+def _back_up(path: Path, *, sensitive: bool) -> Path | None:
+    """Copy *path* to its ``.bak`` sibling unless a backup is already there.
+
+    Args:
+        path: The file about to be replaced.
+        sensitive: Whether the copy may contain a bearer token, in which
+            case it is restricted to its owner like the file itself.
+
+    Returns:
+        The backup this call created, or ``None`` when one was already
+        there. An existing ``.bak`` is never overwritten: it holds what the
+        user had before the installer ever ran, and a second run would
+        otherwise replace that original with our own output.
+    """
     backup = path.with_name(path.name + BACKUP_SUFFIX)
+    if backup.exists():
+        return None
     shutil.copy2(path, backup)
+    # copy2 carries the source's mode over, which for a file created before
+    # this rule existed may be world-readable.
+    if sensitive and os.name != "nt":
+        os.chmod(backup, _OWNER_ONLY)
     return backup
 
 
-def _write_atomically(path: Path, text: str) -> None:
+def _write_atomically(path: Path, text: str, *, sensitive: bool = False) -> None:
     """Replace *path* with *text*, creating parent directories as needed.
 
     The text is written to a temporary file in the destination directory
     and moved onto the target, so a crash never leaves a half-written
-    configuration file. A file we create keeps the owner-only mode of the
-    temporary file; an existing file keeps the mode it already had.
+    configuration file.
+
+    Args:
+        path: The file to replace.
+        text: Its new content.
+        sensitive: Whether *text* embeds the bearer token. A sensitive file
+            keeps the owner-only mode of the temporary file even when it
+            existed before, so a token cannot end up in a world-readable
+            configuration; a file that only references an environment
+            variable keeps whatever mode the user gave it.
+
+    Note:
+        Windows has no POSIX modes, so the mode is left to the directory's
+        inherited ACL there (as elsewhere in this module).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         previous_mode: int | None = stat.S_IMODE(path.stat().st_mode)
     except OSError:
+        previous_mode = None
+    if sensitive:
         previous_mode = None
     handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     tmp_path = Path(tmp_name)
@@ -166,10 +204,13 @@ def _write_atomically(path: Path, text: str) -> None:
         with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
         # ``mkstemp`` already restricts the new file to its owner, which is
-        # what we want for a file we create; only an existing file needs its
-        # own mode restored. Windows has no POSIX modes to preserve.
+        # what we want for a file we create and for every file holding a
+        # token; only an existing, non-sensitive file needs its own mode
+        # restored. Windows has no POSIX modes to preserve.
         if previous_mode is not None and os.name != "nt":
             os.chmod(tmp_path, previous_mode)
+        elif sensitive and os.name != "nt":
+            os.chmod(tmp_path, _OWNER_ONLY)
         os.replace(tmp_path, path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -181,6 +222,7 @@ def merge_json(
     update: Callable[[dict[str, Any]], None],
     *,
     dry_run: bool = False,
+    sensitive: bool = False,
 ) -> WriteResult:
     """Apply *update* to the JSON object in *path* and write it back.
 
@@ -201,6 +243,8 @@ def merge_json(
             called even in a dry run, so a caller's own validation still
             happens.
         dry_run: When ``True``, parse and call *update* but write nothing.
+        sensitive: Whether the entry being merged in embeds the bearer
+            token; the file and its backup are then owner-only.
 
     Returns:
         :attr:`Outcome.WRITTEN` when the file was (or would be) updated,
@@ -237,8 +281,8 @@ def merge_json(
     if dry_run:
         return WriteResult(Outcome.WRITTEN, path, f"would update {path} (dry run)", dry_run=True)
     if existed:
-        _back_up(path)
-    _write_atomically(path, text)
+        _back_up(path, sensitive=sensitive)
+    _write_atomically(path, text, sensitive=sensitive)
     verb = "updated" if existed else "created"
     return WriteResult(Outcome.WRITTEN, path, f"{verb} {path}")
 
@@ -278,6 +322,7 @@ def append_toml_table(
     body: str,
     *,
     dry_run: bool = False,
+    sensitive: bool = False,
 ) -> WriteResult:
     """Append ``[table]`` with *body* to the TOML file at *path*.
 
@@ -296,6 +341,8 @@ def append_toml_table(
         body: The ``key = value`` lines of the table, with or without a
             trailing newline.
         dry_run: When ``True``, check the file but write nothing.
+        sensitive: Whether *body* embeds the bearer token; the file and its
+            backup are then owner-only.
 
     Returns:
         :attr:`Outcome.WRITTEN` when the table was (or would be) appended,
@@ -332,17 +379,23 @@ def append_toml_table(
             Outcome.WRITTEN, path, f"would add [{table}] to {path} (dry run)", dry_run=True
         )
 
-    backup = _back_up(path) if existed else None
-    _write_atomically(path, text)
+    backup = _back_up(path, sensitive=sensitive) if existed else None
+    _write_atomically(path, text, sensitive=sensitive)
     try:
         tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         # The appended body broke the document: put the previous file back
         # (or remove the one we created) so the host keeps working.
-        if backup is None:
+        if not existed:
             path.unlink(missing_ok=True)
-        else:
+        elif backup is not None:
+            # Our own copy, taken moments ago: byte for byte the original.
             os.replace(backup, path)
+        else:
+            # A ``.bak`` from an earlier run was left alone, so it may hold
+            # something much older; the text read at the top of this call is
+            # what the file said a moment ago.
+            _write_atomically(path, raw, sensitive=sensitive)
         return WriteResult(
             Outcome.MANUAL,
             path,
