@@ -21,7 +21,7 @@
 
 services:
   patent-checker:
-    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:0.5}
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.0}
     # No `ports:` on purpose: only Caddy can reach the server.
     expose:
       - "8642"

@@ -29,7 +29,7 @@ services:
     # Compose builds a missing image instead of pulling it, which breaks the
     # "download this one file and run it" path. To run a locally built image
     # instead: docker build -t patent-checker:dev . && PATENT_CHECKER_IMAGE=patent-checker:dev docker compose up -d
-    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:0.5}
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.0}
     ports:
       - "127.0.0.1:${PATENT_CHECKER_PORT:-8642}:8642"
     environment:
