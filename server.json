@@ -1,0 +1,94 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.xhighhongo41/patent-checker",
+  "description": "Prior-art exploration for software projects; finds related patents, never judges infringement",
+  "version": "0.5.0",
+  "websiteUrl": "https://github.com/xhighhongo41/patent-checker",
+  "repository": {
+    "url": "https://github.com/xhighhongo41/patent-checker",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "patent-checker",
+      "version": "0.5.0",
+      "runtimeHint": "uvx",
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "serve",
+          "description": "Start the MCP server"
+        },
+        {
+          "type": "named",
+          "name": "--transport",
+          "value": "stdio",
+          "description": "Speak MCP over stdio (runs with the invoking user's permissions)"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "PATENT_CHECKER_OPERATOR_CONSENT",
+          "description": "Version of the operator notice you accepted; run `patent-checker serve --show-operator-notice`",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "PATENT_CHECKER_OPS_KEY",
+          "description": "EPO OPS credentials; leave unset for degraded mode",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "PATENT_CHECKER_OPS_SECRET",
+          "description": "EPO OPS credentials; leave unset for degraded mode",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
+    },
+    {
+      "registryType": "oci",
+      "identifier": "ghcr.io/xhighhongo41/patent-checker:0.5.0",
+      "version": "0.5.0",
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://127.0.0.1:8642/mcp"
+      },
+      "environmentVariables": [
+        {
+          "name": "PATENT_CHECKER_OPERATOR_CONSENT",
+          "description": "Version of the operator notice you accepted; run `patent-checker serve --show-operator-notice`",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "PATENT_CHECKER_SERVER_TOKEN_FILE",
+          "description": "File holding the bearer token clients must present",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "filepath"
+        },
+        {
+          "name": "PATENT_CHECKER_OPS_KEY_FILE",
+          "description": "EPO OPS credentials; leave unset for degraded mode",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "filepath"
+        },
+        {
+          "name": "PATENT_CHECKER_OPS_SECRET_FILE",
+          "description": "EPO OPS credentials; leave unset for degraded mode",
+          "isRequired": false,
+          "isSecret": true,
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

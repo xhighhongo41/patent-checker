@@ -1,5 +1,7 @@
 # Patent Checker
 
+<!-- mcp-name: io.github.xhighhongo41/patent-checker -->
+
 日本語版: [README_ja.md](README_ja.md)
 
 Patent Checker helps you explore published patents that may relate to your

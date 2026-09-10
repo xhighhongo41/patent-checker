@@ -60,7 +60,11 @@ FROM python:3.12-slim-trixie
 
 LABEL org.opencontainers.image.source="https://github.com/xhighhongo41/patent-checker" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.description="Patent prior-art exploration MCP server; it explores prior art and does not judge infringement"
+      org.opencontainers.image.description="Patent prior-art exploration MCP server; it explores prior art and does not judge infringement" \
+      org.opencontainers.image.url="https://github.com/xhighhongo41/patent-checker" \
+      org.opencontainers.image.documentation="https://github.com/xhighhongo41/patent-checker#readme" \
+      org.opencontainers.image.vendor="xhighhongo41" \
+      io.modelcontextprotocol.server.name="io.github.xhighhongo41/patent-checker"
 
 # An unprivileged user owns /data, the only path the server ever writes to.
 RUN useradd --uid 1000 --user-group --create-home app \

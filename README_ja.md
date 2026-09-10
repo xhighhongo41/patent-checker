@@ -1,5 +1,7 @@
 # Patent Checker
 
+<!-- mcp-name: io.github.xhighhongo41/patent-checker -->
+
 English: [README.md](README.md)
 
 Patent Checker は、あなた自身のソフトウェアプロジェクトに関係しうる公開特許を探索し、見つけたことを日付入りの手順記録形式のレポートとして書き留めるためのツールです。2 つの部分から成ります。

@@ -1,20 +1,38 @@
 [project]
 name = "patent-checker"
 version = "0.5.0"
-description = "Patent prior-art exploration toolkit: core library and CLI; it does not judge infringement"
+description = "Prior-art exploration for software projects: an MCP server and Agent Skill that find related patents and report observations, never an infringement verdict"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{name = "xhighhongo41"}]
-keywords = ["patent", "prior-art", "mcp", "agent-skill", "epo-ops", "google-patents"]
+keywords = [
+    "patent",
+    "prior-art",
+    "mcp",
+    "agent-skill",
+    "epo-ops",
+    "google-patents",
+    "mcp-server",
+    "model-context-protocol",
+    "prior-art-search",
+    "patent-search",
+    "agent-skills",
+    "fastmcp",
+]
 requires-python = ">=3.12"
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
     "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Legal Industry",
     "Operating System :: OS Independent",
-    "Topic :: Scientific/Engineering",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
 ]
 dependencies = [
     "httpx",
@@ -29,6 +47,8 @@ Homepage = "https://github.com/xhighhongo41/patent-checker"
 Repository = "https://github.com/xhighhongo41/patent-checker"
 Issues = "https://github.com/xhighhongo41/patent-checker/issues"
 Changelog = "https://github.com/xhighhongo41/patent-checker/blob/main/README.md#changelog"
+Documentation = "https://github.com/xhighhongo41/patent-checker#readme"
+Security = "https://github.com/xhighhongo41/patent-checker/blob/main/SECURITY.md"
 
 [project.scripts]
 patent-checker = "patent_checker.cli.main:main"
