@@ -55,7 +55,6 @@
     {
       "registryType": "oci",
       "identifier": "ghcr.io/xhighhongo41/patent-checker:1.0.0",
-      "version": "1.0.0",
       "transport": {
         "type": "streamable-http",
         "url": "http://127.0.0.1:8642/mcp"
