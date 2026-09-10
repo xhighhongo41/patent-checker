@@ -227,4 +227,32 @@ if [ "$CONSENT_EXIT" -ne 4 ]; then
 fi
 echo "PASS: an unacknowledged operator notice stops the server with exit code 4"
 
+# --- 10. the hardening in compose.yaml is in effect --------------------------
+
+CID=$(compose ps --quiet patent-checker)
+[ -n "$CID" ] || fail "could not find the running patent-checker container"
+INSPECT=$(docker inspect --format \
+    '{{.HostConfig.ReadonlyRootfs}} {{join .HostConfig.CapDrop ","}} {{join .HostConfig.SecurityOpt ","}}' \
+    "$CID")
+case "$INSPECT" in
+    true*ALL*no-new-privileges*) ;;
+    *) fail "hardening not applied (ReadonlyRootfs CapDrop SecurityOpt): $INSPECT" ;;
+esac
+echo "PASS: root filesystem read-only, capabilities dropped, no-new-privileges set"
+
+# --- 11. the LAN/TLS example is a valid compose file ------------------------
+
+LAN="$TMP/lan"
+mkdir -p "$LAN/secrets"
+cp "$REPO/examples/lan-tls/Caddyfile" "$LAN/Caddyfile"
+: > "$LAN/secrets/ops_key.txt"
+: > "$LAN/secrets/ops_secret.txt"
+printf '%s\n' "$TOKEN" > "$LAN/secrets/server_token.txt"
+PATENT_CHECKER_LAN_HOST=patents.test docker compose \
+    --project-name "$PROJECT-lan" \
+    --project-directory "$LAN" \
+    --file "$REPO/examples/lan-tls/compose.yaml" \
+    config --quiet || fail "examples/lan-tls/compose.yaml does not validate"
+echo "PASS: examples/lan-tls/compose.yaml validates with docker compose config"
+
 echo "container smoke: OK"

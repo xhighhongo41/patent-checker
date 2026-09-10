@@ -236,3 +236,5 @@ secrets/*
 # Only the committed template is exempt.
 .env.*
 !.env.example
+examples/*/secrets/*
+!examples/*/secrets/README.md

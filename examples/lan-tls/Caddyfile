@@ -1,0 +1,16 @@
+# Caddy configuration for examples/lan-tls/compose.yaml.
+#
+# PATENT_CHECKER_LAN_HOST comes from .env (through compose.yaml). Caddy
+# terminates TLS for that name and forwards everything, including the
+# original Host header, to the server on the private Compose network.
+
+{$PATENT_CHECKER_LAN_HOST} {
+	# Internal CA: Caddy mints its own certificate for the name above. Clients
+	# must trust Caddy's root certificate once (docs/deploy-lan.md explains
+	# how to export it). Delete this line to use ACME (Let's Encrypt) instead,
+	# which works only when the name is public DNS and ports 80/443 of this
+	# machine are reachable from the internet.
+	tls internal
+
+	reverse_proxy patent-checker:8642
+}
