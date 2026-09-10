@@ -407,6 +407,27 @@ def _run_cli(request: _Request, argv: list[str]) -> WriteResult:
     )
 
 
+#: What a host's ``mcp add`` says when the name is taken; the entry is then
+#: removed and added again so that a second run updates the registration.
+_ALREADY_EXISTS = "already exists"
+
+
+def _run_cli_replacing(request: _Request, add: list[str], remove: list[str]) -> WriteResult:
+    """Run ``mcp add``; when the host refuses because the entry exists, replace it.
+
+    ``claude mcp add`` (verified on 2026-09-10) exits non-zero with
+    "already exists" instead of updating an entry, which would turn every
+    re-run of the installer into a manual step. The entry is removed with
+    *remove* and added once more, so a re-run refreshes the URL and the
+    token exactly like the file-editing hosts do.
+    """
+    result = _run_cli(request, add)
+    if result.outcome is not Outcome.MANUAL or _ALREADY_EXISTS not in result.message:
+        return result
+    _run_cli(request, remove)
+    return _run_cli(request, add)
+
+
 def _register_claude_code(request: _Request) -> Registration:
     """Register with Claude Code through ``claude mcp add``, else by hand."""
     argv = [
@@ -422,13 +443,14 @@ def _register_claude_code(request: _Request) -> Registration:
         "--header",
         f"Authorization: {request.header}",
     ]
+    remove = ["claude", "mcp", "remove", "--scope", request.scope, SERVER_NAME]
     snippet = _claude_code_snippet(request)
     if request.which("claude") is None:
         return Registration(
             WriteResult(Outcome.MANUAL, None, "claude is not on PATH; register the server by hand"),
             snippet,
         )
-    result = _run_cli(request, argv)
+    result = _run_cli_replacing(request, argv, remove)
     return Registration(result, snippet if result.outcome is Outcome.MANUAL else None)
 
 

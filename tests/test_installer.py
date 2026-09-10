@@ -2398,3 +2398,55 @@ def test_install_run_twice_updates_in_place_and_keeps_the_first_backup(
     backup = config.with_name(config.name + ".bak")
     assert backup.read_text(encoding="utf-8") == original
     assert after_first != config.read_text(encoding="utf-8")
+
+
+def test_install_replaces_an_existing_claude_code_entry_on_a_second_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`claude mcp add` refuses a taken name; the installer removes and re-adds it."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+
+    def runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if argv[2] == "add" and len(calls) == 1:
+            return subprocess.CompletedProcess(
+                list(argv), 1, "", f"MCP server {SERVER_NAME} already exists in .mcp.json\n"
+            )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False, scope="project"),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=lambda program: "/usr/local/bin/claude" if program == "claude" else None,
+        runner=runner,
+    )
+
+    assert report.mcp["claude-code"].result.outcome is Outcome.REGISTERED_BY_CLI
+    assert [call[:3] for call in calls] == [
+        ["claude", "mcp", "add"],
+        ["claude", "mcp", "remove"],
+        ["claude", "mcp", "add"],
+    ]
+    assert calls[1] == ["claude", "mcp", "remove", "--scope", "project", SERVER_NAME]
+
+
+def test_install_does_not_retry_a_claude_code_failure_that_is_not_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=lambda program: "/usr/local/bin/claude" if program == "claude" else None,
+        runner=_fake_runner(returncode=2, stderr="unknown option", calls=calls),
+    )
+
+    assert report.mcp["claude-code"].result.outcome is Outcome.MANUAL
+    assert len(calls) == 1
