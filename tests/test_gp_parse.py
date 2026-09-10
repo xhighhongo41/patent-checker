@@ -333,3 +333,33 @@ def test_every_fixture_yields_claims_or_fallback_text() -> None:
         if not doc.claims and not doc.claims_fallback_text:
             empty.append(path.name)
     assert not empty, f"no claims and no fallback text: {empty}"
+
+
+def test_non_numeric_claim_number_is_skipped_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``num`` attribute that is not a number drops that claim, not the page.
+
+    Some machine-translated pages number a claim "0000a"; a bare int() would
+    end the whole parse with a ValueError the caller cannot act on.
+    """
+    html = """
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000010A1</dd>
+      <section itemprop="claims" itemscope>
+        <div class="claim">
+          <div num="0001a" class="claim">
+            <div class="claim-text">1a. A widget with an odd number.</div>
+          </div>
+          <div num="00002" class="claim">
+            <div class="claim-text">2. A well-numbered widget.</div>
+          </div>
+        </div>
+      </section>
+    </article></body></html>
+    """
+    with caplog.at_level("WARNING", logger="patent_checker.gp.parse"):
+        doc = parse_patent_html(html)
+
+    assert [claim.number for claim in doc.claims] == [2]
+    assert "0001a" in caplog.text

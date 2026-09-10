@@ -81,11 +81,22 @@ def dedup_families(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
 
     Raises:
         KeyError: If a hit is missing the required ``"pub"`` key.
+        ValueError: If a hit is not a mapping, or its ``"pub"`` is not a
+            string; the message names the offending position.
     """
     order: list[str] = []
     groups: dict[str, list[int]] = {}
     for index, hit in enumerate(hits):
+        if not isinstance(hit, Mapping):
+            raise ValueError(
+                f'hits[{index}] must be a mapping carrying a "pub" key, got {type(hit).__name__}'
+            )
         pub = hit["pub"]
+        if not isinstance(pub, str):
+            raise ValueError(
+                f'hits[{index}]["pub"] must be a publication-number string, '
+                f"got {type(pub).__name__}"
+            )
         family_id = hit.get("family_id") or ""
         # Empty/missing family_id: fall back to pub so unrelated hits are not
         # accidentally merged under the shared key "".
@@ -146,6 +157,10 @@ def verify_batch(
     Raises:
         KeyError: If a mapping element of *output_records* has no ``"pub"``
             key.
+        ValueError: If an element of *input_pubs* is not a string, or an
+            element of *output_records* is neither a string nor a mapping
+            carrying a string ``"pub"``; the message names the offending
+            position.
     """
     unparseable: list[str] = []
     seen_unparseable: set[str] = set()
@@ -158,9 +173,11 @@ def verify_batch(
             unparseable.append(key)
         return key
 
-    input_keys = [normalize(pub) for pub in input_pubs]
+    input_keys = [
+        normalize(_checked_pub(pub, "input_pubs", index)) for index, pub in enumerate(input_pubs)
+    ]
     output_keys = [
-        normalize(record if isinstance(record, str) else record["pub"]) for record in output_records
+        normalize(_record_pub(record, index)) for index, record in enumerate(output_records)
     ]
 
     input_key_set = set(input_keys)
@@ -241,8 +258,10 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
     ``{"at": ISO8601 str, "kind": str, "url": str, "status": int,
     "throttling": str}``. When *headers_path* is omitted, the log at
     ``data_dir("ops") / "headers.jsonl"`` (the same path OpsClient writes to)
-    is used. A line that is not valid JSON is skipped and counted in
-    ``"skipped_lines"`` rather than raising.
+    is used. A line that is not valid JSON, or that is valid JSON but not an
+    object, is skipped and counted in ``"skipped_lines"`` rather than
+    raising; so is a field whose value has an unexpected type (a numeric
+    ``"at"``, for instance, simply counts towards no day).
 
     Returns:
         ``{"available": False, "path": str}`` when the log file does not
@@ -280,6 +299,11 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
             except json.JSONDecodeError:
                 skipped_lines += 1
                 continue
+            # A valid JSON line that is not an object carries no fields to
+            # aggregate; it is as unusable as a broken line.
+            if not isinstance(record, Mapping):
+                skipped_lines += 1
+                continue
 
             total_requests += 1
             kind = record.get("kind", "")
@@ -289,6 +313,8 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
             by_status[status] = by_status.get(status, 0) + 1
 
             throttling = record.get("throttling", "")
+            if not isinstance(throttling, str):
+                throttling = ""
             if any(colour in throttling for colour in ("yellow", "red", "black")):
                 non_green_events += 1
 
@@ -297,6 +323,8 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
                 system_states[system] = system_states.get(system, 0) + 1
 
             at = record.get("at", "")
+            if not isinstance(at, str):
+                at = str(at)
             if first_at is None:
                 first_at = at
             last_at = at
@@ -324,6 +352,42 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
 
 
 # --- Private helpers ---------------------------------------------------
+
+
+def _checked_pub(pub: Any, container: str, index: int) -> str:
+    """Return *pub* unchanged, or reject it as an input error naming its position.
+
+    Both front ends (MCP tools and CLI) report a ValueError as "invalid
+    input"; a bare TypeError from a subscript would surface as an internal
+    error instead, without saying which element is at fault.
+
+    Raises:
+        ValueError: If *pub* is not a string.
+    """
+    if not isinstance(pub, str):
+        raise ValueError(
+            f"{container}[{index}] must be a publication-number string, got {type(pub).__name__}"
+        )
+    return pub
+
+
+def _record_pub(record: Any, index: int) -> str:
+    """Return the publication number of one ``output_records`` element.
+
+    Raises:
+        KeyError: If a mapping element has no ``"pub"`` key (documented
+            behaviour of :func:`verify_batch`).
+        ValueError: If the element is neither a string nor a mapping, or its
+            ``"pub"`` value is not a string.
+    """
+    if isinstance(record, str):
+        return record
+    if not isinstance(record, Mapping):
+        raise ValueError(
+            f"output_records[{index}] must be a publication-number string or a mapping "
+            f'carrying a "pub" key, got {type(record).__name__}'
+        )
+    return _checked_pub(record["pub"], "output_records", index)
 
 
 def _dedup_preserve_order(items: Iterable[str]) -> list[str]:
@@ -442,9 +506,14 @@ def _run_search_plan_check(
     }
 
 
-def _local_date(at: str) -> Any:
-    """Return the local calendar date encoded in an ``"at"`` timestamp, or None."""
+def _local_date(at: Any) -> Any:
+    """Return the local calendar date encoded in an ``"at"`` timestamp, or None.
+
+    A log line written by another tool may carry a number (an epoch stamp) or
+    any other type there; such a value is simply not a date this report can
+    use, so it is reported as ``None`` rather than raising.
+    """
     try:
         return datetime.fromisoformat(at).date()
-    except ValueError:
+    except (TypeError, ValueError):
         return None

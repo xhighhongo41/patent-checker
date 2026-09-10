@@ -462,3 +462,234 @@ def test_parse_search_biblio_xml_other_fault_raises_value_error() -> None:
     """Faults other than SERVER.EntityNotFound are real errors (biblio constituent)."""
     with pytest.raises(ValueError, match="CLIENT.InvalidQuery"):
         parse_search_biblio_xml(_OTHER_FAULT_XML)
+
+
+# --- Legal responses without events (v1.0) ----------------------------------
+
+
+def test_parse_legal_xml_event_less_gb_fixture_is_an_empty_tuple() -> None:
+    """A real legal response holding no event parses as "no events known".
+
+    Measured in v0.1: GB.2553053 answers with a populated legal section for
+    both its A and B publications while carrying no ``ops:legal`` element at
+    all. That is a valid answer, not malformed input.
+    """
+    xml = _load_fixture("20260828-125143_legal_GB.2553053.A.xml")
+    assert parse_legal_xml(xml) == ()
+
+
+_LEGAL_NO_EVENTS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <ops:patent-family legal="true" total-result-count="1">
+        <ops:family-member family-id="1">
+            <publication-reference>
+                <document-id document-id-type="docdb">
+                    <country>GB</country>
+                    <doc-number>2553053</doc-number>
+                    <kind>A</kind>
+                </document-id>
+            </publication-reference>
+        </ops:family-member>
+    </ops:patent-family>
+</ops:world-patent-data>
+"""
+
+
+def test_parse_legal_xml_legal_section_without_events_is_an_empty_tuple() -> None:
+    """A legal section with no ops:legal child yields an empty tuple, not an error."""
+    assert parse_legal_xml(_LEGAL_NO_EVENTS_XML) == ()
+
+
+def test_parse_legal_xml_family_response_still_raises_value_error() -> None:
+    """A family response (legal="false") is not a legal response and is rejected."""
+    with pytest.raises(ValueError):
+        parse_legal_xml(_FAMILY_DUP_XML)
+
+
+# --- CPC extraction: only the CPC scheme (v1.0) -----------------------------
+
+
+_MIXED_CLASSIFICATION_BIBLIO_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <exchange-documents>
+        <exchange-document country="US" doc-number="1234567" kind="B2" family-id="1">
+            <bibliographic-data>
+                <patent-classifications>
+                    <patent-classification sequence="1">
+                        <classification-scheme office="EP" scheme="CPCI"/>
+                        <section>G</section>
+                        <class>06</class>
+                        <subclass>F</subclass>
+                        <main-group>16</main-group>
+                        <subgroup>902</subgroup>
+                    </patent-classification>
+                    <patent-classification sequence="2">
+                        <classification-scheme office="US" scheme="UC"/>
+                        <classification-symbol>707/827</classification-symbol>
+                    </patent-classification>
+                    <patent-classification sequence="3">
+                        <classification-scheme office="JP" scheme="FI"/>
+                        <classification-symbol>G06F40/44</classification-symbol>
+                    </patent-classification>
+                    <patent-classification sequence="4">
+                        <classification-scheme office="EP" scheme="CPCI"/>
+                        <section>H</section>
+                        <class>03</class>
+                        <subclass>M</subclass>
+                        <main-group>7</main-group>
+                    </patent-classification>
+                </patent-classifications>
+            </bibliographic-data>
+        </exchange-document>
+    </exchange-documents>
+</ops:world-patent-data>
+"""
+
+
+def test_extract_cpc_ignores_other_classification_schemes() -> None:
+    """US UC and JP FI entries are not CPC symbols and must not be reported as such.
+
+    Before v1.0 they produced the bare separator "/" (measured on the saved
+    searchbib responses: about 120 of 2129 documents).
+    """
+    biblio = parse_biblio_xml(_MIXED_CLASSIFICATION_BIBLIO_XML)
+    assert biblio.cpc == ("G06F16/902",)
+
+
+def test_extract_cpc_over_every_saved_searchbib_never_yields_a_bare_separator() -> None:
+    """Across all saved biblio-constituent pages, every CPC symbol is well formed."""
+    paths = sorted(FIXTURE_DIR.glob("*_searchbib_*.xml"))
+    if not paths:
+        # Go through the shared helper so the "fixtures are required" switch
+        # of the test session applies to this sweep as well.
+        _load_fixture("20260827-092030_searchbib_bc6c779320_1-3.xml")
+    checked = 0
+    for path in paths:
+        for doc in parse_search_biblio_xml(_load_fixture(path.name)).docs:
+            checked += 1
+            assert all(_CPC_RE.match(code) for code in doc.cpc), (path.name, doc.pub, doc.cpc)
+    assert checked > 0
+
+
+# --- Incomplete citation / family entries (v1.0) ----------------------------
+
+
+_BIBLIO_BROKEN_CITATION_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <exchange-documents>
+        <exchange-document country="US" doc-number="1234567" kind="B2" family-id="1">
+            <bibliographic-data>
+                <references-cited>
+                    <citation>
+                        <patcit dnum="US1111111A1">
+                            <document-id document-id-type="epodoc">
+                                <doc-number>US1111111</doc-number>
+                            </document-id>
+                        </patcit>
+                    </citation>
+                    <citation>
+                        <patcit dnum="US2222222A1">
+                            <document-id document-id-type="docdb">
+                                <country>US</country>
+                                <doc-number>2222222</doc-number>
+                                <kind>A1</kind>
+                            </document-id>
+                        </patcit>
+                    </citation>
+                    <citation>
+                        <nplcit><text>Some paper</text></nplcit>
+                    </citation>
+                </references-cited>
+            </bibliographic-data>
+        </exchange-document>
+    </exchange-documents>
+</ops:world-patent-data>
+"""
+
+
+def test_parse_biblio_xml_skips_a_citation_without_a_docdb_document_id() -> None:
+    """One unusable citation costs that citation, not the whole record."""
+    biblio = parse_biblio_xml(_BIBLIO_BROKEN_CITATION_XML)
+    assert biblio.cited_patents == ("US.2222222.A1",)
+    assert biblio.npl_citation_count == 1
+
+
+_FAMILY_BROKEN_MEMBER_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <ops:patent-family legal="false">
+        <ops:family-member family-id="42"/>
+        <ops:family-member family-id="42">
+            <publication-reference>
+                <document-id document-id-type="epodoc">
+                    <doc-number>US1111111</doc-number>
+                </document-id>
+            </publication-reference>
+        </ops:family-member>
+        <ops:family-member family-id="42">
+            <publication-reference>
+                <document-id document-id-type="docdb">
+                    <country>US</country>
+                    <doc-number>3333333</doc-number>
+                    <kind>B2</kind>
+                </document-id>
+            </publication-reference>
+        </ops:family-member>
+    </ops:patent-family>
+</ops:world-patent-data>
+"""
+
+
+def test_parse_family_xml_skips_members_that_carry_no_docdb_reference() -> None:
+    """Incomplete family members are dropped; the usable ones are still returned."""
+    family = parse_family_xml(_FAMILY_BROKEN_MEMBER_XML)
+    assert family.family_id == "42"
+    assert family.members == ("US.3333333.B2",)
+
+
+# --- Language attributes are matched case-insensitively (v1.0) --------------
+
+
+_UPPERCASE_LANG_BIBLIO_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <exchange-documents>
+        <exchange-document country="JP" doc-number="1234567" kind="A" family-id="1">
+            <bibliographic-data>
+                <invention-title lang="ja">\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e</invention-title>
+                <invention-title lang="EN">ENGLISH TITLE</invention-title>
+            </bibliographic-data>
+            <abstract lang="ja"><p>\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e</p></abstract>
+            <abstract lang="EN"><p>English abstract.</p></abstract>
+        </exchange-document>
+    </exchange-documents>
+</ops:world-patent-data>
+"""
+
+
+def test_parse_biblio_xml_matches_upper_case_language_attributes() -> None:
+    """``lang="EN"`` selects the English title and abstract just like ``lang="en"``."""
+    biblio = parse_biblio_xml(_UPPERCASE_LANG_BIBLIO_XML)
+    assert biblio.title == "ENGLISH TITLE"
+    assert biblio.abstract == "English abstract."
+
+
+_LOWERCASE_LANG_CLAIMS_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
+<ops:world-patent-data xmlns="http://www.epo.org/exchange" xmlns:ops="http://ops.epo.org">
+    <ftxt:fulltext-documents xmlns="http://www.epo.org/fulltext"
+                             xmlns:ftxt="http://www.epo.org/fulltext">
+        <ftxt:fulltext-document fulltext-format="text-only">
+            <claims lang="de">
+                <claim><claim-text>1. Eine Vorrichtung.</claim-text></claim>
+            </claims>
+            <claims lang="en">
+                <claim><claim-text>1. A device.</claim-text></claim>
+            </claims>
+        </ftxt:fulltext-document>
+    </ftxt:fulltext-documents>
+</ops:world-patent-data>
+"""
+
+
+def test_parse_claims_xml_matches_lower_case_language_attributes() -> None:
+    """``lang="en"`` selects the English claim set just like ``lang="EN"``."""
+    claims = parse_claims_xml(_LOWERCASE_LANG_CLAIMS_XML)
+    assert claims[0].text == "1. A device."

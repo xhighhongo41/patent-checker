@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 import pytest
 
+from patent_checker.net import AllowlistTransport, HostNotAllowedError
 from patent_checker.ops import client as ops_client
 from patent_checker.ops.client import (
     COOL_DOWN_SECONDS,
@@ -226,12 +228,14 @@ def test_claims_requests_the_fulltext_claims_endpoint(ops_env: Path) -> None:
     assert request_path.endswith("/published-data/publication/docdb/EP.4645156.A1/claims")
 
 
-def test_a_request_writes_no_body_file_and_logs_one_header_line(ops_env: Path) -> None:
+def test_a_request_writes_no_body_file_and_logs_every_upstream_call(ops_env: Path) -> None:
     """The client keeps no copy of the body: only the request log is written.
 
     Since v0.4 the response body is persisted exactly once, by the cache
     layer; ``headers.jsonl`` stays the client's own record of real upstream
     usage (a cache hit never reaches this code and is therefore not logged).
+    Since v1.0 the OAuth2 token request is recorded there as well, so the log
+    accounts for every call that actually left the process.
     """
     client, _ = _make_client(_ok(b"<claims-response/>"))
     with client:
@@ -239,9 +243,9 @@ def test_a_request_writes_no_body_file_and_logs_one_header_line(ops_env: Path) -
 
     assert _written_files(ops_env) == [ops_env / "raw" / "ops" / "headers.jsonl"]
     records = _header_records(ops_env)
-    assert len(records) == 1
-    assert records[0]["kind"] == "claims"
-    assert records[0]["status"] == 200
+    assert len(records) == 2
+    assert [record["kind"] for record in records] == ["token", "claims"]
+    assert [record["status"] for record in records] == [200, 200]
 
 
 def test_claims_404_raises() -> None:
@@ -284,8 +288,13 @@ def test_gb_legal_retries_the_b_publication_when_a_has_no_events(ops_env: Path) 
     assert len(paths) == 2
     assert paths[0].endswith("GB.2553053.A")
     assert paths[1].endswith("GB.2553053.B")
-    # Both calls are real upstream usage, so both are logged and no body is kept.
-    assert len(_header_records(ops_env)) == 2
+    # Both calls are real upstream usage, so both are logged (behind the one
+    # token request, logged since v1.0) and no body is kept.
+    assert [record["kind"] for record in _header_records(ops_env)] == [
+        "token",
+        "legal",
+        "legal",
+    ]
     assert _written_files(ops_env) == [ops_env / "raw" / "ops" / "headers.jsonl"]
 
 
@@ -432,3 +441,270 @@ def test_throttling_header_from_a_live_call_is_applied() -> None:
     with client:
         client.search("ta=computer")
         assert client._interval_for("search") == pytest.approx(12.0)
+
+
+# --- Token acquisition goes through the normal path (v1.0) ------------------
+
+
+def test_token_request_is_rate_limited_and_logged(ops_env: Path) -> None:
+    """The OAuth2 POST is spaced and logged like every other upstream call.
+
+    Before v1.0 it bypassed both, so the request log under-reported real
+    usage and a burst of token requests was not spaced at all.
+    """
+    client, recorder = _make_client(_ok(b"<ok/>"))
+    with client:
+        client.claims("EP4645156A1")
+
+    urls = [str(req.url) for req in recorder.requests]
+    assert [url.endswith("/auth/accesstoken") for url in urls] == [True, False]
+    records = _header_records(ops_env)
+    assert [record["kind"] for record in records] == ["token", "claims"]
+    assert records[0]["status"] == 200
+    # The token endpoint counts as a request for interval purposes.
+    assert "other" in client._last_request_at
+
+
+def test_a_second_call_reuses_the_token_and_logs_only_the_api_request(ops_env: Path) -> None:
+    """A cached token means no second POST and no second token log line."""
+    client, recorder = _make_client(_ok(b"<ok/>"))
+    with client:
+        client.claims("EP4645156A1")
+        client.claims("EP4645156A1")
+
+    assert len(recorder.requests) == 3
+    assert [record["kind"] for record in _header_records(ops_env)] == [
+        "token",
+        "claims",
+        "claims",
+    ]
+
+
+# --- Retry behaviour (v1.0) -------------------------------------------------
+
+
+def test_unauthorized_response_triggers_one_reauthentication(ops_env: Path) -> None:
+    """A 401 re-authenticates once and replays the request."""
+    seen: list[str] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(401, content=b"<fault/>")
+        return httpx.Response(200, content=b"<ok/>")
+
+    client, recorder = _make_client(responder)
+    with client:
+        body = client.claims("EP4645156A1")
+
+    assert body == b"<ok/>"
+    # token, 401 claims, token (re-auth), claims.
+    assert len(recorder.api_requests) == 2
+    assert [record["kind"] for record in _header_records(ops_env)] == [
+        "token",
+        "claims",
+        "token",
+        "claims",
+    ]
+
+
+def test_a_second_unauthorized_response_raises() -> None:
+    """Re-authentication is attempted once; a second 401 is an error."""
+    client, recorder = _make_client(lambda request: httpx.Response(401, content=b"<fault/>"))
+    with client, pytest.raises(httpx.HTTPStatusError):
+        client.claims("EP4645156A1")
+
+    assert len(recorder.api_requests) == 2
+
+
+def test_too_many_requests_is_retried_once_after_the_retry_after_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 waits for the server-supplied Retry-After and then retries once."""
+    slept: list[float] = []
+    monkeypatch.setattr(ops_client.time, "sleep", lambda seconds: slept.append(seconds))
+    responses = [
+        httpx.Response(429, content=b"<fault/>", headers={"Retry-After": "7"}),
+        httpx.Response(200, content=b"<ok/>"),
+    ]
+
+    client, recorder = _make_client(lambda request: responses.pop(0))
+    with client:
+        body = client.claims("EP4645156A1")
+
+    assert body == b"<ok/>"
+    assert len(recorder.api_requests) == 2
+    assert 7.0 in slept
+
+
+def test_service_unavailable_without_retry_after_waits_the_cool_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without Retry-After the existing cool-down is used as the delay."""
+    slept: list[float] = []
+    monkeypatch.setattr(ops_client.time, "sleep", lambda seconds: slept.append(seconds))
+    responses = [
+        httpx.Response(503, content=b"<fault/>"),
+        httpx.Response(200, content=b"<ok/>"),
+    ]
+
+    client, recorder = _make_client(lambda request: responses.pop(0))
+    with client:
+        assert client.claims("EP4645156A1") == b"<ok/>"
+
+    assert len(recorder.api_requests) == 2
+    assert COOL_DOWN_SECONDS in slept
+
+
+def test_a_second_throttled_response_raises() -> None:
+    """Only one retry is made; a second 429 surfaces as an error."""
+    client, recorder = _make_client(
+        lambda request: httpx.Response(429, content=b"<fault/>", headers={"Retry-After": "1"})
+    )
+    with client, pytest.raises(httpx.HTTPStatusError) as excinfo:
+        client.claims("EP4645156A1")
+
+    assert excinfo.value.response.status_code == 429
+    assert len(recorder.api_requests) == 2
+
+
+def test_an_unparsable_retry_after_falls_back_to_the_cool_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Retry-After we cannot read is treated as "no header at all"."""
+    slept: list[float] = []
+    monkeypatch.setattr(ops_client.time, "sleep", lambda seconds: slept.append(seconds))
+    responses = [
+        httpx.Response(
+            429, content=b"<fault/>", headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+        ),
+        httpx.Response(200, content=b"<ok/>"),
+    ]
+
+    client, _ = _make_client(lambda request: responses.pop(0))
+    with client:
+        assert client.claims("EP4645156A1") == b"<ok/>"
+
+    assert COOL_DOWN_SECONDS in slept
+
+
+# --- Header-log failures must not cost the response (v1.0) ------------------
+
+
+def test_a_failing_header_log_write_keeps_the_response(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An OSError while appending to headers.jsonl is a warning, not a lost answer."""
+    real_open = Path.open
+
+    def failing_open(self: Path, *args: object, **kwargs: object):
+        if self.name == "headers.jsonl":
+            raise OSError("no space left on device")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", failing_open)
+
+    client, _ = _make_client(_ok(b"<ok/>"))
+    with caplog.at_level("WARNING", logger="patent_checker.ops.client"), client:
+        body = client.claims("EP4645156A1")
+
+    assert body == b"<ok/>"
+    assert "no space left on device" in caplog.text
+
+
+# --- Default transport carries the allowlist (v1.0) -------------------------
+
+
+def test_default_transport_refuses_hosts_outside_the_allowlist() -> None:
+    """A client built without a transport still cannot reach an unlisted host.
+
+    No connection is attempted for the refused host, so this test never
+    touches the network.
+    """
+    with OpsClient() as client:
+        assert isinstance(client._client._transport, AllowlistTransport)
+        with pytest.raises(HostNotAllowedError):
+            client._client.get("https://evil.example/")
+
+
+def test_an_injected_transport_is_used_as_is() -> None:
+    """A transport handed in by the server is wired unchanged (it brings its own guard)."""
+    transport = httpx.MockTransport(_Recorder(_ok(b"<ok/>")))
+    with OpsClient(transport=transport) as client:
+        assert client._client._transport is transport
+
+
+# --- One upstream request at a time (v1.0) ----------------------------------
+
+
+class _VirtualClock:
+    """A monotonic clock that only advances when someone sleeps.
+
+    Tests must not depend on wall-clock timing, so the client's spacing is
+    measured against this clock instead.
+    """
+
+    def __init__(self) -> None:
+        self._now = 1000.0
+        self._lock = threading.Lock()
+
+    def monotonic(self) -> float:
+        """Return the current virtual time."""
+        with self._lock:
+            return self._now
+
+    def sleep(self, seconds: float) -> None:
+        """Advance the virtual time by *seconds* (never backwards)."""
+        with self._lock:
+            if seconds > 0:
+                self._now += seconds
+
+
+def test_concurrent_calls_are_serialized_and_keep_the_service_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two threads sharing one client never overlap upstream and stay spaced apart."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(ops_client, "time", clock)
+
+    in_flight = 0
+    max_in_flight = 0
+    starts: list[float] = []
+    guard = threading.Lock()
+    ready = threading.Barrier(2)
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        with guard:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            if not str(request.url).endswith("/auth/accesstoken"):
+                starts.append(clock.monotonic())
+        # Long enough for the other thread to be scheduled if it could run.
+        # (threading.Event().wait is used because the fixture replaces time.sleep.)
+        threading.Event().wait(0.01)
+        with guard:
+            in_flight -= 1
+        return httpx.Response(200, content=b"<ok/>")
+
+    client, _ = _make_client(responder)
+    errors: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            ready.wait(timeout=5)
+            client.biblio("EP4645156A1")
+        except BaseException as exc:  # noqa: BLE001 - reported through `errors`
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    with client:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+    assert errors == []
+    assert max_in_flight == 1
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= MIN_INTERVAL_SECONDS["retrieval"]

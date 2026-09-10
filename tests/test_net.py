@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from patent_checker import config
-from patent_checker.net import AllowlistTransport, HostNotAllowedError
+from patent_checker.net import AllowlistTransport, HostNotAllowedError, allowlist_transport
 
 
 class RecordingTransport(httpx.MockTransport):
@@ -120,3 +120,17 @@ def test_close_delegates_to_inner_transport() -> None:
     transport.close()
 
     assert inner.closed is True
+
+
+def test_allowlist_transport_factory_wraps_a_real_transport() -> None:
+    """The factory hands back an allowlisted wrapper around a real HTTP transport."""
+    transport = allowlist_transport()
+
+    assert isinstance(transport, AllowlistTransport)
+    assert isinstance(transport._inner, httpx.HTTPTransport)
+    assert transport.allowed_hosts == config.ALLOWED_HOSTS
+
+    # No connection is attempted for a host outside the allowlist, so this
+    # stays network-free.
+    with httpx.Client(transport=transport) as client, pytest.raises(HostNotAllowedError):
+        client.get("https://evil.example/")

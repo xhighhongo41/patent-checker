@@ -61,3 +61,13 @@ class AllowlistTransport(httpx.BaseTransport):
     def __exit__(self, *exc_info: object) -> None:
         """Exit the inner transport's context."""
         self._inner.__exit__(*exc_info)
+
+
+def allowlist_transport(allowed_hosts: Iterable[str] = ALLOWED_HOSTS) -> AllowlistTransport:
+    """Return a real HTTP transport that only reaches ``allowed_hosts``.
+
+    This is what every module builds when no transport is supplied from the
+    outside, so the allowlist holds on the CLI path as well and not only for
+    the MCP server, which wires its own transport.
+    """
+    return AllowlistTransport(httpx.HTTPTransport(), allowed_hosts)

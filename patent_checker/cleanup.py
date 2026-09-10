@@ -344,6 +344,10 @@ def execute(plan: CleanupPlan) -> dict[str, Any]:
             return
         try:
             path.rmdir()
+        except PermissionError as exc:
+            # Not something the operator can guess from the summary: report it
+            # so a directory left behind by a permission problem is visible.
+            errors.append({"path": str(path), "error": str(exc)})
         except OSError:
             # Not empty (something unplanned lives there, or a file above
             # could not be removed) or already gone: both mean "leave it".
