@@ -67,6 +67,11 @@ OPS_FULLTEXT_COUNTRIES: tuple[str, ...] = ("EP", "WO")
 # this layer enforces it itself so no front end can forget to.
 MAX_BATCH_RECORDS = 10000
 
+# Added to a legal-status result that carries no event at all. OPS answers
+# "this publication has no INPADOC event" with a well-formed, empty document,
+# which reads exactly like a failed fetch unless the result says otherwise.
+LEGAL_NO_EVENTS_NOTE = "no legal events reported by OPS for this publication"
+
 # Shared wording for the "OPS is not available" failure, so the CLI's
 # pre-flight check and this layer's client check report the same thing.
 OPS_NOT_CONFIGURED_MESSAGE = (
@@ -316,9 +321,10 @@ def legal(
 
     Returns:
         ``{"pub" (DOCDB spelling), "events": [...], "raw_path"}``, plus
-        ``"cached": True`` when the result came from *cache*. ``"raw_path"``
-        names the single stored copy of the response body, and is ``None``
-        when no cache was given.
+        ``"note": LEGAL_NO_EVENTS_NOTE`` when OPS reported no event at all,
+        plus ``"cached": True`` when the result came from *cache*.
+        ``"raw_path"`` names the single stored copy of the response body, and
+        is ``None`` when no cache was given.
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -335,11 +341,15 @@ def legal(
     events = parse_legal_xml(xml)
     if cache_hit is None and cache is not None:
         raw_path = cache.put("legal", key, xml, ident=pub)
-    result = {
+    result: dict[str, Any] = {
         "pub": key,
         "events": [dataclasses.asdict(event) for event in events],
         "raw_path": _raw_path_field(raw_path),
     }
+    if not events:
+        # "Nothing was reported" and "nothing could be fetched" are different
+        # answers; without this note an empty list reads like the latter.
+        result["note"] = LEGAL_NO_EVENTS_NOTE
     if cache_hit is not None:
         result["cached"] = True
     return result

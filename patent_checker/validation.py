@@ -7,9 +7,12 @@ ceiling on the number of elements, on the size of one element, and on the
 size of the whole payload, plus the element shapes the helpers can work with
 (a publication-number string, or a mapping carrying one under ``"pub"``).
 
-Every violation is a :class:`ValueError` naming the offending element by
-index and the limit it broke, so the MCP tool layer can map it to its
-``invalid_input`` error and the CLI can print it as-is.
+Every violation is an :class:`InvalidInput` (a :class:`ValueError`) naming
+the offending element by index and the limit it broke, so the MCP tool layer
+can map it to its ``invalid_input`` error and the CLI can print it as-is.
+The dedicated class is what lets the tool layer tell "the caller sent
+something we refuse" apart from a ``ValueError`` raised further down while
+reading upstream data, which no change of the arguments would fix.
 """
 
 from __future__ import annotations
@@ -17,6 +20,17 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
+
+
+class InvalidInput(ValueError):
+    """Raised when the caller's own arguments break a documented limit or shape.
+
+    A ``ValueError`` subclass, so every existing handler (the CLI's
+    ``invalid_input`` envelope, the service layer's documented contract)
+    keeps working unchanged, while a front end that needs the distinction can
+    catch this class alone.
+    """
+
 
 # Ceiling on one element of a batch. Generous next to a publication number or
 # a search hit; it exists so a single element cannot carry a whole document.
@@ -43,18 +57,18 @@ def _check_item(item: Any, position: str) -> None:
     """Check the shape of one element.
 
     Raises:
-        ValueError: If *item* is neither a string nor a mapping, or is a
+        InvalidInput: If *item* is neither a string nor a mapping, or is a
             mapping without a string ``"pub"`` entry.
     """
     if isinstance(item, str):
         return
     if not isinstance(item, Mapping):
-        raise ValueError(f"{position} must be a string or a mapping, got {type(item).__name__}")
+        raise InvalidInput(f"{position} must be a string or a mapping, got {type(item).__name__}")
     if "pub" not in item:
-        raise ValueError(f'{position} is missing the required key "pub"')
+        raise InvalidInput(f'{position} is missing the required key "pub"')
     pub = item["pub"]
     if not isinstance(pub, str):
-        raise ValueError(f'{position}["pub"] must be a string, got {type(pub).__name__}')
+        raise InvalidInput(f'{position}["pub"] must be a string, got {type(pub).__name__}')
 
 
 def validate_batch(
@@ -82,13 +96,15 @@ def validate_batch(
         max_payload_chars: Largest accepted size of all elements together.
 
     Raises:
-        ValueError: If *records* is not a list/tuple, or any limit or shape
+        InvalidInput: If *records* is not a list/tuple, or any limit or shape
             rule is broken. The message names the offending element by index.
+            It is a ``ValueError``, so callers that only know that keep
+            working.
     """
     if isinstance(records, str) or not isinstance(records, Sequence):
-        raise ValueError(f"{label} must be a list, got {type(records).__name__}")
+        raise InvalidInput(f"{label} must be a list, got {type(records).__name__}")
     if len(records) > max_records:
-        raise ValueError(
+        raise InvalidInput(
             f"{label} holds {len(records)} entries: at most {max_records} are accepted"
         )
 
@@ -98,7 +114,7 @@ def validate_batch(
         _check_item(item, position)
         size = _item_chars(item)
         if size > max_item_chars:
-            raise ValueError(
+            raise InvalidInput(
                 f"{position} is {size} characters long: "
                 f"at most {max_item_chars} are accepted per entry"
             )
@@ -108,7 +124,7 @@ def validate_batch(
         # why the message names where the ceiling was reached, not the (then
         # unknown) full size.
         if total > max_payload_chars:
-            raise ValueError(
+            raise InvalidInput(
                 f"{label} is larger than {max_payload_chars} characters in total "
                 f"(the limit is reached at {position})"
             )

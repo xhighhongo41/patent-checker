@@ -25,6 +25,9 @@ from patent_checker.ops.client import OpsClient, parse_throttling_header
 from patent_checker.ops.parse import parse_search_xml
 from patent_checker.pubnum import parse_pubnum
 
+# Name of the OPS request log written by OpsClient and read by usage_report().
+OPS_HEADERS_FILENAME = "headers.jsonl"
+
 # Representative-country priority used by dedup_families() when more than one
 # family member could serve as the representative record. This is the v0.2
 # default: it favors jurisdictions whose publications more often carry an
@@ -250,6 +253,27 @@ def search_plan_check(
         return _run_search_plan_check(queries, owned_client, max_total, cache, refresh)
 
 
+def ops_headers_path(data_base: Path | None = None) -> Path:
+    """Return the OPS request log's path under a data directory.
+
+    One place answers "where is ``headers.jsonl``?" for every front end: the
+    CLI and :func:`usage_report` resolve the current data directory
+    themselves, while the MCP server passes the data directory of the server
+    it is reporting on.
+
+    Args:
+        data_base: Data directory to build the path under. When ``None``, the
+            current process' data directory is used (and its ``raw/ops``
+            subdirectory is created, like every other raw-data path).
+
+    Returns:
+        ``<data_base>/raw/ops/headers.jsonl``.
+    """
+    if data_base is None:
+        return data_dir("ops") / OPS_HEADERS_FILENAME
+    return data_base / "raw" / "ops" / OPS_HEADERS_FILENAME
+
+
 def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
     """Summarize an OPS request-header log (``headers.jsonl``).
 
@@ -257,9 +281,9 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
     :meth:`patent_checker.ops.client.OpsClient._log_headers`:
     ``{"at": ISO8601 str, "kind": str, "url": str, "status": int,
     "throttling": str}``. When *headers_path* is omitted, the log at
-    ``data_dir("ops") / "headers.jsonl"`` (the same path OpsClient writes to)
-    is used. A line that is not valid JSON, or that is valid JSON but not an
-    object, is skipped and counted in ``"skipped_lines"`` rather than
+    :func:`ops_headers_path` (the same path OpsClient writes to) is used. A
+    line that is not valid JSON, or that is valid JSON but not an object, is
+    skipped and counted in ``"skipped_lines"`` rather than
     raising; so is a field whose value has an unexpected type (a numeric
     ``"at"``, for instance, simply counts towards no day).
 
@@ -273,7 +297,7 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
         "YYYY-MM-DD" (local), "total_requests": int, "by_kind": {...}},
         "skipped_lines": int}``.
     """
-    path = headers_path if headers_path is not None else data_dir("ops") / "headers.jsonl"
+    path = headers_path if headers_path is not None else ops_headers_path()
     if not path.exists():
         return {"available": False, "path": str(path)}
 

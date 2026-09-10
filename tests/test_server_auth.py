@@ -19,6 +19,7 @@ import httpx
 import pytest
 from fastmcp.server.auth import AccessToken
 
+import patent_checker
 from patent_checker import config
 from patent_checker.cache import Cache
 from patent_checker.config import ConfigError
@@ -355,6 +356,22 @@ def test_health_is_reachable_without_a_token(
     assert set(body) == {"status", "version", "transport"}
     assert body["status"] == "ok"
     assert body["transport"] == "http"
+
+
+def test_health_reports_the_package_version(
+    http_settings: ServerSettings, state: ServerState
+) -> None:
+    """``/health`` names the version the package itself reports.
+
+    ``--version``, the startup banner, ``server_status`` and this route all
+    read ``patent_checker.__version__``, so a client cannot be told two
+    different versions by the same process.
+    """
+    app = build_http_app(http_settings, state=state)
+
+    response = _get(app)
+
+    assert response.json()["version"] == patent_checker.__version__
 
 
 def test_health_still_enforces_the_host_guard(
