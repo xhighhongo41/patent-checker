@@ -854,9 +854,11 @@ def test_biblio_persists_exactly_one_body_file(
         and path.name != "headers.jsonl"
     ]
     assert body_files == [cache.content_path("biblio", pub_key("US.11468338.B2"))]
-    # The request itself is still logged, exactly once.
+    # The biblio request itself is still logged exactly once, next to the one
+    # token request the client needed to make it.
     headers_log = tmp_path / "raw" / "ops" / "headers.jsonl"
-    assert len(headers_log.read_text(encoding="utf-8").splitlines()) == 1
+    logged = [json.loads(line) for line in headers_log.read_text(encoding="utf-8").splitlines()]
+    assert [record["kind"] for record in logged] == ["token", "biblio"]
 
 
 # --- refresh ---------------------------------------------------------------
@@ -980,3 +982,183 @@ def test_refresh_on_the_gp_route_forces_a_new_download(
     service.claims("US11468338B2", cache=cache, refresh=True)
 
     assert calls == [{"cache": cache, "force": True}]
+
+
+# --- batch size limits ---------------------------------------------------
+
+
+def _boom_parse(*args: Any, **kwargs: Any) -> Any:
+    """Parser stand-in for a body that turns out to be unparseable."""
+    raise ValueError("unparseable body")
+
+
+def test_dedup_rejects_more_records_than_the_batch_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dedup call cannot ask for unbounded work."""
+    monkeypatch.setattr(service, "dedup_families", _explode)
+    hits = [{"pub": "US.1.A1", "family_id": "1"}] * (service.MAX_BATCH_RECORDS + 1)
+
+    with pytest.raises(ValueError, match="10000"):
+        service.dedup(hits)
+
+
+def test_dedup_accepts_exactly_the_batch_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The limit itself is allowed: only going past it is refused."""
+    monkeypatch.setattr(service, "dedup_families", lambda hits: [])
+    hits = [{"pub": "US.1.A1", "family_id": "1"}] * service.MAX_BATCH_RECORDS
+
+    assert service.dedup(hits) == {"families": [], "count": 0}
+
+
+def test_verify_rejects_too_many_input_pubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The input list of verify is bounded by the same limit."""
+    monkeypatch.setattr(service, "verify_batch", _explode)
+    pubs = ["US.1.A1"] * (service.MAX_BATCH_RECORDS + 1)
+
+    with pytest.raises(ValueError, match="10000"):
+        service.verify(pubs, ["US.1.A1"])
+
+
+def test_verify_rejects_too_many_output_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The output list of verify is bounded too."""
+    monkeypatch.setattr(service, "verify_batch", _explode)
+    records = ["US.1.A1"] * (service.MAX_BATCH_RECORDS + 1)
+
+    with pytest.raises(ValueError, match="10000"):
+        service.verify(["US.1.A1"], records)
+
+
+def test_verify_accepts_exactly_the_batch_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both lists may be exactly as long as the limit."""
+    monkeypatch.setattr(service, "verify_batch", lambda inputs, outputs: {"ok": True})
+    pubs = ["US.1.A1"] * service.MAX_BATCH_RECORDS
+
+    assert service.verify(pubs, pubs) == {"ok": True}
+
+
+# --- a body that cannot be parsed is not cached --------------------------
+
+
+def test_search_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A search response the parser rejects is not kept on disk."""
+    monkeypatch.setattr(service, "parse_search_xml", _boom_parse)
+    stub = _StubOpsClient(search=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.search("ti=drone", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_search_biblio_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A biblio-constituent search response the parser rejects is not kept on disk."""
+    monkeypatch.setattr(service, "parse_search_biblio_xml", _boom_parse)
+    stub = _StubOpsClient(search_biblio=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.search_biblio("ti=drone", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_biblio_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A biblio response the parser rejects is not kept on disk (biblio never expires)."""
+    monkeypatch.setattr(service, "parse_biblio_xml", _boom_parse)
+    stub = _StubOpsClient(biblio=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.biblio("US.1.A1", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_legal_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A legal-status response the parser rejects is not kept on disk."""
+    monkeypatch.setattr(service, "parse_legal_xml", _boom_parse)
+    stub = _StubOpsClient(legal=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.legal("US.1.A1", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_family_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A family response the parser rejects is not kept on disk."""
+    monkeypatch.setattr(service, "parse_family_xml", _boom_parse)
+    stub = _StubOpsClient(family=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.family("US.1.A1", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_claims_ops_fulltext_does_not_cache_an_unparseable_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OPS full-text claims body the parser rejects is not kept on disk."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    monkeypatch.setattr(service, "parse_claims_xml", _boom_parse)
+    stub = _StubOpsClient(claims=b"<broken/>")
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    with pytest.raises(ValueError):
+        service.claims("EP1234567A1", client=stub, cache=cache)
+
+    assert cache.entries() == []
+
+
+def test_claims_gp_route_drops_a_page_that_cannot_be_parsed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A freshly downloaded page the parser rejects does not stay in the cache forever."""
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    def fake_fetch(pub: str, **kwargs: Any) -> FetchedPage:
+        # The fetcher stores the page before the service can parse it.
+        path = cache.put("gp", pub_key(pub), b"<html></html>", ident=pub)
+        return _fetched_page(path=path)
+
+    monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
+    monkeypatch.setattr(service, "parse_patent_html", _boom_parse)
+
+    with pytest.raises(ValueError):
+        service.claims("US11468338B2", cache=cache)
+
+    assert cache.get("gp", pub_key("US11468338B2")) is None
+    assert cache.entries() == []
+
+
+def test_claims_gp_route_keeps_a_cached_page_the_parser_rejects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a page stored by this call is dropped; an entry served from cache is left alone."""
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+    path = cache.put("gp", pub_key("US11468338B2"), b"<html></html>", ident="US11468338B2")
+    monkeypatch.setattr(
+        service, "fetch_patent_html", lambda pub, **kwargs: _fetched_page(path=path, cached=True)
+    )
+    monkeypatch.setattr(service, "parse_patent_html", _boom_parse)
+
+    with pytest.raises(ValueError):
+        service.claims("US11468338B2", cache=cache)
+
+    assert cache.get("gp", pub_key("US11468338B2")) is not None

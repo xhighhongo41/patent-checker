@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
-from datetime import datetime, timedelta
+import threading
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -165,10 +167,32 @@ def test_is_fresh_false_for_unparseable_timestamp(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", EXPIRING_KINDS)
-def test_is_fresh_false_for_offset_aware_timestamp(kind: str) -> None:
-    """Cache timestamps are naive local time; an offset-aware one is not trusted."""
+def test_is_fresh_compares_an_offset_aware_timestamp_by_instant(kind: str) -> None:
+    """An offset-aware fetched_at (written since v1.0) is compared by instant."""
+    now = datetime(2026, 9, 2, 12, 0, 0, tzinfo=UTC)
+    fresh = (now - _ttl(kind) + timedelta(seconds=1)).isoformat(timespec="seconds")
+    stale = (now - _ttl(kind)).isoformat(timespec="seconds")
+
+    assert is_fresh(kind, fresh, now) is True
+    assert is_fresh(kind, stale, now) is False
+
+
+@pytest.mark.parametrize("kind", EXPIRING_KINDS)
+def test_is_fresh_mixes_an_aware_timestamp_with_a_naive_now(kind: str) -> None:
+    """A naive "now" is read as local time, so it can be compared with an aware entry."""
     now = datetime(2026, 9, 2, 12, 0, 0)
-    assert is_fresh(kind, "2026-09-02T11:59:00+09:00", now) is False
+    fresh = (now.astimezone(UTC) - _ttl(kind) + timedelta(seconds=1)).isoformat(timespec="seconds")
+    stale = (now.astimezone(UTC) - _ttl(kind)).isoformat(timespec="seconds")
+
+    assert is_fresh(kind, fresh, now) is True
+    assert is_fresh(kind, stale, now) is False
+
+
+@pytest.mark.parametrize("kind", EXPIRING_KINDS)
+def test_is_fresh_false_for_a_non_string_timestamp(kind: str) -> None:
+    """A sidecar whose fetched_at is a number is not trusted."""
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    assert is_fresh(kind, 1756800000, now) is False  # type: ignore[arg-type]
 
 
 def test_is_fresh_ttls_override_can_disable_expiry() -> None:
@@ -327,7 +351,7 @@ def test_put_then_get_roundtrips_content_and_metadata(tmp_path: Path) -> None:
     assert hit is not None
     assert hit.content == b"<xml/>"
     assert hit.ident == "EP1A1"
-    assert hit.fetched_at == "2026-09-02T10:30:00"
+    assert datetime.fromisoformat(hit.fetched_at) == fixed_now.astimezone(UTC)
     assert hit.path == tmp_path / "cache" / "ops" / "biblio" / "EP.1.A1.xml"
     assert hit.raw_path == str(hit.path)
     assert isinstance(hit.raw_path, str)
@@ -345,7 +369,9 @@ def test_put_writes_a_sidecar_with_the_five_expected_keys(tmp_path: Path) -> Non
     assert meta["kind"] == "legal"
     assert meta["key"] == "EP.1.A1"
     assert meta["ident"] == "EP1A1"
-    assert meta["fetched_at"] == "2026-09-02T10:30:00"
+    assert datetime.fromisoformat(meta["fetched_at"]) == datetime(2026, 9, 2, 10, 30, 0).astimezone(
+        UTC
+    )
     assert meta["size"] == len(b"<xml/>")
 
 
@@ -934,8 +960,12 @@ def test_stats_counts_bytes_expired_and_broken_per_kind(tmp_path: Path) -> None:
     assert stats["kinds"]["legal"]["expired"] == 1
     assert stats["kinds"]["legal"]["broken"] == 0
     assert stats["kinds"]["legal"]["bytes"] == len(b"<old/>") + len(b"<fresh/>")
-    assert stats["kinds"]["legal"]["oldest"] == "2026-09-01T12:00:00"
-    assert stats["kinds"]["legal"]["newest"] == "2026-09-01T13:00:00"
+    assert datetime.fromisoformat(stats["kinds"]["legal"]["oldest"]) == datetime(
+        2026, 9, 1, 12, 0, 0
+    ).astimezone(UTC)
+    assert datetime.fromisoformat(stats["kinds"]["legal"]["newest"]) == datetime(
+        2026, 9, 1, 13, 0, 0
+    ).astimezone(UTC)
     assert stats["kinds"]["biblio"]["entries"] == 1
     assert stats["kinds"]["biblio"]["broken"] == 1
     assert stats["kinds"]["biblio"]["bytes"] == 0
@@ -1219,3 +1249,539 @@ def test_remove_returns_total_count_and_bytes_across_several_entries(tmp_path: P
     assert result["removed"] == 4  # 2 bodies + 2 sidecars
     assert result["bytes"] == len(b"<one/>") + len(b"<two-x/>")
     assert cache.entries() == []
+
+
+# --- key validation ---------------------------------------------------------
+
+# Keys that must never reach the filesystem: they escape the kind directory or
+# carry characters the cache layout does not allow.
+BAD_KEYS: tuple[str, ...] = (
+    "",
+    "..",
+    "../escape",
+    "sub/dir",
+    "back\\slash",
+    "EP.1.A1\x00",
+    "with space",
+    "EP.1.A1;rm",
+)
+
+
+@pytest.mark.parametrize("key", BAD_KEYS)
+def test_put_rejects_a_key_outside_the_allowed_characters(tmp_path: Path, key: str) -> None:
+    """put() refuses a key that is not made of [A-Za-z0-9._-] characters."""
+    cache = Cache(tmp_path / "cache")
+
+    with pytest.raises(ValueError):
+        cache.put("biblio", key, b"<xml/>", ident="EP1A1")
+
+
+@pytest.mark.parametrize("key", BAD_KEYS)
+def test_get_rejects_a_key_outside_the_allowed_characters(tmp_path: Path, key: str) -> None:
+    """get() refuses the same keys put() refuses, so a lookup cannot escape either."""
+    cache = Cache(tmp_path / "cache")
+
+    with pytest.raises(ValueError):
+        cache.get("biblio", key)
+
+
+def test_put_refusing_a_bad_key_writes_nothing(tmp_path: Path) -> None:
+    """A rejected key leaves the cache tree untouched."""
+    cache = Cache(tmp_path / "cache")
+
+    with pytest.raises(ValueError):
+        cache.put("biblio", "../escape", b"<xml/>", ident="EP1A1")
+
+    assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize(
+    "pub", ["EP1234567A1", "US2024/0111636A1", "WO2020/123456A1", "JP2019123456A"]
+)
+def test_keys_produced_by_pub_key_are_accepted(tmp_path: Path, pub: str) -> None:
+    """Every key pub_key() produces passes the key check."""
+    cache = Cache(tmp_path / "cache")
+
+    assert cache.put("biblio", pub_key(pub), b"<xml/>", ident=pub).is_file()
+
+
+def test_keys_produced_by_search_key_are_accepted(tmp_path: Path) -> None:
+    """Every key search_key() produces passes the key check."""
+    cache = Cache(tmp_path / "cache")
+    key = search_key("ti=drone and pd within 2020", 1, 25)
+
+    assert cache.put("search", key, b"<xml/>", ident="ti=drone").is_file()
+
+
+# --- temporary file names ----------------------------------------------------
+
+
+def test_put_uses_a_unique_temporary_name_per_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The temp sibling carries the pid and a random part, so two writers cannot collide."""
+    seen: list[str] = []
+    real_write_bytes = Path.write_bytes
+
+    def spy(self: Path, data: bytes) -> int:
+        seen.append(self.name)
+        return real_write_bytes(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", spy)
+    cache = Cache(tmp_path / "cache")
+
+    cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+    cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+
+    tmp_names = [name for name in seen if name.endswith(".tmp")]
+    assert len(tmp_names) == 4  # two bodies and two sidecars
+    assert len(set(tmp_names)) == 4
+    assert all(str(os.getpid()) in name for name in tmp_names)
+    assert all(name.startswith(("EP.1.A1.xml.", "EP.1.A1.meta.json.")) for name in tmp_names)
+
+
+def test_concurrent_put_of_the_same_key_leaves_a_consistent_entry(tmp_path: Path) -> None:
+    """Two threads writing the same key never fail and leave one readable entry."""
+    cache = Cache(tmp_path / "cache")
+    payloads = (b"A" * 64, b"B" * 64)
+    rounds = 200
+    start = threading.Barrier(len(payloads))
+    failures: list[BaseException] = []
+
+    def writer(payload: bytes) -> None:
+        start.wait(timeout=30)
+        try:
+            for _ in range(rounds):
+                cache.put("biblio", "EP.1.A1", payload, ident="EP1A1")
+        except BaseException as exc:  # noqa: BLE001 - reported through the assertion below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(payload,)) for payload in payloads]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert failures == []
+    assert all(not thread.is_alive() for thread in threads)
+    hit = cache.get("biblio", "EP.1.A1")
+    assert hit is not None
+    assert hit.content in payloads
+    (entry,) = cache.entries("biblio")
+    assert entry.broken is False
+    assert list((tmp_path / "cache").rglob("*.tmp")) == []
+
+
+def test_entries_reports_a_stray_tmp_file_written_with_a_unique_name(tmp_path: Path) -> None:
+    """A leftover temp file with the new pid/random name is still a "stray tmp file"."""
+    cache = Cache(tmp_path / "cache")
+    content_dir = tmp_path / "cache" / "ops" / "biblio"
+    content_dir.mkdir(parents=True)
+    (content_dir / "EP.1.A1.xml.4321.0a1b2c3d.tmp").write_bytes(b"<half")
+
+    (entry,) = cache.entries("biblio")
+
+    assert entry.key == "EP.1.A1"
+    assert entry.broken is True
+    assert entry.problem == "stray tmp file"
+
+
+def test_remove_deletes_a_stray_tmp_file_written_with_a_unique_name(tmp_path: Path) -> None:
+    """remove() cleans up temp leftovers whatever their unique suffix is."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+    kind_dir = tmp_path / "cache" / "ops" / "biblio"
+    body_tmp = kind_dir / "EP.1.A1.xml.4321.0a1b2c3d.tmp"
+    meta_tmp = kind_dir / "EP.1.A1.meta.json.4321.0a1b2c3d.tmp"
+    body_tmp.write_bytes(b"<half")
+    meta_tmp.write_text('{"kind"', encoding="utf-8")
+
+    result = cache.remove(cache.entries("biblio"))
+
+    assert not body_tmp.exists()
+    assert not meta_tmp.exists()
+    assert result["errors"] == []
+    assert list(kind_dir.iterdir()) == []
+
+
+# --- listing races -----------------------------------------------------------
+
+
+def test_entries_survives_a_body_deleted_between_listing_and_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body removed by another process after the listing is reported, not raised."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+    body = cache.content_path("biblio", "EP.1.A1")
+    real_stat = Path.stat
+    deleted: list[Path] = []
+
+    def stat_after_deleting(self: Path, **kwargs: object) -> os.stat_result:
+        # Delete the body on the first stat of it, reproducing a concurrent
+        # ``clean`` between iterdir() and stat().
+        if self == body and not deleted:
+            deleted.append(body)
+            body.unlink()
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_after_deleting)
+
+    (entry,) = cache.entries("biblio")
+
+    assert entry.size == 0
+    assert entry.broken is True
+    assert entry.problem == "missing body"
+
+
+def test_stats_and_select_survive_a_body_deleted_between_listing_and_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same race does not break stats() or select() either."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+    body = cache.content_path("biblio", "EP.1.A1")
+    real_stat = Path.stat
+    deleted: list[Path] = []
+
+    def stat_after_deleting(self: Path, **kwargs: object) -> os.stat_result:
+        if self == body and not deleted:
+            deleted.append(body)
+            body.unlink()
+        return real_stat(self, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_after_deleting)
+
+    stats = cache.stats()
+    selected = cache.select(broken=True)
+
+    assert stats["kinds"]["biblio"]["broken"] == 1
+    assert stats["kinds"]["biblio"]["bytes"] == 0
+    assert [entry.key for entry in selected] == ["EP.1.A1"]
+
+
+# --- fetched_at is stored as UTC ---------------------------------------------
+
+
+def test_put_records_fetched_at_as_an_offset_aware_utc_timestamp(tmp_path: Path) -> None:
+    """A sidecar written since v1.0 carries UTC, so a TZ change cannot shift it."""
+    fixed_now = datetime(2026, 9, 2, 10, 30, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: fixed_now)
+
+    cache.put("legal", "EP.1.A1", b"<xml/>", ident="EP1A1")
+
+    meta = json.loads(cache.meta_path("legal", "EP.1.A1").read_text(encoding="utf-8"))
+    assert meta["fetched_at"].endswith("+00:00")
+    assert datetime.fromisoformat(meta["fetched_at"]) == fixed_now.astimezone(UTC)
+
+
+def test_put_keeps_an_already_aware_clock_in_utc(tmp_path: Path) -> None:
+    """An offset-aware clock is converted to UTC rather than stored as given."""
+    fixed_now = datetime(2026, 9, 2, 10, 30, 0, tzinfo=UTC)
+    cache = Cache(tmp_path / "cache", clock=lambda: fixed_now)
+
+    cache.put("legal", "EP.1.A1", b"<xml/>", ident="EP1A1")
+
+    meta = json.loads(cache.meta_path("legal", "EP.1.A1").read_text(encoding="utf-8"))
+    assert meta["fetched_at"] == "2026-09-02T10:30:00+00:00"
+
+
+def test_get_still_reads_a_naive_sidecar_written_before_v1_0(tmp_path: Path) -> None:
+    """A naive fetched_at is read as local time, so pre-v1.0 entries keep working."""
+    clock_value = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    content_dir = tmp_path / "cache" / "ops" / "legal"
+    content_dir.mkdir(parents=True)
+    (content_dir / "EP.1.A1.xml").write_bytes(b"<xml/>")
+    (content_dir / "EP.1.A1.meta.json").write_text(
+        json.dumps(
+            {
+                "kind": "legal",
+                "key": "EP.1.A1",
+                "ident": "EP1A1",
+                "fetched_at": "2026-09-01T10:00:00",
+                "size": len(b"<xml/>"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    hit = cache.get("legal", "EP.1.A1")
+
+    assert hit is not None
+    assert hit.fetched_at == "2026-09-01T10:00:00"
+
+
+def test_ttl_is_evaluated_the_same_for_naive_and_aware_sidecars(tmp_path: Path) -> None:
+    """The naive (pre-v1.0) and the aware (v1.0) spellings expire at the same moment."""
+    written_at = datetime(2026, 9, 2, 10, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("legal", "EP.AWARE.A1", b"<xml/>", ident="aware")
+    naive_dir = tmp_path / "cache" / "ops" / "legal"
+    (naive_dir / "EP.NAIVE.A1.xml").write_bytes(b"<xml/>")
+    (naive_dir / "EP.NAIVE.A1.meta.json").write_text(
+        json.dumps(
+            {
+                "kind": "legal",
+                "key": "EP.NAIVE.A1",
+                "ident": "naive",
+                "fetched_at": written_at.isoformat(timespec="seconds"),
+                "size": len(b"<xml/>"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    legal_ttl = _ttl("legal")
+
+    clock_value = written_at + legal_ttl - timedelta(seconds=1)
+    assert cache.get("legal", "EP.AWARE.A1") is not None
+    assert cache.get("legal", "EP.NAIVE.A1") is not None
+
+    clock_value = written_at + legal_ttl
+    assert cache.get("legal", "EP.AWARE.A1") is None
+    assert cache.get("legal", "EP.NAIVE.A1") is None
+
+
+# --- select() time handling and shortcuts ------------------------------------
+
+
+def test_select_older_than_handles_an_offset_aware_timestamp(tmp_path: Path) -> None:
+    """An aware fetched_at is compared by instant instead of raising TypeError."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    content_dir = tmp_path / "cache" / "ops" / "biblio"
+    content_dir.mkdir(parents=True)
+    (content_dir / "EP.1.A1.xml").write_bytes(b"<xml/>")
+    (content_dir / "EP.1.A1.meta.json").write_text(
+        json.dumps(
+            {
+                "kind": "biblio",
+                "key": "EP.1.A1",
+                "ident": "EP1A1",
+                "fetched_at": "2026-09-01T20:00:00+09:00",  # 11:00 UTC
+                "size": len(b"<xml/>"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    clock_value = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+    selected = cache.select(kinds=["biblio"], older_than=timedelta(minutes=59))
+    too_young = cache.select(kinds=["biblio"], older_than=timedelta(minutes=61))
+
+    assert [entry.key for entry in selected] == ["EP.1.A1"]
+    assert too_young == []
+
+
+def test_select_older_than_ignores_a_non_string_timestamp(tmp_path: Path) -> None:
+    """A numeric fetched_at is not trusted, and does not raise TypeError."""
+    cache = Cache(tmp_path / "cache")
+    content_dir = tmp_path / "cache" / "ops" / "biblio"
+    content_dir.mkdir(parents=True)
+    (content_dir / "EP.1.A1.xml").write_bytes(b"<xml/>")
+    (content_dir / "EP.1.A1.meta.json").write_text(
+        json.dumps(
+            {
+                "kind": "biblio",
+                "key": "EP.1.A1",
+                "ident": "EP1A1",
+                "fetched_at": 1756800000,
+                "size": len(b"<xml/>"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert cache.select(kinds=["biblio"], older_than=timedelta(seconds=0)) == []
+    assert cache.entries("biblio")[0].expired is True
+
+
+def _explode_for_kind(self: Cache, kind: str) -> list[CacheEntry]:
+    """Stand-in for _entries_for_kind that must not be called."""
+    raise AssertionError(f"_entries_for_kind called for {kind!r}")
+
+
+def test_select_pub_does_not_list_every_kind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pub filter stats the candidate paths instead of walking every kind directory."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", pub_key("EP1234567A1"), b"<biblio/>", ident="EP1234567A1")
+    cache.put("legal", pub_key("EP1234567A1"), b"<legal/>", ident="EP1234567A1")
+    cache.put("search", "abc123", b"<search/>", ident="ti=drone")
+    monkeypatch.setattr(Cache, "_entries_for_kind", _explode_for_kind)
+
+    selected = cache.select(pub="EP1234567A1")
+
+    assert {(entry.kind, entry.key) for entry in selected} == {
+        ("biblio", "EP.1234567.A1"),
+        ("legal", "EP.1234567.A1"),
+    }
+
+
+def test_select_pub_still_honours_the_other_filters(tmp_path: Path) -> None:
+    """The pub shortcut applies the kinds, expired and broken filters as before."""
+    clock_value = datetime(2026, 9, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("biblio", pub_key("EP1234567A1"), b"<biblio/>", ident="EP1234567A1")
+    cache.put("legal", pub_key("EP1234567A1"), b"<legal/>", ident="EP1234567A1")
+
+    clock_value = datetime(2026, 9, 1, 12, 0, 0) + _ttl("legal") + timedelta(seconds=1)
+
+    assert [e.kind for e in cache.select(pub="EP1234567A1", kinds=["legal"])] == ["legal"]
+    assert [e.kind for e in cache.select(pub="EP1234567A1", expired=True)] == ["legal"]
+    assert cache.select(pub="EP7654321A1") == []
+
+
+def test_select_pub_reports_a_broken_entry_of_that_publication(tmp_path: Path) -> None:
+    """The shortcut finds an entry whose body is gone, exactly as a full listing would."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", pub_key("EP1234567A1"), b"<biblio/>", ident="EP1234567A1")
+    cache.content_path("biblio", pub_key("EP1234567A1")).unlink()
+
+    (entry,) = cache.select(pub="EP1234567A1", broken=True)
+
+    assert entry.problem == "missing body"
+    assert entry.size == 0
+
+
+# --- eviction throttling -----------------------------------------------------
+
+
+def test_eviction_is_skipped_shortly_after_the_previous_sweep(tmp_path: Path) -> None:
+    """A second put() within a minute does not walk the kind directory again."""
+    clock_value = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(
+        tmp_path / "cache", ttls={"search": timedelta(seconds=1)}, clock=lambda: clock_value
+    )
+    cache.put("search", "aaa111", b"<first/>", ident="ti=first")
+
+    clock_value = datetime(2026, 9, 2, 10, 0, 30)
+    cache.put("search", "bbb222", b"<second/>", ident="ti=second")
+
+    assert cache.content_path("search", "aaa111").is_file()
+
+
+def test_eviction_runs_again_once_the_interval_has_passed(tmp_path: Path) -> None:
+    """Once a minute has passed, the next put() sweeps the expired entries away."""
+    clock_value = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(
+        tmp_path / "cache", ttls={"search": timedelta(seconds=1)}, clock=lambda: clock_value
+    )
+    cache.put("search", "aaa111", b"<first/>", ident="ti=first")
+
+    clock_value = datetime(2026, 9, 2, 10, 0, 30)
+    cache.put("search", "bbb222", b"<second/>", ident="ti=second")
+
+    clock_value = datetime(2026, 9, 2, 10, 1, 30)
+    cache.put("search", "ccc333", b"<third/>", ident="ti=third")
+
+    assert not cache.content_path("search", "aaa111").exists()
+    assert not cache.content_path("search", "bbb222").exists()
+    assert cache.content_path("search", "ccc333").is_file()
+
+
+def test_eviction_throttling_is_per_kind(tmp_path: Path) -> None:
+    """A sweep of one search kind does not silence the other one."""
+    clock_value = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(
+        tmp_path / "cache",
+        ttls={"search": timedelta(seconds=1), "searchbib": timedelta(seconds=1)},
+        clock=lambda: clock_value,
+    )
+    cache.put("searchbib", "aaa111", b"<first/>", ident="ti=first")
+
+    clock_value = datetime(2026, 9, 2, 10, 1, 10)
+    cache.put("search", "bbb222", b"<second/>", ident="ti=second")
+    cache.put("searchbib", "ccc333", b"<third/>", ident="ti=third")
+
+    assert not cache.content_path("searchbib", "aaa111").exists()
+
+
+def test_first_put_of_a_new_cache_always_evicts(tmp_path: Path) -> None:
+    """Throttling never suppresses the first sweep of a freshly built Cache."""
+    clock_value = datetime(2026, 9, 2, 10, 0, 0)
+    first = Cache(
+        tmp_path / "cache", ttls={"search": timedelta(seconds=1)}, clock=lambda: clock_value
+    )
+    first.put("search", "aaa111", b"<first/>", ident="ti=first")
+
+    clock_value = datetime(2026, 9, 2, 10, 0, 30)
+    second = Cache(
+        tmp_path / "cache", ttls={"search": timedelta(seconds=1)}, clock=lambda: clock_value
+    )
+    second.put("search", "bbb222", b"<second/>", ident="ti=second")
+
+    assert not first.content_path("search", "aaa111").exists()
+
+
+# --- quick_counts ------------------------------------------------------------
+
+
+def test_quick_counts_reports_a_zero_for_every_kind_on_an_empty_cache(tmp_path: Path) -> None:
+    """quick_counts() names every kind even when nothing has been written."""
+    counts = Cache(tmp_path / "cache").quick_counts()
+
+    assert counts == dict.fromkeys(cache_mod.KINDS, 0)
+
+
+def test_quick_counts_counts_the_sidecars_of_each_kind(tmp_path: Path) -> None:
+    """Each kind is counted in its own root and directory."""
+    cache = Cache(tmp_path / "shared", tmp_path / "local")
+    cache.put("biblio", "EP.1.A1", b"<biblio/>", ident="EP1A1")
+    cache.put("biblio", "EP.2.A1", b"<biblio/>", ident="EP2A1")
+    cache.put("gp", "US.1.A1", b"<html/>", ident="US1A1")
+    cache.put("search", "abc123", b"<search/>", ident="ti=drone")
+
+    counts = cache.quick_counts()
+
+    assert counts["biblio"] == 2
+    assert counts["gp"] == 1
+    assert counts["search"] == 1
+    assert counts["legal"] == 0
+
+
+def test_quick_counts_ignores_bodies_and_temporary_files(tmp_path: Path) -> None:
+    """Only sidecars are counted, so half-written entries do not inflate the total."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "EP.1.A1", b"<biblio/>", ident="EP1A1")
+    content_dir = tmp_path / "cache" / "ops" / "biblio"
+    (content_dir / "EP.2.A1.xml").write_bytes(b"<orphan/>")
+    (content_dir / "EP.3.A1.meta.json.4321.0a1b2c3d.tmp").write_text("{", encoding="utf-8")
+
+    assert cache.quick_counts()["biblio"] == 1
+
+
+def test_quick_counts_does_not_read_any_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """quick_counts() only lists directory entries: no JSON is parsed."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("biblio", "EP.1.A1", b"<biblio/>", ident="EP1A1")
+
+    def no_reading(*args: object, **kwargs: object) -> object:
+        raise AssertionError("quick_counts() must not open cache files")
+
+    monkeypatch.setattr(Path, "read_text", no_reading)
+    monkeypatch.setattr(Path, "read_bytes", no_reading)
+    monkeypatch.setattr(Path, "open", no_reading)
+
+    assert cache.quick_counts()["biblio"] == 1
+
+
+# --- compatibility names -----------------------------------------------------
+
+
+def test_v0_3_compatibility_names_say_so_in_their_docstrings() -> None:
+    """The names kept only for v0.3 callers document that they are not used here."""
+    note = "kept for v0.3 compatibility; not used by the package itself"
+    docs = [cache_mod.Cache.base.__doc__, cache_mod.CacheHit.raw_path.__doc__]
+    assert all(doc is not None and note in " ".join(doc.split()) for doc in docs)
+
+    # A module-level constant has no runtime docstring, so its comment block
+    # is checked in the source instead.
+    source = Path(cache_mod.__file__).read_text(encoding="utf-8")
+    declaration = source.index("NO_EXPIRY_KINDS: frozenset")
+    comment_block = source[:declaration].rsplit("\n\n", 1)[-1]
+    assert note in " ".join(comment_block.replace("#", " ").split())

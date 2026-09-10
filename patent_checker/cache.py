@@ -66,19 +66,25 @@ Durability
 
 Both files are written to a ``.tmp`` sibling and moved into place with
 ``os.replace``, so a crash mid-write can leave a stray ``.tmp`` file but
-never a truncated body or sidecar in place of a previously good entry.
+never a truncated body or sidecar in place of a previously good entry. The
+temporary name carries the writer's process id and a random part, so the
+CLI and the server writing the same key at the same time cannot take each
+other's file away; the body is moved into place before the sidecar, so a
+sidecar is never newer than the body it describes.
 :meth:`Cache.get` additionally verifies the body against the ``size``
 recorded in the sidecar, so a body damaged after the fact is reported as a
 miss rather than served as a short response; the next :meth:`Cache.put`
 replaces both files and restores a normal hit.
 
 The sidecar carries ``kind``, ``key``, ``ident``, ``fetched_at`` and
-``size``. Sidecars written by v0.3 instead carry a ``raw_path`` and no
+``size``. ``fetched_at`` is written as an offset-aware UTC timestamp since
+v1.0; the naive local timestamps written before that are still read, as
+local time. Sidecars written by v0.3 instead carry a ``raw_path`` and no
 ``size``; they are still read, simply without the size check.
 
-Search entries are the only ones that accumulate without bound, so every
+Search entries are the only ones that accumulate without bound, so a
 :meth:`Cache.put` of a search-keyed kind also removes the expired entries
-sitting in that kind's directory.
+sitting in that kind's directory, at most once a minute per kind.
 """
 
 from __future__ import annotations
@@ -86,9 +92,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import uuid
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -122,7 +130,9 @@ DEFAULT_TTLS: dict[str, timedelta | None] = {
     "searchbib": timedelta(days=1),
 }
 
-# Kinds whose default policy is "never expires".
+# Kinds whose default policy is "never expires". This name is kept for v0.3
+# compatibility; not used by the package itself, which reads DEFAULT_TTLS
+# directly.
 NO_EXPIRY_KINDS: frozenset[str] = frozenset(
     kind for kind, ttl in DEFAULT_TTLS.items() if ttl is None
 )
@@ -134,8 +144,26 @@ _REQUIRED_META_FIELDS: tuple[str, ...] = ("kind", "key", "ident", "fetched_at")
 # Suffix of the sidecar file, relative to the key.
 _META_SUFFIX = ".meta.json"
 
-# Suffix of the half-written file a ``put`` moves into place.
+# Suffix of the half-written file a ``put`` moves into place. The name in
+# front of it is ``<final name>.<pid>.<random>``, so two writers of the same
+# key cannot pick the same temporary file.
 _TMP_SUFFIX = ".tmp"
+
+# The ``.<pid>.<random>`` part of a temporary name, stripped to recover the
+# final name the file was being written for.
+_TMP_INFIX_RE = re.compile(r"\.\d+\.[0-9a-f]+\Z")
+
+# Characters a cache key may be made of. Keys become file names, so anything
+# that could escape the kind directory (a separator, ``..``) is refused.
+_KEY_RE = re.compile(r"[A-Za-z0-9._-]+\Z")
+
+# Keys that are made of allowed characters but still name a directory.
+_RESERVED_KEYS: frozenset[str] = frozenset({".", ".."})
+
+# How long a search-kind ``put`` may skip the sweep for expired entries of
+# that kind. Sweeping on every put costs one directory walk per upstream
+# call; once a minute is enough to keep the directory bounded.
+_EVICT_INTERVAL = timedelta(seconds=60)
 
 
 @dataclass(frozen=True)
@@ -144,8 +172,9 @@ class CacheHit:
 
     Attributes:
         content: The cached response body.
-        fetched_at: ISO 8601 local timestamp recorded when the entry was
-            written (seconds precision).
+        fetched_at: ISO 8601 timestamp recorded when the entry was written
+            (seconds precision). Written as UTC since v1.0; entries written
+            earlier carry naive local time.
         ident: The human-readable identifier (CQL query or publication
             number) the entry was written with.
         path: The cache body file this entry was read from.
@@ -158,7 +187,11 @@ class CacheHit:
 
     @property
     def raw_path(self) -> str:
-        """Return the body file as a string: the only copy kept on disk."""
+        """Return the body file as a string: the only copy kept on disk.
+
+        This name is kept for v0.3 compatibility; not used by the package
+        itself, which reads :attr:`path`.
+        """
         return str(self.path)
 
 
@@ -236,6 +269,35 @@ def _check_kind(kind: str) -> None:
         raise ValueError(f"unknown cache kind: {kind!r}")
 
 
+def _check_key(key: str) -> None:
+    """Raise ``ValueError`` unless *key* is a safe file name.
+
+    A key becomes a file name inside the kind directory, so only the
+    characters :func:`pub_key` and :func:`search_key` produce are accepted
+    (``A-Z``, ``a-z``, ``0-9``, ``.``, ``_`` and ``-``), and a key naming a
+    directory (``.``, ``..``) is refused as well.
+    """
+    if not isinstance(key, str) or _KEY_RE.fullmatch(key) is None or key in _RESERVED_KEYS:
+        raise ValueError(f"invalid cache key: {key!r}")
+
+
+def _as_aware(moment: datetime) -> datetime:
+    """Return *moment* as an offset-aware datetime, reading a naive one as local time."""
+    return moment if moment.tzinfo is not None else moment.astimezone()
+
+
+def _parse_timestamp(value: Any) -> datetime | None:
+    """Return *value* as an offset-aware datetime, or ``None`` if it is not a timestamp.
+
+    Naive values (every sidecar written before v1.0) are read as local
+    time, which is how they were written.
+    """
+    try:
+        return _as_aware(datetime.fromisoformat(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def kind_subdir(kind: str) -> Path:
     """Return the directory of *kind* relative to its root.
 
@@ -282,10 +344,12 @@ def is_fresh(
 
     Args:
         kind: One of :data:`KINDS`.
-        fetched_at: ISO 8601 timestamp the entry was written with. A value
-            that cannot be parsed, or that carries a UTC offset (cache
-            timestamps are naive local time), counts as expired.
-        now: The moment freshness is evaluated at.
+        fetched_at: ISO 8601 timestamp the entry was written with. It may
+            be offset-aware (written since v1.0) or naive (written earlier,
+            and read as local time); a value that cannot be parsed counts
+            as expired.
+        now: The moment freshness is evaluated at. A naive value is read as
+            local time, like a naive *fetched_at*.
         ttls: Per-kind TTL overrides. Kinds missing from it, and every kind
             when it is ``None``, fall back to :data:`DEFAULT_TTLS`.
 
@@ -297,13 +361,11 @@ def is_fresh(
     ttl = effective.get(kind, DEFAULT_TTLS[kind])
     if ttl is None:
         return True
-    try:
-        fetched_at_dt = datetime.fromisoformat(fetched_at)
-        return fetched_at_dt + ttl > now
-    except (TypeError, ValueError):
-        # A malformed timestamp, and an offset-aware one that cannot be
-        # compared with the naive local *now*, both mean "do not trust it".
+    fetched_at_dt = _parse_timestamp(fetched_at)
+    if fetched_at_dt is None:
+        # A malformed timestamp means "do not trust it".
         return False
+    return fetched_at_dt + ttl > _as_aware(now)
 
 
 def format_ttl(ttl: timedelta | None) -> str:
@@ -365,6 +427,9 @@ class Cache:
                 merged[kind] = ttl
         self._ttls: Mapping[str, timedelta | None] = MappingProxyType(merged)
         self._clock = clock
+        # When each kind was last swept for expired entries, so that a burst
+        # of puts does not walk the same directory over and over.
+        self._last_evicted_at: dict[str, datetime] = {}
 
     @property
     def shared(self) -> Path:
@@ -378,7 +443,12 @@ class Cache:
 
     @property
     def base(self) -> Path:
-        """Return the shared root (kept for callers written against v0.3)."""
+        """Return the shared root.
+
+        This name is kept for v0.3 compatibility; not used by the package
+        itself, which names the two roots explicitly through :attr:`shared`
+        and :attr:`local`.
+        """
         return self._shared
 
     @property
@@ -437,8 +507,10 @@ class Cache:
                 :func:`search_key`.
 
         Raises:
-            ValueError: If *kind* is not one of :data:`KINDS`.
+            ValueError: If *kind* is not one of :data:`KINDS`, or *key* is
+                not made of the characters a cache key may use.
         """
+        _check_key(key)
         content_path = self.content_path(kind, key)
         meta = self._read_meta(self.meta_path(kind, key))
         if meta is None:
@@ -473,10 +545,12 @@ class Cache:
     def put(self, kind: str, key: str, content: bytes, *, ident: str) -> Path:
         """Write *content* and its sidecar for *kind*/*key*, replacing any prior entry.
 
-        Both files are written to a ``.tmp`` sibling and moved into place
-        with ``os.replace``, so a crash mid-write cannot leave a good
-        sidecar pointing at a half-written body. For search-keyed kinds,
-        the expired entries of the same kind are removed afterwards.
+        Both files are written to a uniquely named ``.tmp`` sibling and
+        moved into place with ``os.replace``, body first, so a crash
+        mid-write cannot leave a good sidecar pointing at a half-written
+        body and two writers of the same key cannot collide. For
+        search-keyed kinds, the expired entries of the same kind are
+        removed afterwards, at most once a minute.
 
         Args:
             kind: One of :data:`KINDS`.
@@ -490,11 +564,15 @@ class Cache:
             The path of the written body file.
 
         Raises:
-            ValueError: If *kind* is not one of :data:`KINDS`.
+            ValueError: If *kind* is not one of :data:`KINDS`, or *key* is
+                not made of the characters a cache key may use.
             OSError: If the entry cannot be written.
         """
+        _check_key(key)
         content_path = self.content_path(kind, key)
         content_path.parent.mkdir(parents=True, exist_ok=True)
+        # The body goes in first: a reader that sees the sidecar then always
+        # sees a body at least as new as it.
         _replace_atomically(content_path, content)
 
         now = self._clock()
@@ -502,7 +580,9 @@ class Cache:
             "kind": kind,
             "key": key,
             "ident": ident,
-            "fetched_at": now.isoformat(timespec="seconds"),
+            # Stored as UTC so that a change of time zone (or of DST) cannot
+            # make an entry look younger or older than it is.
+            "fetched_at": _as_aware(now).astimezone(UTC).isoformat(timespec="seconds"),
             "size": len(content),
         }
         _replace_atomically(
@@ -592,9 +672,11 @@ class Cache:
                 whose age is at least *older_than* (``fetched_at +
                 older_than <= now``, so an entry exactly *older_than* old is
                 included). Entries with an unreadable sidecar never match.
-            pub: Keep only the entry keyed by this publication number
+            pub: Keep only the entries keyed by this publication number
                 (:func:`pub_key`); search-keyed kinds never match, since
-                their keys are not publication numbers.
+                their keys are not publication numbers. Filtering on *pub*
+                looks the candidate paths up directly instead of listing
+                every kind directory.
             expired: When ``True``, require the entry to be expired.
             broken: When ``True``, require the entry to be broken. When
                 both *expired* and *broken* are ``True``, an entry matches
@@ -611,20 +693,25 @@ class Cache:
                 _check_kind(one_kind)
         kind_set = set(kinds) if kinds is not None else None
         target_key = pub_key(pub) if pub is not None else None
-        now = self._clock()
+        now = _as_aware(self._clock())
+
+        if target_key is not None:
+            candidates = self._entries_for_key(target_key, kind_set)
+        else:
+            candidates = [
+                entry for entry in self.entries() if kind_set is None or entry.kind in kind_set
+            ]
 
         result: list[CacheEntry] = []
-        for entry in self.entries():
-            if kind_set is not None and entry.kind not in kind_set:
-                continue
-            if target_key is not None and entry.key != target_key:
-                continue
+        for entry in candidates:
             if older_than is not None:
                 if entry.fetched_at is None:
                     continue
-                try:
-                    fetched_at_dt = datetime.fromisoformat(entry.fetched_at)
-                except ValueError:
+                fetched_at_dt = _parse_timestamp(entry.fetched_at)
+                if fetched_at_dt is None:
+                    # A timestamp that cannot be read (malformed, or not a
+                    # string at all) is not trusted, so it never matches an
+                    # age filter; the entry is reported as broken instead.
                     continue
                 if fetched_at_dt + older_than > now:
                     continue
@@ -693,8 +780,8 @@ class Cache:
                 freed_bytes += entry.size
             for extra in (
                 entry.meta_path,
-                entry.path.with_name(entry.path.name + _TMP_SUFFIX),
-                entry.meta_path.with_name(entry.meta_path.name + _TMP_SUFFIX),
+                *_tmp_siblings(entry.path),
+                *_tmp_siblings(entry.meta_path),
             ):
                 if _remove_one(extra):
                     removed += 1
@@ -705,6 +792,56 @@ class Cache:
             "paths": removed_paths,
             "errors": errors,
         }
+
+    def quick_counts(self) -> dict[str, int]:
+        """Return the number of sidecars of every kind, without reading any of them.
+
+        This is the cheap counterpart of :meth:`stats`: it lists each kind's
+        directory once and counts sidecar names, so no JSON is parsed, no
+        body is stat'ed and nothing is sorted. A kind whose directory does
+        not exist yet counts ``0``.
+
+        Returns:
+            ``{kind: number of sidecars}`` for every kind of :data:`KINDS`.
+        """
+        counts: dict[str, int] = {}
+        for kind in KINDS:
+            kind_dir = self.root_for(kind) / kind_subdir(kind)
+            found = 0
+            try:
+                with os.scandir(kind_dir) as scan:
+                    for item in scan:
+                        # A ".meta.json.<pid>.<random>.tmp" leftover does not
+                        # end with the sidecar suffix, so it is not counted.
+                        if item.name.endswith(_META_SUFFIX):
+                            found += 1
+            except OSError:
+                found = 0
+            counts[kind] = found
+        return counts
+
+    def _entries_for_key(self, key: str, kind_set: set[str] | None) -> list[CacheEntry]:
+        """Return the entries stored under *key*, looked up path by path.
+
+        Only the publication-keyed kinds are considered: a search key is a
+        hash of a query, never a publication number.
+        """
+        found: list[CacheEntry] = []
+        for kind in PUB_KINDS:
+            if kind_set is not None and kind not in kind_set:
+                continue
+            kind_dir = self.root_for(kind) / kind_subdir(kind)
+            suffix = content_suffix(kind)
+            has_body = (kind_dir / f"{key}{suffix}").exists()
+            has_meta = (kind_dir / f"{key}{_META_SUFFIX}").exists()
+            if not has_body and not has_meta:
+                continue
+            root_name = "local" if kind in LOCAL_KINDS else "shared"
+            found.append(
+                self._build_entry(kind, key, kind_dir, suffix, root_name, has_body, has_meta)
+            )
+        found.sort(key=lambda entry: (entry.kind, entry.key))
+        return found
 
     def _read_meta(self, meta_path: Path) -> dict[str, Any] | None:
         """Return the sidecar at *meta_path* as a dict, or ``None`` if unusable."""
@@ -718,8 +855,14 @@ class Cache:
         """Delete the expired entries of *kind*, except the one keyed *keep*.
 
         Entries whose sidecar cannot be read are left alone: they may be
-        mid-write, and :meth:`get` already treats them as a miss.
+        mid-write, and :meth:`get` already treats them as a miss. The sweep
+        runs at most once per :data:`_EVICT_INTERVAL` per kind, so a burst
+        of puts costs one directory walk rather than one per put.
         """
+        last = self._last_evicted_at.get(kind)
+        if last is not None and _as_aware(now) - _as_aware(last) < _EVICT_INTERVAL:
+            return
+        self._last_evicted_at[kind] = now
         kind_dir = self.root_for(kind) / kind_subdir(kind)
         suffix = content_suffix(kind)
         try:
@@ -752,12 +895,12 @@ class Cache:
         body_tmp: set[str] = set()
         meta_tmp: set[str] = set()
         for name in names:
-            if name.endswith(_TMP_SUFFIX):
-                inner = name[: -len(_TMP_SUFFIX)]
-                if inner.endswith(_META_SUFFIX):
-                    meta_tmp.add(inner[: -len(_META_SUFFIX)])
-                elif inner.endswith(suffix):
-                    body_tmp.add(inner[: -len(suffix)])
+            target = _tmp_target_name(name)
+            if target is not None:
+                if target.endswith(_META_SUFFIX):
+                    meta_tmp.add(target[: -len(_META_SUFFIX)])
+                elif target.endswith(suffix):
+                    body_tmp.add(target[: -len(suffix)])
                 continue
             if name.endswith(_META_SUFFIX):
                 metas.add(name[: -len(_META_SUFFIX)])
@@ -767,7 +910,8 @@ class Cache:
         root_name = "local" if kind in LOCAL_KINDS else "shared"
         keys = bodies | metas | body_tmp | meta_tmp
         return [
-            self._build_entry(kind, key, kind_dir, suffix, root_name, bodies, metas) for key in keys
+            self._build_entry(kind, key, kind_dir, suffix, root_name, key in bodies, key in metas)
+            for key in keys
         ]
 
     def _build_entry(
@@ -777,14 +921,12 @@ class Cache:
         kind_dir: Path,
         suffix: str,
         root_name: str,
-        bodies: set[str],
-        metas: set[str],
+        has_body: bool,
+        has_meta: bool,
     ) -> CacheEntry:
         """Build the :class:`CacheEntry` for *kind*/*key* from what is on disk."""
         path = kind_dir / f"{key}{suffix}"
         meta_path = kind_dir / f"{key}{_META_SUFFIX}"
-        has_body = key in bodies
-        has_meta = key in metas
 
         meta: dict[str, Any] | None = None
         if has_meta:
@@ -792,7 +934,15 @@ class Cache:
             if meta is not None and any(field not in meta for field in _REQUIRED_META_FIELDS):
                 meta = None
 
-        size = path.stat().st_size if has_body else 0
+        size = 0
+        if has_body:
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                # The body was removed between the listing and this stat
+                # (another process cleaning up, or a put replacing it):
+                # report it as missing instead of failing the whole listing.
+                has_body = False
 
         problem: str | None = None
         if not has_body:
@@ -829,10 +979,38 @@ class Cache:
 
 
 def _replace_atomically(path: Path, payload: bytes) -> None:
-    """Write *payload* to a ``.tmp`` sibling of *path*, then move it onto *path*."""
-    tmp_path = path.with_name(path.name + _TMP_SUFFIX)
+    """Write *payload* to a private ``.tmp`` sibling of *path*, then move it onto *path*.
+
+    The temporary name is ``<name>.<pid>.<random>.tmp``, so two processes
+    (or two threads) writing the same key each own their temporary file and
+    neither can have it replaced or removed under it.
+    """
+    unique = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    tmp_path = path.with_name(f"{path.name}.{unique}{_TMP_SUFFIX}")
     tmp_path.write_bytes(payload)
     os.replace(tmp_path, path)
+
+
+def _tmp_target_name(name: str) -> str | None:
+    """Return the final name a temporary file was being written for.
+
+    Returns ``None`` when *name* is not a temporary file. Names written
+    before v1.0 are ``<final name>.tmp`` with nothing in between, so the
+    ``.<pid>.<random>`` part is stripped only when it is there.
+    """
+    if not name.endswith(_TMP_SUFFIX):
+        return None
+    return _TMP_INFIX_RE.sub("", name[: -len(_TMP_SUFFIX)])
+
+
+def _tmp_siblings(path: Path) -> list[Path]:
+    """Return the temporary files left behind for *path*, oldest naming scheme first."""
+    siblings = [path.with_name(path.name + _TMP_SUFFIX)]
+    try:
+        siblings.extend(sorted(path.parent.glob(f"{path.name}.*{_TMP_SUFFIX}")))
+    except OSError:
+        pass
+    return siblings
 
 
 def _unlink_quietly(path: Path) -> None:
