@@ -26,7 +26,8 @@ from fastmcp import Client, FastMCP
 from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
-from patent_checker import cache, config, service, utils
+import patent_checker
+from patent_checker import cache, config, service, utils, validation
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
@@ -414,6 +415,19 @@ def test_get_legal_returns_events(
     ]
 
 
+def test_get_legal_without_events_says_so_instead_of_looking_empty(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """OPS reporting no event at all is a result, and must not read as a failed fetch."""
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: ())
+    mcp = build_server(settings, state=make_state(ops_client=_StubOpsClient(legal=b"<xml/>")))
+
+    data = _call(mcp, "get_legal", {"pub": "US11468338B2"})
+
+    assert data["events"] == []
+    assert data["note"] == service.LEGAL_NO_EVENTS_NOTE
+
+
 def test_get_family_returns_members(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
@@ -541,6 +555,18 @@ def test_usage_report_without_a_log_is_not_an_error(
     assert data["path"] == str(tmp_path / "raw" / "ops" / "headers.jsonl")
 
 
+def test_usage_report_uses_the_shared_log_path_helper(
+    settings: ServerSettings, make_state: Any, tmp_path: Path
+) -> None:
+    """The log location comes from one helper, not from a layout spelled out here."""
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(mcp, "usage_report")
+
+    assert data["path"] == str(utils.ops_headers_path(settings.data_base))
+    assert data["path"] == str(tmp_path / "raw" / "ops" / "headers.jsonl")
+
+
 def test_server_status_reports_the_running_configuration(
     settings: ServerSettings, make_state: Any, tmp_path: Path
 ) -> None:
@@ -593,6 +619,63 @@ def test_server_status_reports_the_configured_log_level(
     data = _call(mcp, "server_status")
 
     assert data["log_level"] == "debug"
+
+
+class _CountingCache:
+    """A ``Cache`` stand-in that answers counts and fails if anything is read."""
+
+    def __init__(self, shared: Path, local: Path, counts: dict[str, int]) -> None:
+        self.shared = shared
+        self.local = local
+        self.ttls = dict(cache.DEFAULT_TTLS)
+        self._counts = counts
+        self.quick_counts_calls = 0
+
+    def quick_counts(self) -> dict[str, int]:
+        """Return the canned per-kind counts, recording the call."""
+        self.quick_counts_calls += 1
+        return dict(self._counts)
+
+    def stats(self) -> dict[str, Any]:
+        """Fail: reading every sidecar is what server_status must not do."""
+        raise AssertionError("server_status must not walk the cache")
+
+    def entries(self, kind: str | None = None) -> list[Any]:
+        """Fail: listing entries reads sidecars, which server_status must not do."""
+        raise AssertionError("server_status must not read cache entries")
+
+
+def test_server_status_counts_the_cache_without_reading_it(
+    settings: ServerSettings, make_state: Any, tmp_path: Path
+) -> None:
+    """server_status stays cheap: it counts sidecar files and opens none of them.
+
+    A full walk parses every sidecar and sorts the result, which grows with
+    the cache; a status call must not pay for that.
+    """
+    state = make_state(ops_client=_StubOpsClient())
+    counting = _CountingCache(
+        state.cache.shared, state.cache.local, {kind: 3 for kind in cache.KINDS}
+    )
+    state.cache = counting
+    mcp = build_server(settings, state=state)
+
+    data = _call(mcp, "server_status")
+
+    assert counting.quick_counts_calls == 1
+    assert data["cache_entries"] == {kind: 3 for kind in cache.KINDS}
+    assert data["cache_ttl"] == {
+        kind: cache.format_ttl(ttl) for kind, ttl in cache.DEFAULT_TTLS.items()
+    }
+
+
+def test_server_status_reports_the_package_version(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """One version source for the whole toolkit: ``patent_checker.__version__``."""
+    mcp = build_server(settings, state=make_state())
+
+    assert _call(mcp, "server_status")["version"] == patent_checker.__version__
 
 
 # --- error mapping -------------------------------------------------------
@@ -654,6 +737,46 @@ def test_oversized_offline_payloads_are_rejected(
     assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
+def test_an_oversized_element_is_rejected(settings: ServerSettings, make_state: Any) -> None:
+    """One huge element is refused even when the element count is well within the limit."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(
+            mcp,
+            "verify_batch",
+            {"input_pubs": ["x" * (validation.MAX_ITEM_CHARS + 1)], "output_records": []},
+        )
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
+
+
+def test_an_oversized_total_payload_is_rejected(settings: ServerSettings, make_state: Any) -> None:
+    """Many acceptable elements that together exceed the payload ceiling are refused."""
+    item = "x" * 4000
+    count = validation.MAX_PAYLOAD_CHARS // len(item) + 1
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "verify_batch", {"input_pubs": [item] * count, "output_records": []})
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
+
+
+def test_a_record_with_a_non_string_pub_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """A mapping whose ``pub`` is not a string is the caller's mistake, not an internal error."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "dedup_families", {"hits": [{"pub": 5, "family_id": "1"}]})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_INVALID_INPUT}:")
+    assert "pub" in message
+
+
 def test_records_missing_a_required_key_are_invalid_input(
     settings: ServerSettings, make_state: Any
 ) -> None:
@@ -694,6 +817,124 @@ def test_transport_failures_are_reported_as_external_api_errors(
     message = str(exc_info.value)
     assert message.startswith(f"{tools.ERROR_EXTERNAL_API}:")
     assert "connection refused" in message
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(KeyError("ops:world-patent-data"), id="key-error"),
+        pytest.param(TypeError("'NoneType' object is not subscriptable"), id="type-error"),
+        pytest.param(ValueError("invalid literal for int()"), id="value-error"),
+        pytest.param(
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), id="decode-error"
+        ),
+    ],
+)
+def test_broken_upstream_data_is_reported_as_upstream_data(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: ServerSettings,
+    make_state: Any,
+    failure: Exception,
+) -> None:
+    """What the parser chokes on is the fetched data's fault, not the caller's.
+
+    Telling the two apart matters to a calling LLM: an ``invalid_input``
+    answer invites another attempt with different arguments, which for a
+    malformed OPS document would loop forever.
+    """
+
+    def broken_parser(xml: bytes) -> Any:
+        raise failure
+
+    monkeypatch.setattr(service, "parse_biblio_xml", broken_parser)
+    stub = _StubOpsClient(biblio=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "get_biblio", {"pub": "US11468338B2"})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_UPSTREAM_DATA}:")
+    assert not message.startswith(f"{tools.ERROR_INVALID_INPUT}:")
+    # The request did happen: this is not something the caller could avoid.
+    assert stub.calls == [("biblio", ("US11468338B2",), {})]
+
+
+def test_a_missing_key_in_the_fetched_data_names_what_was_missing(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """A bare KeyError stringifies to just the key, so the message spells it out."""
+
+    def broken_parser(xml: bytes) -> Any:
+        raise KeyError("family-id")
+
+    monkeypatch.setattr(service, "parse_biblio_xml", broken_parser)
+    mcp = build_server(settings, state=make_state(ops_client=_StubOpsClient(biblio=b"<xml/>")))
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "get_biblio", {"pub": "US11468338B2"})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_UPSTREAM_DATA}:")
+    assert "family-id" in message
+
+
+def test_a_malformed_element_is_still_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """The offline helpers keep reporting a caller's own payload as invalid_input.
+
+    Counterpart of the upstream_data tests above: the two paths must not
+    collapse into one now that both start as a ``ValueError``.
+    """
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(
+            mcp,
+            "verify_batch",
+            {"input_pubs": ["US11468338B2"], "output_records": [{"family_id": "1"}]},
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_INVALID_INPUT}:")
+    assert "output_records[0]" in message
+
+
+def test_dedup_payload_validation_refuses_an_element_that_is_not_an_object() -> None:
+    """dedup reads more of a hit than its number, so a bare string is refused.
+
+    The tool's schema already rejects one, so this checks the validator
+    itself: it is the same rule the CLI applies to a ``dedup`` file, and it
+    must raise the class that maps to ``invalid_input``.
+    """
+    with pytest.raises(validation.InvalidInput) as exc_info:
+        tools._validate_hits(["US11468338B2"], "hits")
+
+    assert "hits[0]" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("ops_search", {"cql": "ti=drone", "begin": 0, "end": 25}),
+        ("ops_search", {"cql": "ti=drone", "begin": 30, "end": 20}),
+        ("ops_search", {"cql": "ti=drone", "begin": 1, "end": 9999}),
+        ("ops_search_biblio", {"cql": "ti=drone", "begin": 1, "end": 500}),
+    ],
+)
+def test_an_unusable_paging_window_is_refused_before_any_request(
+    settings: ServerSettings, make_state: Any, name: str, arguments: dict[str, Any]
+) -> None:
+    """The paging window is checked here, so OPS is not asked for a range it refuses."""
+    stub = _StubOpsClient()
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, name, arguments)
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
+    assert stub.calls == []
 
 
 @pytest.mark.parametrize(
@@ -861,68 +1102,155 @@ def test_concurrent_ops_calls_keep_the_upstream_interval(
     assert gap >= MIN_INTERVAL_SECONDS["retrieval"] - 0.1
 
 
-def test_concurrent_ops_tools_do_not_overlap(
+def test_concurrent_ops_tools_serialize_the_upstream_round_trip(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
-    """One shared lock keeps every OPS-backed tool call sequential, across tools.
+    """Two OPS-backed tools may run at once, but only one request is upstream at a time.
 
-    FastMCP runs sync tools in worker threads and does execute two calls at
-    once (verified separately), so a maximum overlap of one proves the lock.
+    Since v1.0 the tool layer holds no lock: pacing is enforced inside
+    ``OpsClient``, whose instance lock spans the wait and the request it
+    spaces. What must still hold is that no two OPS requests overlap on the
+    wire, which this drives through a real ``OpsClient`` on a
+    ``MockTransport``. The second tool call is started only once the first
+    one is parked inside the transport, so the outcome does not depend on
+    thread timing: with the client lock the second request cannot reach the
+    transport before the first returns; without it it arrives right away.
     """
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "dummy-key")
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "dummy-secret")
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio())
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=())
+    )
     active = {"current": 0, "max": 0}
     active_lock = threading.Lock()
+    first_is_upstream = threading.Event()
+    second_arrived = threading.Event()
+    release_first = threading.Event()
 
-    def recording_call(pub: str, **kwargs: Any) -> dict[str, Any]:
-        """Stand in for a service call, recording how many run at once."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/accesstoken"):
+            return httpx.Response(200, json=_TOKEN_JSON)
         with active_lock:
             active["current"] += 1
             active["max"] = max(active["max"], active["current"])
-        time.sleep(0.2)
+        if first_is_upstream.is_set():
+            second_arrived.set()
+        else:
+            first_is_upstream.set()
+            # Bounded, so a regression cannot hang the suite.
+            release_first.wait(timeout=10.0)
         with active_lock:
             active["current"] -= 1
-        return {"pub": pub}
+        return httpx.Response(200, content=b"<xml/>")
 
-    monkeypatch.setattr(service, "biblio", recording_call)
-    monkeypatch.setattr(service, "family", recording_call)
-    mcp = build_server(settings, state=make_state(ops_client=_StubOpsClient()))
+    ops = OpsClient(transport=httpx.MockTransport(handler))
+    mcp = build_server(settings, state=make_state(ops_client=ops))
 
-    async def run() -> None:
+    async def run() -> bool:
         async with Client(mcp) as client:
-            await asyncio.gather(
-                client.call_tool("get_biblio", {"pub": "US11468338B2"}),
-                client.call_tool("get_family", {"pub": "EP1672502A1"}),
-            )
+            first = asyncio.create_task(client.call_tool("get_biblio", {"pub": "US11468338B2"}))
+            await asyncio.to_thread(first_is_upstream.wait, 10.0)
+            second = asyncio.create_task(client.call_tool("get_family", {"pub": "EP1672502A1"}))
+            # Proving a negative: the second request must not show up while
+            # the first one is still parked in the transport.
+            overlapped = await asyncio.to_thread(second_arrived.wait, 1.0)
+            release_first.set()
+            await asyncio.gather(first, second)
+            return overlapped
 
-    asyncio.run(run())
+    try:
+        overlapped = asyncio.run(run())
+    finally:
+        ops.close()
 
+    assert first_is_upstream.is_set()
+    assert not overlapped
     assert active["max"] == 1
 
 
-def test_concurrent_claims_calls_do_not_overlap(
+def test_a_long_running_ops_tool_does_not_block_another_tool(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
-    """The Google Patents lock keeps two concurrent get_claims calls strictly sequential.
+    """A search_plan_check still upstream does not keep get_biblio waiting.
 
-    FastMCP runs sync tools in worker threads and does execute two calls at
-    once (verified separately), so a maximum overlap of one proves the lock.
+    This is the point of moving the lock into the clients (v1.0): a 50-query
+    plan used to hold the server's OPS lock for its whole run. The plan check
+    is parked inside its first upstream call; get_biblio must complete while
+    it is still parked, which is asserted by the plan call not being done
+    yet. Ordering is fixed with events, never with sleeps.
     """
+    page = OpsSearchPage(total_count=3, query="ti=drone", begin=1, end=2, hits=())
+    monkeypatch.setattr(utils, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio())
+    plan_is_upstream = threading.Event()
+    release_plan = threading.Event()
+
+    class _ParkedOpsClient(_StubOpsClient):
+        """Blocks in ``search`` until the test releases it; answers biblio at once."""
+
+        def search(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
+            plan_is_upstream.set()
+            # Bounded, so a regression fails the assertion below instead of
+            # hanging the suite.
+            release_plan.wait(timeout=10.0)
+            return b"<xml/>"
+
+    stub = _ParkedOpsClient(biblio=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    async def run() -> tuple[dict[str, Any], bool]:
+        async with Client(mcp) as client:
+            plan = asyncio.create_task(
+                client.call_tool("search_plan_check", {"queries": ["ti=drone"]})
+            )
+            await asyncio.to_thread(plan_is_upstream.wait, 10.0)
+            biblio = await client.call_tool("get_biblio", {"pub": "US11468338B2"})
+            plan_still_running = not plan.done()
+            release_plan.set()
+            await plan
+            return biblio.data, plan_still_running
+
+    data, plan_still_running = asyncio.run(run())
+
+    assert plan_is_upstream.is_set()
+    assert data["pub"] == "US.11468338.B2"
+    assert plan_still_running
+
+
+def test_concurrent_claims_calls_serialize_the_google_patents_request(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """Two get_claims calls may overlap, but their downloads do not.
+
+    Like the OPS test above, the guarantee now lives one layer down: the
+    module lock of ``patent_checker.gp.fetch`` spans the courtesy interval
+    and the request, so this drives the real fetch function and watches the
+    Google Patents transport instead of the tool.
+    """
+    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    # The courtesy interval would serialize the two requests on its own; with
+    # it out of the way, only the lock can keep them apart.
+    monkeypatch.setattr(gp_fetch, "MIN_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
     active = {"current": 0, "max": 0}
     active_lock = threading.Lock()
+    second_arrived = threading.Event()
 
-    def fake_fetch(
-        pub: str, *, force: bool = False, client: Any = None, cache: Any = None
-    ) -> FetchedPage:
+    def handler(request: httpx.Request) -> httpx.Response:
         with active_lock:
             active["current"] += 1
             active["max"] = max(active["max"], active["current"])
-        time.sleep(0.2)
+            first = active["max"] == 1 and active["current"] == 1
+        if first:
+            second_arrived.wait(timeout=1.0)
+        else:
+            second_arrived.set()
         with active_lock:
             active["current"] -= 1
-        return FetchedPage(pub=pub, html="<html></html>", path=None, cached=False)
+        return httpx.Response(200, text="<html></html>")
 
-    monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
-    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
-    mcp = build_server(settings, state=make_state())
+    mcp = build_server(settings, state=make_state(gp_handler=handler))
 
     async def run() -> None:
         async with Client(mcp) as client:
@@ -954,6 +1282,44 @@ def test_build_state_without_credentials_has_no_ops_client(settings: ServerSetti
     assert state.gp_client.is_closed
 
 
+def test_one_state_and_one_ops_client_serve_every_tool_call(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """The server builds its state once, so every call shares one OPS client.
+
+    Upstream pacing is enforced by the client instance's own lock (v1.0), so
+    a per-call client would silently drop the interval between requests. Both
+    calls are made in one session, because a session is what the lifespan --
+    and with it the state -- belongs to.
+    """
+    monkeypatch.setattr(service, "parse_biblio_xml", lambda xml: _sample_biblio())
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=())
+    )
+    stub = _StubOpsClient(biblio=b"<xml/>", family=b"<xml/>")
+    shared = make_state(ops_client=stub)
+    builds: list[ServerSettings] = []
+
+    def fake_build_state(built_for: ServerSettings, **kwargs: Any) -> ServerState:
+        builds.append(built_for)
+        return shared
+
+    monkeypatch.setattr(server_app, "build_state", fake_build_state)
+    # No state is passed: this is the production path, where the lifespan
+    # owns what it builds.
+    mcp = build_server(settings)
+
+    async def run() -> None:
+        async with Client(mcp) as client:
+            await client.call_tool("get_biblio", {"pub": "US11468338B2"})
+            await client.call_tool("get_family", {"pub": "EP1672502A1"})
+
+    asyncio.run(run())
+
+    assert len(builds) == 1
+    assert [name for name, _, _ in stub.calls] == ["biblio", "family", "close"]
+
+
 def test_build_state_wraps_both_transports_in_the_allowlist_guard(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings
 ) -> None:
@@ -981,20 +1347,39 @@ def test_build_state_wraps_both_transports_in_the_allowlist_guard(
     assert state.ops_client._client.is_closed
 
 
-def test_http_allowed_hosts_lists_each_host_with_and_without_the_port(
+def test_http_allowed_hosts_lists_the_bind_host_and_the_configured_hosts(
     settings: ServerSettings,
 ) -> None:
-    """Clients may send the Host header with or without the port; both are accepted."""
+    """Only bare host names are listed: FastMCP strips the port before comparing."""
     http_settings = dataclasses.replace(
         settings, transport="http", host="127.0.0.1", port=8642, allowed_hosts=("a.example",)
     )
 
-    assert http_allowed_hosts(http_settings) == [
-        "127.0.0.1",
-        "127.0.0.1:8642",
-        "a.example",
-        "a.example:8642",
-    ]
+    assert http_allowed_hosts(http_settings) == ["127.0.0.1", "a.example"]
+
+
+def test_http_allowed_hosts_does_not_append_the_port(settings: ServerSettings) -> None:
+    """A ``host:port`` entry would be pointless and would break IPv6 literals."""
+    http_settings = dataclasses.replace(
+        settings, transport="http", host="::1", port=8642, allowed_hosts=("a.example",)
+    )
+
+    assert all(":8642" not in entry for entry in http_allowed_hosts(http_settings))
+
+
+def test_http_allowed_hosts_keeps_the_configuration_order_without_duplicates(
+    settings: ServerSettings,
+) -> None:
+    """A configured host equal to the bind host is listed once, in configuration order."""
+    http_settings = dataclasses.replace(
+        settings,
+        transport="http",
+        host="127.0.0.1",
+        port=8642,
+        allowed_hosts=("a.example", "127.0.0.1"),
+    )
+
+    assert http_allowed_hosts(http_settings) == ["127.0.0.1", "a.example"]
 
 
 def test_banner_lines_never_leak_the_token(settings: ServerSettings) -> None:

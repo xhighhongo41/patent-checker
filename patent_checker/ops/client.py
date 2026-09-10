@@ -14,21 +14,30 @@ upstream usage.
 Requests are spaced per OPS service; the ``X-Throttling-Control`` header is
 recorded on every call: a non-green service state triggers a cool-down, and
 an "overloaded" system state tightens the per-service spacing to the
-per-minute limits the header reports.
+per-minute limits the header reports. One client serializes its own upstream
+calls: the interval wait, the request and the bookkeeping happen under a
+single lock, so concurrent callers (the MCP server serves tool calls from a
+thread pool) are spaced correctly while nothing outside that one HTTP round
+trip is blocked. Rate control across *processes* is out of scope.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
+import threading
 import time
 from datetime import datetime
 
 import httpx
 
 from patent_checker.config import data_dir, ops_credentials
+from patent_checker.net import allowlist_transport
 from patent_checker.pubnum import PubNumber, parse_pubnum
+
+_LOGGER = logging.getLogger(__name__)
 
 OPS_BASE = "https://ops.epo.org/3.2"
 TOKEN_URL = f"{OPS_BASE}/auth/accesstoken"
@@ -46,8 +55,18 @@ MIN_INTERVAL_SECONDS = {
 }
 
 # Cool-down applied when X-Throttling-Control reports a non-green state
-# for the service that was just used.
+# for the service that was just used. It is also the fallback delay before
+# the single retry of a throttled/unavailable response that carries no
+# usable Retry-After header.
 COOL_DOWN_SECONDS = 60.0
+
+# Statuses retried once after a delay: OPS answers 429 when a quota is spent
+# and 503 while the system is saturated, both of which pass.
+RETRY_STATUSES = frozenset({httpx.codes.TOO_MANY_REQUESTS, httpx.codes.SERVICE_UNAVAILABLE})
+
+# Longest Retry-After delay honoured; anything larger is the caller's problem
+# to schedule, not something to sleep through inside one call.
+MAX_RETRY_AFTER_SECONDS = 300.0
 
 # OPS paging limits for the Range request parameter.
 MAX_RANGE_END = 2000
@@ -85,6 +104,29 @@ def parse_throttling_header(value: str) -> tuple[str, dict[str, tuple[str, int]]
     if not services:
         return "", {}
     return header.group(1), services
+
+
+# Recorded as the "url" of a token request in headers.jsonl (a path, like
+# the endpoint paths logged for the other kinds).
+_TOKEN_LOG_PATH = "auth/accesstoken"
+
+
+def _retry_delay(resp: httpx.Response) -> float:
+    """Return how long to wait before retrying *resp*.
+
+    Only the delta-seconds spelling of ``Retry-After`` is honoured: the HTTP
+    date spelling would have to be compared against the server clock, and OPS
+    was only ever observed sending seconds. Anything unreadable, negative or
+    beyond :data:`MAX_RETRY_AFTER_SECONDS` falls back to the cool-down.
+    """
+    raw = resp.headers.get("Retry-After", "")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return COOL_DOWN_SECONDS
+    if seconds <= 0 or seconds > MAX_RETRY_AFTER_SECONDS:
+        return COOL_DOWN_SECONDS
+    return seconds
 
 
 def _is_entity_not_found(resp: httpx.Response) -> bool:
@@ -126,7 +168,23 @@ class OpsClient:
     """
 
     def __init__(self, transport: httpx.BaseTransport | None = None) -> None:
-        self._client = httpx.Client(timeout=30.0, transport=transport)
+        """Build a client, defaulting to an allowlisted transport.
+
+        Args:
+            transport: Transport to send through. With ``None`` an
+                allowlisted transport (see :func:`patent_checker.net.
+                allowlist_transport`) is built, so the guard also holds on
+                the CLI path; a supplied transport is used unchanged (the
+                MCP server wraps its own).
+        """
+        self._client = httpx.Client(
+            timeout=30.0,
+            transport=transport if transport is not None else allowlist_transport(),
+        )
+        # Serializes one upstream round trip (wait, send, bookkeeping) so
+        # concurrent callers cannot break the per-service spacing. The
+        # helpers below assume it is already held.
+        self._lock = threading.Lock()
         self._token: str | None = None
         self._token_acquired_at: float = 0.0
         self._last_request_at: dict[str, float] = {}
@@ -148,19 +206,32 @@ class OpsClient:
     # -- transport ---------------------------------------------------------
 
     def _fresh_token(self) -> str:
-        """Return a cached OAuth2 token, refreshing it when close to expiry."""
+        """Return a cached OAuth2 token, refreshing it when close to expiry.
+
+        The token request is an upstream call like any other: it waits for
+        the service interval and is written to the request log, so the log
+        accounts for everything that left the process. ``self._lock`` must be
+        held by the caller.
+        """
         now = time.monotonic()
-        if self._token is None or now - self._token_acquired_at > TOKEN_LIFETIME_SECONDS:
-            key, secret = ops_credentials()
-            basic = base64.b64encode(f"{key}:{secret}".encode()).decode()
-            resp = self._client.post(
-                TOKEN_URL,
-                headers={"Authorization": f"Basic {basic}"},
-                data={"grant_type": "client_credentials"},
-            )
-            resp.raise_for_status()
-            self._token = resp.json()["access_token"]
-            self._token_acquired_at = now
+        if self._token is not None and now - self._token_acquired_at <= TOKEN_LIFETIME_SECONDS:
+            return self._token
+
+        key, secret = ops_credentials()
+        basic = base64.b64encode(f"{key}:{secret}".encode()).decode()
+        # The token endpoint is not one of the throttled OPS services, so it
+        # is paced with the catch-all "other" interval.
+        self._wait_for_service("other")
+        resp = self._client.post(
+            TOKEN_URL,
+            headers={"Authorization": f"Basic {basic}"},
+            data={"grant_type": "client_credentials"},
+        )
+        self._log_headers("token", _TOKEN_LOG_PATH, resp)
+        self._note_throttling("other", resp.headers.get("X-Throttling-Control", ""))
+        resp.raise_for_status()
+        self._token = resp.json()["access_token"]
+        self._token_acquired_at = time.monotonic()
         return self._token
 
     def _interval_for(self, service: str) -> float:
@@ -168,7 +239,11 @@ class OpsClient:
         return self._effective_interval.get(service, MIN_INTERVAL_SECONDS.get(service, 1.0))
 
     def _wait_for_service(self, service: str) -> None:
-        """Honor per-service minimum intervals and any active cool-down."""
+        """Honor per-service minimum intervals and any active cool-down.
+
+        ``self._lock`` must be held by the caller: the wait and the request
+        that follows it form one unit.
+        """
         now = time.monotonic()
         wait = max(0.0, self._cool_down_until - now)
         last = self._last_request_at.get(service)
@@ -206,7 +281,12 @@ class OpsClient:
             self._effective_interval.clear()
 
     def _log_headers(self, kind: str, url: str, resp: httpx.Response) -> None:
-        """Append one JSON line describing the response headers."""
+        """Append one JSON line describing the response headers.
+
+        The log is an observation aid, not part of the answer: when it cannot
+        be written (read-only or full data directory) the failure is reported
+        as a warning and the response is still handed to the caller.
+        """
         record = {
             "at": datetime.now().isoformat(timespec="seconds"),
             "kind": kind,
@@ -215,8 +295,11 @@ class OpsClient:
             "throttling": resp.headers.get("X-Throttling-Control", ""),
         }
         log_path = self._data_dir / "headers.jsonl"
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        try:
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            _LOGGER.warning("could not append to the OPS request log %s: %s", log_path, exc)
 
     def _get(
         self,
@@ -235,15 +318,37 @@ class OpsClient:
         ``SERVER.EntityNotFound`` fault is returned like a normal response
         instead of raising: that is how OPS reports a search without hits.
         Every other 404 and every other error status still raises.
+
+        Two upstream answers are retried exactly once, because both are known
+        to pass on their own: an expired token (401, the token is dropped and
+        re-acquired) and a throttled or saturated service (429 / 503, after
+        the server's ``Retry-After`` or, absent that, the cool-down). A second
+        failure of the same kind raises like any other error status.
         """
-        self._wait_for_service(service)
         url = f"{OPS_BASE}/rest-services/{path}"
-        resp = self._client.get(url, headers={"Authorization": f"Bearer {self._fresh_token()}"})
-        self._log_headers(kind, path, resp)
-        self._note_throttling(service, resp.headers.get("X-Throttling-Control", ""))
+        with self._lock:
+            resp = self._send_get(url, path, service=service, kind=kind)
+            if resp.status_code == httpx.codes.UNAUTHORIZED:
+                # Most likely an expired token: drop it and authenticate once more.
+                self._token = None
+                resp = self._send_get(url, path, service=service, kind=kind)
+            elif resp.status_code in RETRY_STATUSES:
+                time.sleep(_retry_delay(resp))
+                resp = self._send_get(url, path, service=service, kind=kind)
         if not (accept_not_found and _is_entity_not_found(resp)):
             resp.raise_for_status()
         return resp.content
+
+    def _send_get(self, url: str, path: str, *, service: str, kind: str) -> httpx.Response:
+        """Send one authenticated GET, spaced and logged. ``self._lock`` must be held."""
+        # The token is acquired first so its own pacing does not eat into the
+        # interval measured for this service.
+        token = self._fresh_token()
+        self._wait_for_service(service)
+        resp = self._client.get(url, headers={"Authorization": f"Bearer {token}"})
+        self._log_headers(kind, path, resp)
+        self._note_throttling(service, resp.headers.get("X-Throttling-Control", ""))
+        return resp
 
     # -- endpoints ---------------------------------------------------------
 

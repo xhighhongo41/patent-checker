@@ -9,6 +9,11 @@
 #   (b) README.md            -- the status line's `vX.Y` (major.minor only).
 #   (f) compose.yaml         -- the default image tag `ghcr.io/.../patent-checker:X.Y`
 #                               (major.minor only) in the `image:` line.
+#   (g) README_ja.md         -- the status line's `vX.Y`, like README.md.
+#   (h) README.md, README_ja.md -- a `**vX.Y**` entry in the changelog.
+#   (i) server.json          -- the top-level `version`, every package
+#                               `version` and the OCI identifier's tag (X.Y.Z).
+#   (j) examples/lan-tls/compose.yaml -- the default image tag, like (f).
 # Places intentionally NOT checked:
 #   - patent_checker/__init__.py: `__version__` is derived at import time
 #     from installed package metadata (importlib.metadata), it is not a
@@ -94,6 +99,60 @@ else
     COMPOSE_CURRENT=$(echo "$COMPOSE_LINE" | sed -E 's/^[0-9]+://' | grep -oE 'patent-checker:[0-9]+\.[0-9]+' | head -n 1)
     if [ "$COMPOSE_CURRENT" != "patent-checker:$MAJOR_MINOR" ]; then
         echo "compose.yaml:$COMPOSE_LINENO -> $COMPOSE_CURRENT -> patent-checker:$MAJOR_MINOR" >>"$FAILURES_FILE"
+    fi
+fi
+
+# --- (g) README_ja.md: status line with vX.Y --------------------------------
+README_JA_LINE=$(grep -nE '(状態|[Ss]tatus).*v[0-9]+\.[0-9]+' README_ja.md | head -n 1)
+if [ -z "$README_JA_LINE" ]; then
+    echo "README_ja.md:? -> (status line not found) -> v$MAJOR_MINOR" >>"$FAILURES_FILE"
+else
+    README_JA_LINENO=$(echo "$README_JA_LINE" | cut -d: -f1)
+    README_JA_CURRENT=$(echo "$README_JA_LINE" | sed -E 's/^[0-9]+://' | grep -oE 'v[0-9]+\.[0-9]+' | head -n 1)
+    if [ "$README_JA_CURRENT" != "v$MAJOR_MINOR" ]; then
+        echo "README_ja.md:$README_JA_LINENO -> $README_JA_CURRENT -> v$MAJOR_MINOR" >>"$FAILURES_FILE"
+    fi
+fi
+
+# --- (h) changelog entry for vX.Y in both READMEs ---------------------------
+for readme in README.md README_ja.md; do
+    if ! grep -qE "^- \*\*v$MAJOR_MINOR\*\*" "$readme"; then
+        echo "$readme:? -> (no changelog entry) -> - **v$MAJOR_MINOR** (...)" >>"$FAILURES_FILE"
+    fi
+done
+
+# --- (i) server.json: version fields and the OCI tag ------------------------
+# (a plain -c script through uv: a here-document inside $(...) hangs bash 3.2, and a
+# pyenv shim for python3 can stall in a non-interactive shell)
+SERVER_JSON_CHECK=$(uv run --no-sync python -c '
+import json, sys
+version = sys.argv[1]
+data = json.load(open("server.json", encoding="utf-8"))
+problems = []
+if data.get("version") != version:
+    problems.append(f"server.json version -> {data.get("version")} -> {version}")
+for package in data.get("packages", []):
+    if "version" in package and package["version"] != version:
+        problems.append(f"server.json packages[{package.get(\"registryType\")}].version -> {package["version"]} -> {version}")
+    if package.get("registryType") == "oci":
+        tag = package.get("identifier", "").rsplit(":", 1)[-1]
+        if tag != version:
+            problems.append(f"server.json oci identifier tag -> {tag} -> {version}")
+print("\n".join(problems))
+' "$VERSION")
+if [ -n "$SERVER_JSON_CHECK" ]; then
+    echo "$SERVER_JSON_CHECK" >>"$FAILURES_FILE"
+fi
+
+# --- (j) examples/lan-tls/compose.yaml: default image tag X.Y ---------------
+LAN_LINE=$(grep -nE '^\s*image:.*patent-checker:[0-9]+\.[0-9]+' examples/lan-tls/compose.yaml | head -n 1)
+if [ -z "$LAN_LINE" ]; then
+    echo "examples/lan-tls/compose.yaml:? -> (image line not found) -> patent-checker:$MAJOR_MINOR" >>"$FAILURES_FILE"
+else
+    LAN_LINENO=$(echo "$LAN_LINE" | cut -d: -f1)
+    LAN_CURRENT=$(echo "$LAN_LINE" | sed -E 's/^[0-9]+://' | grep -oE 'patent-checker:[0-9]+\.[0-9]+' | head -n 1)
+    if [ "$LAN_CURRENT" != "patent-checker:$MAJOR_MINOR" ]; then
+        echo "examples/lan-tls/compose.yaml:$LAN_LINENO -> $LAN_CURRENT -> patent-checker:$MAJOR_MINOR" >>"$FAILURES_FILE"
     fi
 fi
 

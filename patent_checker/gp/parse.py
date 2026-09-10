@@ -7,6 +7,7 @@ network; document retrieval lives in :mod:`patent_checker.gp.fetch`.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, replace
 
@@ -16,6 +17,8 @@ from patent_checker.claimref import extract_claim_refs_from_text
 from patent_checker.models import Claim
 
 __all__ = ["Claim", "GPatentDoc", "parse_patent_html"]
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -102,12 +105,19 @@ def _extract_claims(claims_sections: list[Tag]) -> tuple[Claim, ...]:
     """Return all claims across ``claims_sections``, concatenated in document order.
 
     Claim divs without a ``num`` attribute are style wrappers, not claims, and
-    are excluded by the ``div.claim[num]`` selector.
+    are excluded by the ``div.claim[num]`` selector. A ``num`` that is not a
+    number belongs to no claim we can address, so that div is dropped (with a
+    warning) instead of ending the parse of an otherwise usable page.
     """
     claims: list[Claim] = []
     for section in claims_sections:
         for div in section.select("div.claim[num]"):
-            number = int(div["num"])
+            raw_number = div["num"]
+            try:
+                number = int(raw_number)
+            except (TypeError, ValueError):
+                _LOGGER.warning("skipping claim with a non-numeric num attribute: %r", raw_number)
+                continue
             text = _normalize_whitespace(div.get_text())
             depends_on = _extract_claim_dependencies(div)
             claims.append(Claim(number=number, text=text, depends_on=depends_on))

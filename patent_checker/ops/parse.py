@@ -8,6 +8,7 @@ network. XML namespaces: default (exchange) ``http://www.epo.org/exchange``,
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 
@@ -16,6 +17,8 @@ from lxml import etree
 from patent_checker.claimref import extract_claim_refs_from_text
 from patent_checker.models import Claim
 from patent_checker.pubnum import PubNumber
+
+_LOGGER = logging.getLogger(__name__)
 
 _EXCHANGE_NS = "http://www.epo.org/exchange"
 _OPS_NS = "http://ops.epo.org"
@@ -165,12 +168,14 @@ def parse_biblio_xml(xml: bytes) -> OpsBiblio:
     - ``applicants`` / ``inventors``: names preferring entries with
       ``data-format="original"``; order kept, duplicates removed.
     - ``ipc``: ``classification-ipcr`` text values, whitespace normalized.
-    - ``cpc``: ``patent-classification`` entries joined as
+    - ``cpc``: ``patent-classification`` entries of a CPC scheme, joined as
       ``section + class + subclass + main-group + "/" + subgroup``
-      (e.g. ``G06N3/10``), deduplicated, document order.
+      (e.g. ``G06N3/10``), deduplicated, document order. National schemes
+      (US ``UC``, JP ``FI`` / ``FTERM``) in the same container are ignored.
     - ``publication_date``: date of the docdb publication document-id
       ("" if absent).
-    - ``cited_patents``: ``patcit`` docdb document-ids in docdb spelling.
+    - ``cited_patents``: ``patcit`` docdb document-ids in docdb spelling; a
+      citation carrying no docdb document-id is skipped (with a warning).
     - ``npl_citation_count``: number of ``nplcit`` elements.
 
     Raises:
@@ -266,13 +271,19 @@ def parse_legal_xml(xml: bytes) -> tuple[OpsLegalEvent, ...]:
     ``desc`` attribute equals ``"Gazette DATE"`` ("" if absent), and the
     text of every ``ops:pre`` child in order.
 
+    A populated legal section carrying no event at all is a normal OPS
+    answer (measured in v0.1: GB.2553053 answers that way for both its A and
+    its B publication) and yields an empty tuple, which means "no legal event
+    is on record", not "the response was unusable".
+
     Raises:
-        ValueError: If the document contains no legal section at all.
+        ValueError: If the document contains no legal section at all, i.e. no
+            ``ops:patent-family`` marked ``legal="true"``.
     """
     root = etree.fromstring(xml)
     legal_elems = root.findall(f".//{_ops('legal')}")
-    if not legal_elems:
-        raise ValueError("not a legal response: no ops:legal elements present")
+    if not legal_elems and not _has_legal_section(root):
+        raise ValueError("not a legal response: no legal patent-family section present")
 
     events = []
     for legal in legal_elems:
@@ -353,7 +364,8 @@ def parse_family_xml(xml: bytes) -> OpsFamily:
       ``ops:family-member``.
     - ``members``: for each ``ops:family-member``, the publication-reference
       ``document-id[document-id-type=docdb]`` in docdb spelling; order kept,
-      duplicates removed.
+      duplicates removed. A member without such a reference is skipped (with
+      a warning) so one incomplete entry does not cost the whole family.
 
     Raises:
         ValueError: If no ``ops:family-member`` is present.
@@ -370,8 +382,14 @@ def parse_family_xml(xml: bytes) -> OpsFamily:
     for member in member_elems:
         pub_ref = member.find(_ex("publication-reference"))
         if pub_ref is None:
-            raise ValueError("family-member missing publication-reference")
-        doc_id = _find_docdb_document_id(pub_ref, "family-member publication-reference")
+            _LOGGER.warning("skipping family member without a publication-reference")
+            continue
+        try:
+            doc_id = _find_docdb_document_id(pub_ref, "family-member publication-reference")
+        except ValueError as exc:
+            # One unusable member must not cost the whole family record.
+            _LOGGER.warning("skipping family member: %s", exc)
+            continue
         pub = _docdb_pub(doc_id)
         if pub not in seen:
             seen.add(pub)
@@ -406,6 +424,23 @@ def _is_zero_hit_fault(root: etree._Element) -> bool:
         return True
     message = (root.findtext(_ops("message")) or "").strip()
     raise ValueError(f"OPS fault: {code or '<no code>'} ({message or 'no message'})")
+
+
+def _is_english(element: etree._Element) -> bool:
+    """Return True if *element* declares English in its ``lang`` attribute.
+
+    OPS spells the attribute both ways ("en" in exchange documents, "EN" in
+    full-text documents), so the comparison ignores case everywhere.
+    """
+    return (element.get("lang") or "").lower() == "en"
+
+
+def _has_legal_section(root: etree._Element) -> bool:
+    """Return True if *root* carries a patent-family section marked as legal."""
+    for family in root.iter(_ops("patent-family")):
+        if (family.get("legal") or "").lower() == "true":
+            return True
+    return False
 
 
 def _find_docdb_document_id(container: etree._Element, context: str) -> etree._Element:
@@ -478,7 +513,7 @@ def _biblio_title(bibliographic_data: etree._Element) -> str:
     """Return the ``invention-title``, preferring the English one."""
     titles = bibliographic_data.findall(_ex("invention-title"))
     for title in titles:
-        if title.get("lang") == "en":
+        if _is_english(title):
             return (title.text or "").strip()
     if titles:
         return (titles[0].text or "").strip()
@@ -490,7 +525,7 @@ def _biblio_abstract(exchange_document: etree._Element) -> str:
     abstracts = exchange_document.findall(_ex("abstract"))
     chosen = None
     for abstract in abstracts:
-        if abstract.get("lang") == "en":
+        if _is_english(abstract):
             chosen = abstract
             break
     if chosen is None and abstracts:
@@ -511,15 +546,29 @@ def _extract_ipc(bibliographic_data: etree._Element) -> tuple[str, ...]:
 
 
 def _extract_cpc(bibliographic_data: etree._Element) -> tuple[str, ...]:
-    """Extract CPC symbols from ``patent-classification`` entries, deduplicated in order."""
+    """Extract CPC symbols from ``patent-classification`` entries, deduplicated in order.
+
+    Only entries whose ``classification-scheme`` is a CPC scheme (``CPCI`` /
+    ``CPCA``) are taken: the same container also carries national schemes
+    (US ``UC``, JP ``FI`` / ``FTERM``), which spell their symbol in a single
+    ``classification-symbol`` element and would otherwise be reported as the
+    bare separator ``"/"``. An entry missing any of the five CPC parts is
+    dropped for the same reason.
+    """
     seen: set[str] = set()
     result: list[str] = []
     for classification in bibliographic_data.findall(f".//{_ex('patent-classification')}"):
-        section = (classification.findtext(_ex("section")) or "").strip()
-        class_ = (classification.findtext(_ex("class")) or "").strip()
-        subclass = (classification.findtext(_ex("subclass")) or "").strip()
-        main_group = (classification.findtext(_ex("main-group")) or "").strip()
-        subgroup = (classification.findtext(_ex("subgroup")) or "").strip()
+        scheme_elem = classification.find(_ex("classification-scheme"))
+        scheme = "" if scheme_elem is None else (scheme_elem.get("scheme") or "")
+        if not scheme.upper().startswith("CPC"):
+            continue
+        parts = [
+            (classification.findtext(_ex(name)) or "").strip()
+            for name in ("section", "class", "subclass", "main-group", "subgroup")
+        ]
+        if not all(parts):
+            continue
+        section, class_, subclass, main_group, subgroup = parts
         symbol = f"{section}{class_}{subclass}{main_group}/{subgroup}"
         if symbol not in seen:
             seen.add(symbol)
@@ -546,7 +595,13 @@ def _extract_citations(bibliographic_data: etree._Element) -> tuple[tuple[str, .
 
     cited_patents = []
     for patcit in references.findall(f".//{_ex('patcit')}"):
-        doc_id = _find_docdb_document_id(patcit, "patcit")
+        try:
+            doc_id = _find_docdb_document_id(patcit, "patcit")
+        except ValueError as exc:
+            # A citation spelled only in epodoc form costs that citation, not
+            # the whole bibliographic record.
+            _LOGGER.warning("skipping citation: %s", exc)
+            continue
         cited_patents.append(_docdb_pub(doc_id))
 
     npl_citation_count = len(references.findall(f".//{_ex('nplcit')}"))
@@ -561,7 +616,7 @@ def _ft(tag: str) -> str:
 def _preferred_claims_element(claims_elems: list[etree._Element]) -> etree._Element:
     """Return the English ``claims`` element, or the first one when absent."""
     for claims_elem in claims_elems:
-        if (claims_elem.get("lang") or "").upper() == "EN":
+        if _is_english(claims_elem):
             return claims_elem
     return claims_elems[0]
 

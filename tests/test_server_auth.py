@@ -10,18 +10,27 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hmac
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+from fastmcp.server.auth import AccessToken
 
+import patent_checker
 from patent_checker import config
 from patent_checker.cache import Cache
 from patent_checker.config import ConfigError
-from patent_checker.server.app import ServerState, build_http_app, build_server
+from patent_checker.server import auth as server_auth
+from patent_checker.server.app import (
+    AUTH_CLIENT_ID,
+    ServerState,
+    build_http_app,
+    build_server,
+)
+from patent_checker.server.auth import ConstantTimeTokenVerifier
 from patent_checker.server.settings import (
     OPERATOR_NOTICE_VERSION,
     ServerSettings,
@@ -210,14 +219,90 @@ def test_configured_extra_host_is_accepted(
 # --- auth provider selection ---------------------------------------------
 
 
-def test_http_transport_installs_the_static_token_verifier(
+def test_http_transport_installs_the_constant_time_token_verifier(
     http_settings: ServerSettings,
 ) -> None:
     """The http transport authenticates with the configured bearer token."""
     server = build_server(http_settings)
 
-    assert isinstance(server.auth, StaticTokenVerifier)
-    assert list(server.auth.tokens) == [TEST_TOKEN]
+    assert isinstance(server.auth, ConstantTimeTokenVerifier)
+    assert _verify(server.auth, TEST_TOKEN) is not None
+    assert _verify(server.auth, "wrong-token") is None
+
+
+# --- the token verifier itself --------------------------------------------
+
+
+def _verify(verifier: ConstantTimeTokenVerifier, token: str) -> AccessToken | None:
+    """Run the verifier's asynchronous check from synchronous test code."""
+    return asyncio.run(verifier.verify_token(token))
+
+
+@pytest.fixture
+def verifier() -> ConstantTimeTokenVerifier:
+    """A verifier configured with the test token."""
+    return ConstantTimeTokenVerifier(TEST_TOKEN, client_id=AUTH_CLIENT_ID)
+
+
+def test_verifier_accepts_the_configured_token(verifier: ConstantTimeTokenVerifier) -> None:
+    """The configured token yields the same access info the previous verifier returned."""
+    access = _verify(verifier, TEST_TOKEN)
+
+    assert access is not None
+    assert access.token == TEST_TOKEN
+    assert access.client_id == AUTH_CLIENT_ID
+    assert access.scopes == []
+    assert access.expires_at is None
+
+
+def test_verifier_rejects_a_different_token_of_the_same_length(
+    verifier: ConstantTimeTokenVerifier,
+) -> None:
+    """A wrong token of identical length is refused."""
+    same_length = "x" * len(TEST_TOKEN)
+
+    assert _verify(verifier, same_length) is None
+
+
+@pytest.mark.parametrize("token", ["", TEST_TOKEN[:-1], TEST_TOKEN + "x"])
+def test_verifier_rejects_tokens_of_a_different_length(
+    verifier: ConstantTimeTokenVerifier, token: str
+) -> None:
+    """Empty, truncated and extended tokens are all refused."""
+    assert _verify(verifier, token) is None
+
+
+def test_verifier_rejects_a_non_ascii_token(verifier: ConstantTimeTokenVerifier) -> None:
+    """A non-ASCII token is a rejection, not a ``TypeError`` from the comparison."""
+    assert _verify(verifier, "トークン") is None
+
+
+def test_verifier_compares_in_constant_time(
+    monkeypatch: pytest.MonkeyPatch, verifier: ConstantTimeTokenVerifier
+) -> None:
+    """The comparison goes through ``hmac.compare_digest``, never ``==``."""
+    calls: list[tuple[Any, Any]] = []
+
+    def _spy(left: Any, right: Any) -> bool:
+        calls.append((left, right))
+        return hmac.compare_digest(left, right)
+
+    monkeypatch.setattr(server_auth, "compare_digest", _spy)
+
+    assert _verify(verifier, TEST_TOKEN) is not None
+    assert len(calls) == 1
+
+
+def test_verifier_never_exposes_the_token(verifier: ConstantTimeTokenVerifier) -> None:
+    """Neither ``repr`` nor ``str`` may print the configured token."""
+    assert TEST_TOKEN not in repr(verifier)
+    assert TEST_TOKEN not in str(verifier)
+
+
+def test_verifier_refuses_an_empty_configured_token() -> None:
+    """An empty configured token would accept an empty Authorization header."""
+    with pytest.raises(ValueError, match="token"):
+        ConstantTimeTokenVerifier("", client_id=AUTH_CLIENT_ID)
 
 
 def test_stdio_transport_has_no_auth_provider(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -271,6 +356,22 @@ def test_health_is_reachable_without_a_token(
     assert set(body) == {"status", "version", "transport"}
     assert body["status"] == "ok"
     assert body["transport"] == "http"
+
+
+def test_health_reports_the_package_version(
+    http_settings: ServerSettings, state: ServerState
+) -> None:
+    """``/health`` names the version the package itself reports.
+
+    ``--version``, the startup banner, ``server_status`` and this route all
+    read ``patent_checker.__version__``, so a client cannot be told two
+    different versions by the same process.
+    """
+    app = build_http_app(http_settings, state=state)
+
+    response = _get(app)
+
+    assert response.json()["version"] == patent_checker.__version__
 
 
 def test_health_still_enforces_the_host_guard(

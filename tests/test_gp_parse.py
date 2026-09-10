@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
 from patent_checker.gp.parse import GPatentDoc, parse_patent_html
+from tests._fixtures import FIXTURES_ROOT, fixture_path
 
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "gp"
+FIXTURE_DIR = FIXTURES_ROOT / "gp"
 
 _CPC_LEAF_RE = re.compile(r"^[A-Z]\d{2}[A-Z]\d+/\d+$")
 
 
 def _load_fixture(pub: str) -> str:
     """Return the saved Google Patents HTML for ``pub``, skipping if unavailable."""
-    path = FIXTURE_DIR / f"{pub}.html"
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_text(encoding="utf-8")
+    return fixture_path(f"gp/{pub}.html").read_text(encoding="utf-8")
 
 
 # --- US11468338B2: values below were confirmed against the raw HTML by grep and
@@ -325,7 +322,9 @@ def test_every_fixture_yields_claims_or_fallback_text() -> None:
     """
     paths = sorted(FIXTURE_DIR.glob("*.html"))
     if not paths:
-        pytest.skip(f"fixtures not available: {FIXTURE_DIR}")
+        # Go through the shared helper so the "fixtures are required" switch
+        # of the test session applies to this sweep as well.
+        _load_fixture("US11468338B2")
 
     empty: list[str] = []
     for path in paths:
@@ -333,3 +332,33 @@ def test_every_fixture_yields_claims_or_fallback_text() -> None:
         if not doc.claims and not doc.claims_fallback_text:
             empty.append(path.name)
     assert not empty, f"no claims and no fallback text: {empty}"
+
+
+def test_non_numeric_claim_number_is_skipped_with_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ``num`` attribute that is not a number drops that claim, not the page.
+
+    Some machine-translated pages number a claim "0000a"; a bare int() would
+    end the whole parse with a ValueError the caller cannot act on.
+    """
+    html = """
+    <html><body><article>
+      <dd itemprop="publicationNumber">XX0000010A1</dd>
+      <section itemprop="claims" itemscope>
+        <div class="claim">
+          <div num="0001a" class="claim">
+            <div class="claim-text">1a. A widget with an odd number.</div>
+          </div>
+          <div num="00002" class="claim">
+            <div class="claim-text">2. A well-numbered widget.</div>
+          </div>
+        </div>
+      </section>
+    </article></body></html>
+    """
+    with caplog.at_level("WARNING", logger="patent_checker.gp.parse"):
+        doc = parse_patent_html(html)
+
+    assert [claim.number for claim in doc.claims] == [2]
+    assert "0001a" in caplog.text

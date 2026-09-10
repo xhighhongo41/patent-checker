@@ -9,13 +9,18 @@ implemented).
 
 from __future__ import annotations
 
+import errno
 import io
 import json
+import os
 import sys
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import dotenv
 import httpx
 import pytest
 
@@ -23,7 +28,7 @@ import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 import patent_checker.server.tools as server_tools
 from patent_checker import consent, installer, service
-from patent_checker.cache import Cache
+from patent_checker.cache import Cache, default_cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable
@@ -46,6 +51,67 @@ def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     below is ``null``; the paths themselves are covered where the cache is.
     """
     monkeypatch.setattr(cli_main, "_cache", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``main()``'s ``.env`` read away from the developer's own file.
+
+    ``main()`` loads the nearest ``.env`` for every subcommand (v1.0); the
+    test suite runs from the repository, whose ``.env`` holds real OPS
+    credentials. Replacing the loader keeps them out of ``os.environ``. The
+    test that covers the ``.env`` behaviour itself puts the real loader back
+    and works in ``tmp_path``.
+    """
+    monkeypatch.setattr(cli_main.config, "load_dotenv", lambda *args, **kwargs: False)
+
+
+@pytest.fixture
+def restore_environ() -> Iterator[None]:
+    """Undo whatever a test lets ``python-dotenv`` write into ``os.environ``.
+
+    ``load_dotenv`` sets variables directly, so ``monkeypatch`` cannot track
+    them; the whole environment is snapshotted and put back instead.
+    """
+    saved = os.environ.copy()
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+class _PlainStream:
+    """A minimal stdout/stderr stand-in: collects what was written to it."""
+
+    def __init__(self) -> None:
+        self.text = ""
+
+    def write(self, text: str) -> int:
+        """Collect what was printed."""
+        self.text += text
+        return len(text)
+
+    def flush(self) -> None:
+        """Accept flushes; nothing is buffered."""
+
+
+class _RecordingStream(_PlainStream):
+    """A stream that records every ``reconfigure`` call, optionally refusing it.
+
+    Args:
+        fails: Raise instead of accepting the new encoding, like a stream
+            whose encoding cannot be changed any more.
+    """
+
+    def __init__(self, *, fails: bool = False) -> None:
+        super().__init__()
+        self.calls: list[dict[str, Any]] = []
+        self._fails = fails
+
+    def reconfigure(self, **kwargs: Any) -> None:
+        """Record the request, or refuse it like a stream that cannot be re-encoded."""
+        self.calls.append(kwargs)
+        if self._fails:
+            raise ValueError("cannot reconfigure this stream")
 
 
 def _invoke(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
@@ -294,6 +360,26 @@ def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
         {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
     ]
     assert data["raw_path"] is None
+
+
+def test_legal_without_events_carries_a_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An empty event list is labelled, so it cannot be read as a failed fetch.
+
+    OPS answers "this publication has no INPADOC event" with a well-formed
+    document; without the note the output is indistinguishable from a lookup
+    that returned nothing at all.
+    """
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(legal=b"<xml/>"))
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: ())
+
+    rc, data = _invoke(["legal", "US.1.A1"], capsys)
+
+    assert rc == 0
+    assert data["events"] == []
+    assert data["note"] == service.LEGAL_NO_EVENTS_NOTE
 
 
 def test_family_success(
@@ -684,6 +770,164 @@ def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
     assert data == fake
 
 
+# --- .env, output encoding and I/O failures --------------------------------
+
+
+def test_every_command_reads_the_nearest_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    restore_environ: None,
+) -> None:
+    """``cache status`` honours a ``.env`` next to the caller, like the OPS commands do.
+
+    Before v1.0 only the commands that resolved OPS credentials read
+    ``.env``, so ``cache status`` and ``clean`` could report (and clean) a
+    different directory than the one the rest of the toolkit used.
+    """
+    monkeypatch.setattr(cli_main.config, "load_dotenv", dotenv.load_dotenv)
+    monkeypatch.delenv("PATENT_CHECKER_DATA_DIR", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_CACHE_DIR", raising=False)
+    monkeypatch.setattr(cli_main, "_cache", default_cache)
+    data_dir = tmp_path / "data"
+    (tmp_path / ".env").write_text(f"PATENT_CHECKER_DATA_DIR={data_dir}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    rc, data = _invoke(["cache", "status"], capsys)
+
+    assert rc == 0
+    assert data["shared_dir"] == str(data_dir / "cache")
+    assert data["local_dir"] == str(data_dir / "cache")
+
+
+def test_output_streams_are_switched_to_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both output streams are reconfigured to UTF-8 before anything is printed.
+
+    A Windows console defaults to a legacy code page, on which a Japanese
+    title would abort the command with a UnicodeEncodeError.
+    """
+    out = _RecordingStream()
+    err = _RecordingStream()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    rc = cli_main.main(["normalize", "US11468338B2"])
+
+    assert rc == 0
+    assert out.calls == [{"encoding": "utf-8"}]
+    assert err.calls == [{"encoding": "utf-8"}]
+    assert "US.11468338.B2" in out.text
+
+
+def test_a_stream_that_refuses_to_be_reconfigured_does_not_stop_the_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream that cannot be re-encoded is left as it is, and the command still runs."""
+    out = _RecordingStream(fails=True)
+    err = _PlainStream()
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    rc = cli_main.main(["normalize", "US11468338B2"])
+
+    assert rc == 0
+    assert "US.11468338.B2" in out.text
+
+
+def test_a_missing_input_file_is_an_io_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file that cannot be read is reported as JSON, not as a traceback."""
+    missing = tmp_path / "nonexistent.json"
+
+    rc, data = _invoke(["dedup", str(missing)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "io_error"
+    assert str(missing) in data["error"]["message"]
+    assert "No such file" in data["error"]["message"]
+
+
+def test_an_unreadable_verify_file_is_an_io_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same holds for the second payload of ``verify``: the path is named."""
+    input_path = tmp_path / "input.json"
+    input_path.write_text(json.dumps(["US11468338B2"]), encoding="utf-8")
+    missing = tmp_path / "output.json"
+
+    rc, data = _invoke(["verify", "--input", str(input_path), "--output", str(missing)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "io_error"
+    assert str(missing) in data["error"]["message"]
+
+
+# --- exit codes 3 and 4 across the subcommands -----------------------------
+
+# One invocation per OPS-backed subcommand, with the service function it
+# reaches, so that a failure of the shared service layer is checked to come
+# out as the documented envelope for every one of them.
+_SERVICE_ROUTES: tuple[tuple[str, list[str], str], ...] = (
+    ("search", ["search", "ti=drone"], "search"),
+    ("search-biblio", ["search-biblio", "ti=drone"], "search_biblio"),
+    ("plan-check", ["plan-check", "ti=drone"], "plan_check"),
+    ("biblio", ["biblio", "US.1.A1"], "biblio"),
+    ("legal", ["legal", "US.1.A1"], "legal"),
+    ("family", ["family", "US.1.A1"], "family"),
+    ("claims", ["claims", "EP1672502A1"], "claims"),
+    ("usage", ["usage"], "usage"),
+)
+
+_SERVICE_FAILURES: tuple[tuple[str, Exception, int, str], ...] = (
+    (
+        "http-error",
+        httpx.ConnectError("boom", request=httpx.Request("GET", "https://ops.epo.org")),
+        3,
+        "external_api_error",
+    ),
+    ("config-error", ConfigError("malformed $PATENT_CHECKER_CACHE_TTL"), 4, "config_error"),
+    (
+        "ops-not-configured",
+        ConfigError(service.OPS_NOT_CONFIGURED_MESSAGE),
+        4,
+        "ops_not_configured",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_type"),
+    [pytest.param(f, c, t, id=i) for i, f, c, t in _SERVICE_FAILURES],
+)
+@pytest.mark.parametrize(
+    ("argv", "function"),
+    [pytest.param(argv, function, id=name) for name, argv, function in _SERVICE_ROUTES],
+)
+def test_every_subcommand_maps_a_service_failure_to_its_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    function: str,
+    failure: Exception,
+    expected_code: int,
+    expected_type: str,
+) -> None:
+    """Each subcommand reports the same failure with the same type and exit code."""
+
+    def raising(*args: Any, **kwargs: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient())
+    monkeypatch.setattr(service, function, raising)
+
+    rc, data = _invoke(argv, capsys)
+
+    assert rc == expected_code
+    assert data["error"]["type"] == expected_type
+
+
 # --- consent --------------------------------------------------------------
 
 
@@ -883,6 +1127,81 @@ def test_serve_config_error_is_reported_as_config_error(
     assert rc == 4
     assert data == {"error": {"type": "config_error", "message": "boom"}}
     assert run_calls == []
+
+
+def test_serve_bind_failure_is_reported_as_a_config_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A busy port ends in the config-error envelope naming the port and --port."""
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        # Only host and port are read on this path; a namespace keeps the
+        # test independent of the settings dataclass' other fields.
+        return SimpleNamespace(transport="http", host="127.0.0.1", port=8642)
+
+    def fake_run(settings: Any) -> None:
+        raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", fake_run)
+
+    rc, data = _invoke(["serve"], capsys)
+
+    assert rc == 4
+    assert data["error"]["type"] == "config_error"
+    message = data["error"]["message"]
+    assert "8642" in message
+    assert "--port" in message
+    assert "Address already in use" in message
+
+
+def test_serve_stdio_reports_a_config_error_on_stderr_only(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With stdio, stdout is the protocol channel, so not even an error may go there."""
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        raise ConfigError("boom")
+
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", lambda settings: None)
+
+    try:
+        rc = cli_main.main(["serve", "--transport", "stdio"])
+    except SystemExit as exc:
+        rc = exc.code
+    captured = capsys.readouterr()
+
+    assert rc == 4
+    assert captured.out == ""
+    assert json.loads(captured.err) == {"error": {"type": "config_error", "message": "boom"}}
+
+
+def test_serve_stdio_io_failure_stays_off_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """stdio binds nothing, so an OSError there is an io_error -- and still not on stdout."""
+
+    def fake_load_settings(*, transport: str, host: str | None, port: int | None) -> Any:
+        return SimpleNamespace(transport="stdio", host="127.0.0.1", port=8642)
+
+    def fake_run(settings: Any) -> None:
+        raise OSError(errno.EPIPE, "Broken pipe")
+
+    monkeypatch.setattr(server_settings, "load_settings", fake_load_settings)
+    monkeypatch.setattr(server_app, "run", fake_run)
+
+    try:
+        rc = cli_main.main(["serve", "--transport", "stdio"])
+    except SystemExit as exc:
+        rc = exc.code
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert captured.out == ""
+    error = json.loads(captured.err)["error"]
+    assert error["type"] == "io_error"
+    assert "Broken pipe" in error["message"]
 
 
 def test_serve_invalid_transport_is_invalid_input(capsys: pytest.CaptureFixture[str]) -> None:
@@ -1390,6 +1709,36 @@ def test_install_list_agents_prints_every_known_agent(
     assert _files_under(tmp_path) == before
 
 
+def test_install_list_agents_warns_about_flags_it_ignores(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Listing agents ignores the installation flags, and now says so on stderr."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--list-agents", "--agent", "claude-code", "--dry-run"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "--agent" in captured.err
+    assert "--dry-run" in captured.err
+    assert captured.err.count("warning:") == 1
+    # The listing itself is unaffected.
+    assert "claude-code" in captured.out
+
+
+def test_install_list_agents_stays_silent_without_extra_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--scope belongs to listing, so using it warns about nothing."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--list-agents", "--scope", "project"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert captured.err == ""
+
+
 def test_install_dry_run_writes_nothing(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
@@ -1492,3 +1841,41 @@ def test_default_lang_follows_the_locale_environment(
 ) -> None:
     """LC_ALL wins over LANG, and only a ja* value selects Japanese."""
     assert cli_main._default_lang(environ) == expected
+
+
+def test_dedup_rejects_an_oversized_element(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI applies the same per-element size limit as the MCP server."""
+    from patent_checker.validation import MAX_ITEM_CHARS
+
+    path = tmp_path / "hits.json"
+    path.write_text(json.dumps([{"pub": "US" + "1" * (MAX_ITEM_CHARS + 1)}]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["dedup", str(path)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "hits[0]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
+def test_verify_rejects_an_oversized_input_payload(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The total-size limit applies to ``verify --input`` as well."""
+    from patent_checker.validation import MAX_ITEM_CHARS, MAX_PAYLOAD_CHARS
+
+    count = MAX_PAYLOAD_CHARS // MAX_ITEM_CHARS + 2
+    inputs = tmp_path / "in.json"
+    inputs.write_text(json.dumps(["U" * MAX_ITEM_CHARS] * count), encoding="utf-8")
+    outputs = tmp_path / "out.json"
+    outputs.write_text("[]", encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(
+        ["verify", "--input", str(inputs), "--output", str(outputs)], capsys
+    )
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err

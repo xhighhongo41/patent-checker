@@ -38,13 +38,25 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# Longest digit run accepted in a publication number. Real numbers use at
+# most 11 digits (4-digit year + 7-digit serial); the ceiling leaves one
+# spare digit and keeps an over-long input from reaching the file system,
+# where the docdb spelling becomes a cache path (ENAMETOOLONG).
+MAX_NUMBER_DIGITS: int = 12
+
 # Matches: 2-letter country + optional 1-char separator + digit run +
 # optional (1-char separator + kind letter + optional 1 digit).
 # Separator may be "", ".", "-" or a single space, independently at each
 # position; the pattern is applied to an already upper-cased, stripped string.
 # The digit run may contain a single "/" (e.g. the USPTO citation style
-# "2007/0016547"); it is stripped out before further normalization.
-_PUBNUM_RE = re.compile(r"^([A-Z]{2})[.\- ]?(\d+(?:/\d+)?)(?:[.\- ]?([A-Z]\d?))?$")
+# "2007/0016547"); it is stripped out before further normalization. Each side
+# of the slash is bounded by MAX_NUMBER_DIGITS; their sum is checked in
+# parse_pubnum.
+_PUBNUM_RE = re.compile(
+    rf"^([A-Z]{{2}})[.\- ]?"
+    rf"(\d{{1,{MAX_NUMBER_DIGITS}}}(?:/\d{{1,{MAX_NUMBER_DIGITS}}})?)"
+    rf"(?:[.\- ]?([A-Z]\d?))?$"
+)
 
 # DOCDB spells US A-kind publications with 10 digits through 2025 and 11
 # digits from 2026 (verified against EPO OPS, 2026-09).
@@ -102,7 +114,8 @@ def parse_pubnum(text: str) -> PubNumber:
     single ``.``, ``-`` or space between the parts.
 
     Raises:
-        ValueError: If ``text`` is not a recognizable publication number.
+        ValueError: If ``text`` is not a recognizable publication number,
+            including a digit run longer than :data:`MAX_NUMBER_DIGITS`.
         TypeError: If ``text`` is not a string.
     """
     if not isinstance(text, str):
@@ -116,6 +129,14 @@ def parse_pubnum(text: str) -> PubNumber:
     country, number, kind = match.groups()
     number = number.replace("/", "")
     kind = kind or ""
+
+    # The slash form is bounded per side by the pattern, so the sum is the
+    # only remaining way past the ceiling.
+    if len(number) > MAX_NUMBER_DIGITS:
+        raise ValueError(
+            f"publication number has {len(number)} digits, "
+            f"at most {MAX_NUMBER_DIGITS} are accepted: {text!r}"
+        )
 
     if (
         country == "US"

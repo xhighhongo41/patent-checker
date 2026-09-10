@@ -19,8 +19,7 @@ from patent_checker.utils import (
     usage_report,
     verify_batch,
 )
-
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+from tests._fixtures import fixture_path
 
 # X-Throttling-Control samples (see tests/test_ops_client.py for the source shape).
 _IDLE_HEADER = (
@@ -39,10 +38,7 @@ _BUSY_YELLOW_HEADER = (
 
 def _load_fixture(name: str) -> bytes:
     """Return the raw bytes of a saved OPS fixture, skipping if unavailable."""
-    path = FIXTURE_DIR / name
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_bytes()
+    return fixture_path(f"ops/{name}").read_bytes()
 
 
 # --- dedup_families ------------------------------------------------------
@@ -470,3 +466,93 @@ def test_usage_report_aggregates_and_skips_broken_lines(tmp_path: Path) -> None:
     assert result["today"]["total_requests"] == 2
     assert result["today"]["by_kind"] == {"search": 1, "biblio": 1}
     assert result["skipped_lines"] == 1
+
+
+# --- Input-shape errors (v1.0: TypeError normalized to ValueError) ----------
+
+
+def test_dedup_families_rejects_a_non_mapping_hit_with_its_position() -> None:
+    """A hit that is not a mapping names its position instead of leaking a TypeError."""
+    with pytest.raises(ValueError, match=r"hits\[1\]"):
+        dedup_families([{"pub": "US.1.A1", "family_id": "1"}, "US.2.A1"])
+
+
+def test_dedup_families_rejects_a_non_string_pub_with_its_position() -> None:
+    """A mapping whose "pub" is not a string is reported by position too."""
+    with pytest.raises(ValueError, match=r"hits\[0\]"):
+        dedup_families([{"pub": 12345, "family_id": "1"}])
+
+
+def test_dedup_families_still_raises_key_error_without_pub() -> None:
+    """The documented KeyError for a missing "pub" key is unchanged."""
+    with pytest.raises(KeyError):
+        dedup_families([{"family_id": "1"}])
+
+
+def test_verify_batch_rejects_a_non_string_input_pub_with_its_position() -> None:
+    """A non-string element of input_pubs is an input error, not a TypeError."""
+    with pytest.raises(ValueError, match=r"input_pubs\[1\]"):
+        verify_batch(["US.1.A1", None], ["US.1.A1"])
+
+
+def test_verify_batch_rejects_a_non_mapping_output_record_with_its_position() -> None:
+    """An output record that is neither a string nor a mapping names its position."""
+    with pytest.raises(ValueError, match=r"output_records\[1\]"):
+        verify_batch(["US.1.A1"], ["US.1.A1", ["US.2.A1"]])
+
+
+def test_verify_batch_rejects_a_non_string_pub_in_an_output_record() -> None:
+    """A mapping output record whose "pub" is not a string names its position."""
+    with pytest.raises(ValueError, match=r"output_records\[0\]"):
+        verify_batch(["US.1.A1"], [{"pub": 1}])
+
+
+# --- Malformed request-log lines --------------------------------------------
+
+
+def test_usage_report_survives_a_numeric_at_value(tmp_path: Path) -> None:
+    """A numeric "at" (a hand-edited or foreign log line) is counted, not fatal."""
+    lines = [
+        '{"at": 1700000000, "kind": "search", "url": "u1", "status": 200, "throttling": ""}',
+        '{"at": "2020-01-01T00:00:00", "kind": "biblio", "url": "u2", "status": 200}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path)
+
+    assert result["total_requests"] == 2
+    assert result["by_kind"] == {"search": 1, "biblio": 1}
+    assert result["today"]["total_requests"] == 0
+
+
+def test_usage_report_skips_a_line_that_is_not_a_json_object(tmp_path: Path) -> None:
+    """A valid JSON line that is not an object is skipped like a broken line."""
+    lines = [
+        "[1, 2, 3]",
+        '"just a string"',
+        '{"at": "2020-01-01T00:00:00", "kind": "search", "url": "u", "status": 200}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path)
+
+    assert result["total_requests"] == 1
+    assert result["skipped_lines"] == 2
+
+
+def test_usage_report_survives_a_non_string_throttling_value(tmp_path: Path) -> None:
+    """A non-string "throttling" value is ignored rather than raising."""
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        '{"at": "2020-01-01T00:00:00", "kind": "search", "url": "u", '
+        '"status": 200, "throttling": 7}\n',
+        encoding="utf-8",
+    )
+
+    result = usage_report(path)
+
+    assert result["total_requests"] == 1
+    assert result["non_green_events"] == 0
+    assert result["system_states"] == {}

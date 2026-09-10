@@ -9,8 +9,8 @@ Run a prior-art exploration of the target software by combining this
 workflow (the judgment work) with the `patent-checker` MCP server (the
 deterministic work: searching, fetching, normalizing, verifying). The
 procedure below was validated end-to-end on two projects of different
-character during v0.1 and re-validated through the CLI in v0.2; v0.3
-moves the data access to MCP tools without changing the procedure.
+character during development, first by hand, then through the CLI; the
+MCP tools took over the data access without changing the procedure.
 
 ## Preconditions and constraints (non-negotiable)
 
@@ -32,10 +32,14 @@ moves the data access to MCP tools without changing the procedure.
 - The target repository is read-only. All artifacts are written on the
   exploring side, under `.patent-checker/` (see step 0.5).
 - Tool results are structured JSON objects. A failed call raises a tool
-  error whose message starts with one of three prefixes: `invalid_input:`
+  error whose message starts with one of four prefixes: `invalid_input:`
   (fix the argument), `external_api_error:` (the upstream service failed;
   retry later or record the gap), `ops_not_configured:` (the server has no
-  OPS credentials — the degraded-mode signal, see step 11). A result
+  OPS credentials — the degraded-mode signal, see step 11), `upstream_data:`
+  (the document came back but could not be read; changing the argument
+  will not help and retrying is pointless — record the gap, or ask the
+  operator to run `patent-checker cache clear --pub <pub>` if it persists).
+  A result
   carrying `"cached": true` was served from the server's cache instead of
   a fresh upstream request; treat it exactly like a fresh result. Each kind
   of data has its own expiry (claim and description bodies never expire;
@@ -106,7 +110,7 @@ vocabulary. **Systematic synonym expansion is mandatory**: list at least
 three families of spelling variants per concept — device terms (processor
 / processing unit / engine / accelerator / coprocessor), serving terms
 (serving / server / hosting / deployment), storage terms (block / sector /
-cluster), and so on. Both v0.1 runs lost patents in force to missing
+cluster), and so on. Both validation runs lost patents in force to missing
 synonym families; treat this table as the core asset of the exploration.
 
 ### 3. Classification estimation
@@ -150,7 +154,7 @@ symbol alone hits too much.
   restoring a file's content).
 - After each batch returns, machine-check it:
   `verify_batch(input_pubs=[...], output_records=[...])` (silent omissions
-  really happened in v0.1; re-judge missing items yourself).
+  really happened during validation; re-judge missing items yourself).
 - Normalize verdict thresholds in your own second review. Normalization
   axis: **does the claim read on the target software's own behavior, or on
   the internals of a toolchain/platform it merely uses?** Classify the
@@ -173,18 +177,23 @@ symbol alone hits too much.
   (reads-on direction / lacks / unclear). **No overall verdict.**
 - **Family expansion is mandatory for every close-read document**:
   `get_family(pub="<pub>")`. Never judge rights on a single country's
-  member — v0.1 found expired-in-CN/alive-in-US, and JP/KR withdrawals
-  alongside a KR grant, only through expansion.
+  member — the validation runs found expired-in-CN/alive-in-US, and JP/KR
+  withdrawals alongside a KR grant, only through expansion.
 
 ### 8. Legal-status cross-check
 - For every document in the element tables plus key family members:
   `get_legal(pub="<pub>")`. **INPADOC is the authority; Google Patents
-  status labels are reference values only** (v0.1: 5 of 10 disagreed).
+  status labels are reference values only** (during validation, 5 of 10
+  sampled documents disagreed).
   `get_biblio(pub)` gives the bibliographic record (title, abstract,
   applicants, classification, citations) of a single document when a
   search page did not carry it.
 - Interpret events with `references/legal-status-codes.md` and cite the
-  decisive event (code + date) in the report.
+  decisive event (code + date) in the report. A response with
+  `"events": []` and a `note` means OPS reported no events at all for that
+  publication (it does happen for some offices, GB among them): treat the
+  status as unknown, say so in the report, and do not read it as "no
+  rights".
 - Pending applications are "monitored": write a next-check date into the
   report.
 
@@ -248,15 +257,17 @@ bodies (never from summarized search snippets — hallucination guard).
 6. Review every sub-agent result yourself before it feeds the next step.
 7. Stage-2 element comparison requires a sub-agent that is allowed to
    make judgments: pick an agent type whose role includes assessment, not
-   a read-only summarizer (v0.2: a read-only reader declined the task).
+   a read-only summarizer (during validation, a read-only reader declined
+   the task).
 
-## Failure-mode quick reference (measured in v0.1 and v0.2)
+## Failure-mode quick reference (measured during validation)
 
 | Symptom | Cause / action |
 |---|---|
 | `ops_search` / `ops_search_biblio` returns `"total": 0` | Nothing matched (OPS reports this as a 404 fault; the server normalizes it). Not an error |
 | Tool error `invalid_input: ...` on a search | Range end > 2000, span > 100, malformed publication number, or an over-long query; fix the argument and call again |
 | Tool error `external_api_error: ...` | Upstream OPS / Google Patents failure or throttling; wait, retry once, then record the gap in "Scope and limitations" |
+| Tool error `upstream_data: ...` | The document was fetched but could not be parsed (unexpected markup, corrupt cache entry); retrying with the same or a changed argument will not help. Record the gap; a persistent case is cleared by the operator with `patent-checker cache clear --pub <pub>` |
 | `get_claims` returns `"unavailable": true` | Indexing lag (about two months after publication). EP/WO fall back to OPS automatically; others go to the monitoring list |
 | `get_claims` (GP) returns `claims_fallback_text` instead of numbered claims | Page without claim-number markup (older CN/KR/WO). Read the flat text; numbering must be recovered manually |
 | Family member looked dead, right was alive elsewhere | Expansion is mandatory (step 7) before any rights statement |
@@ -268,10 +279,12 @@ bodies (never from summarized search snippets — hallucination guard).
 The `patent-checker` CLI installed with the server offers the same
 operations with the same JSON shapes, so the procedure above can be run
 unchanged from a shell. CLI errors come as `{"error": {"type", "message"}}`
-with exit codes 0 = success, 2 = invalid input, 3 = external API error,
-4 = configuration error: OPS not configured (`ops_not_configured`, the
-CLI equivalent of that tool-error prefix) or an invalid cache setting
-(`config_error`).
+with exit codes 0 = success, 2 = invalid input (`invalid_input`) or a
+file that could not be read or written (`io_error`), 3 = external API
+error, 4 = configuration error: OPS not configured (`ops_not_configured`,
+the CLI equivalent of that tool-error prefix) or an invalid cache setting
+(`config_error`). Unreadable upstream data is `upstream_data` with exit
+code 3.
 
 | MCP tool | CLI subcommand |
 |---|---|

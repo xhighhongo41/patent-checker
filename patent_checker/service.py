@@ -26,7 +26,9 @@ stored entry.
 
 The cache also owns the single on-disk copy of every response body: the
 ``"raw_path"`` of a result names that copy, and is ``None`` when no cache
-was given (nothing was stored).
+was given (nothing was stored). A fetched body is stored only once it has
+been parsed successfully, so an unusable response is fetched again next
+time instead of being served from disk for as long as its kind lives.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from typing import Any
 
 import httpx
 
+from patent_checker import validation
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable, fetch_patent_html
@@ -60,8 +63,14 @@ OPS_FULLTEXT_COUNTRIES: tuple[str, ...] = ("EP", "WO")
 
 # Ceiling on the number of records an offline batch helper (``dedup``,
 # ``verify``) accepts, so one call cannot turn into unbounded work. Same
-# limit as the MCP tools' ``MAX_RECORDS``; both front ends share it.
+# limit as the MCP tools' ``MAX_RECORDS``; both front ends share it, and
+# this layer enforces it itself so no front end can forget to.
 MAX_BATCH_RECORDS = 10000
+
+# Added to a legal-status result that carries no event at all. OPS answers
+# "this publication has no INPADOC event" with a well-formed, empty document,
+# which reads exactly like a failed fetch unless the result says otherwise.
+LEGAL_NO_EVENTS_NOTE = "no legal events reported by OPS for this publication"
 
 # Shared wording for the "OPS is not available" failure, so the CLI's
 # pre-flight check and this layer's client check report the same thing.
@@ -145,8 +154,12 @@ def search(
         xml, raw_path = cache_hit.content, cache_hit.path
     else:
         xml = client.search(cql, begin=begin, end=end)
-        raw_path = cache.put("search", key, xml, ident=cql) if cache is not None else None
+        raw_path = None
     page = parse_search_xml(xml)
+    if cache_hit is None and cache is not None:
+        # Stored only now: a body the parser rejects must not become the
+        # cached answer for the rest of the entry's lifetime.
+        raw_path = cache.put("search", key, xml, ident=cql)
     result = {
         "query": page.query,
         "total": page.total_count,
@@ -196,8 +209,10 @@ def search_biblio(
         xml, raw_path = cache_hit.content, cache_hit.path
     else:
         xml = client.search_biblio(cql, begin=begin, end=end)
-        raw_path = cache.put("searchbib", key, xml, ident=cql) if cache is not None else None
+        raw_path = None
     page = parse_search_biblio_xml(xml)
+    if cache_hit is None and cache is not None:
+        raw_path = cache.put("searchbib", key, xml, ident=cql)
     result = {
         "total": page.total_count,
         "begin": page.begin,
@@ -278,8 +293,10 @@ def biblio(
         xml, raw_path = cache_hit.content, cache_hit.path
     else:
         xml = client.biblio(pub)
-        raw_path = cache.put("biblio", key, xml, ident=pub) if cache is not None else None
+        raw_path = None
     result = dataclasses.asdict(parse_biblio_xml(xml))
+    if cache_hit is None and cache is not None:
+        raw_path = cache.put("biblio", key, xml, ident=pub)
     result["raw_path"] = _raw_path_field(raw_path)
     if cache_hit is not None:
         result["cached"] = True
@@ -304,9 +321,10 @@ def legal(
 
     Returns:
         ``{"pub" (DOCDB spelling), "events": [...], "raw_path"}``, plus
-        ``"cached": True`` when the result came from *cache*. ``"raw_path"``
-        names the single stored copy of the response body, and is ``None``
-        when no cache was given.
+        ``"note": LEGAL_NO_EVENTS_NOTE`` when OPS reported no event at all,
+        plus ``"cached": True`` when the result came from *cache*.
+        ``"raw_path"`` names the single stored copy of the response body, and
+        is ``None`` when no cache was given.
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -319,13 +337,19 @@ def legal(
         xml, raw_path = cache_hit.content, cache_hit.path
     else:
         xml = client.legal(pub)
-        raw_path = cache.put("legal", key, xml, ident=pub) if cache is not None else None
+        raw_path = None
     events = parse_legal_xml(xml)
-    result = {
+    if cache_hit is None and cache is not None:
+        raw_path = cache.put("legal", key, xml, ident=pub)
+    result: dict[str, Any] = {
         "pub": key,
         "events": [dataclasses.asdict(event) for event in events],
         "raw_path": _raw_path_field(raw_path),
     }
+    if not events:
+        # "Nothing was reported" and "nothing could be fetched" are different
+        # answers; without this note an empty list reads like the latter.
+        result["note"] = LEGAL_NO_EVENTS_NOTE
     if cache_hit is not None:
         result["cached"] = True
     return result
@@ -363,8 +387,10 @@ def family(
         xml, raw_path = cache_hit.content, cache_hit.path
     else:
         xml = client.family(pub)
-        raw_path = cache.put("family", key, xml, ident=pub) if cache is not None else None
+        raw_path = None
     result = parse_family_xml(xml)
+    if cache_hit is None and cache is not None:
+        raw_path = cache.put("family", key, xml, ident=pub)
     out = {
         "family_id": result.family_id,
         "members": list(result.members),
@@ -421,7 +447,16 @@ def claims(
         fetched = fetch_patent_html(pub, client=gp_client, cache=cache, force=refresh)
 
     if isinstance(fetched, FetchedPage):
-        doc = parse_patent_html(fetched.html)
+        try:
+            doc = parse_patent_html(fetched.html)
+        except Exception:
+            # The fetcher stores the page before this layer can parse it, and
+            # the Google Patents kind never expires, so a page that cannot be
+            # read is dropped again rather than kept forever. A page that came
+            # from the cache is left alone: it is the caller's existing entry.
+            if cache is not None and not fetched.cached:
+                _drop_cached_page(cache, pub)
+            raise
         gp_result = {
             "source": "gp",
             "pub": doc.pub_number,
@@ -451,11 +486,14 @@ def claims(
                 if exc.response.status_code == httpx.codes.NOT_FOUND:
                     return _claims_unavailable(fetched)
                 raise
-            raw_path = cache.put("claims", key, xml, ident=pub) if cache is not None else None
+            raw_path = None
+        claims_read = [dataclasses.asdict(claim) for claim in parse_claims_xml(xml)]
+        if cache_hit is None and cache is not None:
+            raw_path = cache.put("claims", key, xml, ident=pub)
         result = {
             "source": "ops-fulltext",
             "pub": pub,
-            "claims": [dataclasses.asdict(claim) for claim in parse_claims_xml(xml)],
+            "claims": claims_read,
             "raw_path": _raw_path_field(raw_path),
         }
         if cache_hit is not None:
@@ -468,6 +506,11 @@ def claims(
 def _claims_unavailable(fetched: GPUnavailable) -> dict[str, Any]:
     """Build the "claims could not be fetched from any source" result."""
     return {"unavailable": True, "pub": fetched.pub, "retry_after_hint": fetched.retry_after_hint}
+
+
+def _drop_cached_page(cache: Cache, pub: str) -> None:
+    """Remove the cached Google Patents page of *pub*, ignoring what is not there."""
+    cache.remove(cache.select(kinds=("gp",), pub=pub))
 
 
 # --- offline helpers -----------------------------------------------------
@@ -508,8 +551,11 @@ def dedup(hits: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         ``{"families": [...], "count": int}``.
 
     Raises:
-        KeyError: If a hit is missing the required ``"pub"`` key.
+        ValueError: If *hits* holds more than :data:`MAX_BATCH_RECORDS`
+            records, or a record is not a mapping carrying a ``"pub"``
+            string, or the batch is larger than the shared size limits.
     """
+    validation.validate_batch(hits, label="hits", max_records=MAX_BATCH_RECORDS)
     families = dedup_families(hits)
     return {"families": families, "count": len(families)}
 
@@ -524,7 +570,14 @@ def verify(input_pubs: Sequence[Any], output_records: Sequence[Any]) -> dict[str
 
     Returns:
         :func:`patent_checker.utils.verify_batch`'s report.
+
+    Raises:
+        ValueError: If either list holds more than :data:`MAX_BATCH_RECORDS`
+            records, or an element has a shape the report cannot be built
+            from, or a list is larger than the shared size limits.
     """
+    validation.validate_batch(input_pubs, label="input_pubs", max_records=MAX_BATCH_RECORDS)
+    validation.validate_batch(output_records, label="output_records", max_records=MAX_BATCH_RECORDS)
     return verify_batch(input_pubs, output_records)
 
 

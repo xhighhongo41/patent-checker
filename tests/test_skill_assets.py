@@ -78,7 +78,12 @@ def test_skill_keeps_consent_on_the_cli_and_names_the_error_prefixes() -> None:
     text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
     assert "`patent-checker consent status`" in text
     assert "`patent-checker consent record --lang <lang>`" in text
-    for prefix in ("invalid_input:", "external_api_error:", "ops_not_configured:"):
+    for prefix in (
+        "invalid_input:",
+        "external_api_error:",
+        "ops_not_configured:",
+        "upstream_data:",
+    ):
         assert f"`{prefix}`" in text, prefix
     assert "server_status" in text
 
@@ -214,3 +219,68 @@ def test_readme_states_the_no_verdict_boundary_and_the_installer_flow() -> None:
         "patent-checker clean",
     ):
         assert needle in text, needle
+
+
+DOCS = REPO_ROOT / "docs"
+
+
+def test_skill_carries_no_internal_version_history() -> None:
+    """The shipped Skill text must not cite development version numbers (v1.0)."""
+    for path in [SKILL_DIR / "SKILL.md", *sorted((SKILL_DIR / "references").glob("*.md"))]:
+        text = path.read_text(encoding="utf-8")
+        assert not re.search(r"\bv0\.[0-9]", text), f"{path.name} still cites a v0.x version"
+
+
+@pytest.mark.parametrize(
+    ("readme", "sections"),
+    [
+        (
+            README,
+            [
+                "## The bearer token",
+                "## Without an EPO OPS account (degraded mode)",
+                "## Uninstalling",
+                "## Updating",
+                "### If the server answers 401",
+            ],
+        ),
+        (
+            README_JA,
+            [
+                "## ベアラートークン",
+                "## EPO OPS アカウントが無い場合(縮退モード)",
+                "## アンインストール",
+                "## 更新",
+                "### サーバーが 401 を返す場合",
+            ],
+        ),
+    ],
+    ids=["en", "ja"],
+)
+def test_readme_has_the_release_sections(readme: Path, sections: list[str]) -> None:
+    """v1.0: token, degraded mode, uninstall and update are dedicated sections."""
+    text = readme.read_text(encoding="utf-8")
+    for heading in sections:
+        assert heading in text, heading
+
+
+@pytest.mark.parametrize(
+    "name", ["deploy-lan.md", "deploy-lan_ja.md", "mcp-clients.md", "mcp-clients_ja.md"]
+)
+def test_docs_pages_exist_and_are_linked_from_the_readme(name: str) -> None:
+    """Each docs page ships in both languages and the README points at it."""
+    page = DOCS / name
+    assert page.is_file(), name
+    readme = README_JA if name.endswith("_ja.md") else README
+    assert name in readme.read_text(encoding="utf-8"), f"{readme.name} does not link {name}"
+    counterpart = (
+        name.replace("_ja.md", ".md") if name.endswith("_ja.md") else name.replace(".md", "_ja.md")
+    )
+    assert counterpart in page.read_text(encoding="utf-8"), f"{name} does not link {counterpart}"
+
+
+def test_readme_avoids_developer_only_remarks() -> None:
+    """v1.0: the README is for users; internal wording must not creep back in."""
+    text = README.read_text(encoding="utf-8")
+    for phrase in ("pre-release", "Keep it that way", "this README", "proof of concept"):
+        assert phrase not in text, phrase

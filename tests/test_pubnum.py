@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 
-from patent_checker.pubnum import PubNumber, parse_pubnum
+from patent_checker.pubnum import MAX_NUMBER_DIGITS, PubNumber, parse_pubnum
 
 # (input text, expected country, expected number, expected kind)
 VALID_CASES = [
@@ -265,3 +265,31 @@ def test_parse_pubnum_rejects_malformed_slash_forms(text: str) -> None:
     """More than one slash, or a slash with nothing on one side, still raises."""
     with pytest.raises(ValueError):
         parse_pubnum(text)
+
+
+# --- Digit-count ceiling (v1.0) ---------------------------------------------
+
+TOO_MANY_DIGITS_CASES = [
+    "US" + "1" * 13,  # 13 digits: one past the ceiling
+    "US." + "9" * 40 + ".A1",  # a pasted paragraph of digits
+    "US 2007/00165470000 A1",  # slash form whose digits add up past the ceiling
+]
+
+
+@pytest.mark.parametrize("text", TOO_MANY_DIGITS_CASES)
+def test_parse_pubnum_rejects_numbers_past_the_digit_ceiling(text: str) -> None:
+    """A digit run longer than MAX_NUMBER_DIGITS is rejected, not carried around.
+
+    An unbounded digit run reaches file-system paths (cache keys are built from
+    the docdb spelling) and can only fail there, with ENAMETOOLONG.
+    """
+    with pytest.raises(ValueError):
+        parse_pubnum(text)
+
+
+def test_parse_pubnum_accepts_the_longest_allowed_digit_run() -> None:
+    """The ceiling itself is accepted, so real long numbers keep parsing."""
+    text = "JP" + "1" * MAX_NUMBER_DIGITS + "A"
+    result = parse_pubnum(text)
+    assert result.number == "1" * MAX_NUMBER_DIGITS
+    assert result.kind == "A"

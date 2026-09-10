@@ -352,6 +352,140 @@ def test_load_env_does_nothing_when_no_dotenv_file_is_found(monkeypatch, tmp_pat
     assert _LOAD_ENV_VAR not in os.environ
 
 
+def _home_tree(monkeypatch, tmp_path) -> tuple[Path, Path, Path]:
+    """Build ``home/proj/sub`` under ``tmp_path`` and make ``home`` the home directory.
+
+    ``Path.home`` is replaced rather than ``$HOME`` so the boundary is
+    exercised without ever reading the real home directory of whoever runs
+    the suite.
+    """
+    home = tmp_path / "home"
+    project = home / "proj"
+    sub = project / "sub"
+    sub.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.delenv(_LOAD_ENV_VAR, raising=False)
+    return home, project, sub
+
+
+def test_load_env_walks_up_to_the_nearest_dotenv(monkeypatch, tmp_path) -> None:
+    """From a subdirectory, the project's ``.env`` one level up is the one that is read."""
+    _home, project, sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(f"{_LOAD_ENV_VAR}=from-project\n", encoding="utf-8")
+    monkeypatch.chdir(sub)
+
+    config.load_env()
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-project"
+
+
+def test_load_env_prefers_the_closest_dotenv(monkeypatch, tmp_path) -> None:
+    """The first ``.env`` found on the way up wins over one further away."""
+    _home, project, sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(f"{_LOAD_ENV_VAR}=from-project\n", encoding="utf-8")
+    (sub / ".env").write_text(f"{_LOAD_ENV_VAR}=from-sub\n", encoding="utf-8")
+    monkeypatch.chdir(sub)
+
+    config.load_env()
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-sub"
+
+
+def test_load_env_never_reads_the_home_directorys_dotenv(monkeypatch, tmp_path) -> None:
+    """A ``.env`` in the home directory belongs to other tools and is left alone."""
+    home, project, _sub = _home_tree(monkeypatch, tmp_path)
+    (home / ".env").write_text(f"{_LOAD_ENV_VAR}=from-home\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    config.load_env()
+
+    assert _LOAD_ENV_VAR not in os.environ
+
+
+def test_load_env_does_not_read_the_dotenv_of_the_home_directory_itself(
+    monkeypatch, tmp_path
+) -> None:
+    """Even when the home directory *is* the working directory, its ``.env`` is skipped."""
+    home, _project, _sub = _home_tree(monkeypatch, tmp_path)
+    (home / ".env").write_text(f"{_LOAD_ENV_VAR}=from-home\n", encoding="utf-8")
+    monkeypatch.chdir(home)
+
+    config.load_env()
+
+    assert _LOAD_ENV_VAR not in os.environ
+
+
+def test_dotenv_directories_stop_below_the_home_directory() -> None:
+    """The search covers the working directory and its parents down to (not into) home."""
+    home = Path("/base/home")
+
+    directories = config._dotenv_directories(home / "proj" / "sub", home)
+
+    assert directories == [home / "proj" / "sub", home / "proj"]
+
+
+def test_dotenv_directories_stop_below_the_filesystem_root() -> None:
+    """Outside the home directory the search stops before the root itself."""
+    root = Path(Path.cwd().anchor)
+
+    directories = config._dotenv_directories(root / "srv" / "app", home=None)
+
+    assert directories == [root / "srv" / "app", root / "srv"]
+    assert root not in directories
+
+
+def test_dotenv_directories_of_the_root_itself_are_empty() -> None:
+    """Running from the root leaves nothing to search: the root is never examined."""
+    root = Path(Path.cwd().anchor)
+
+    assert config._dotenv_directories(root, home=None) == []
+
+
+def test_load_env_reads_the_dotenv_only_once_per_process(monkeypatch, tmp_path) -> None:
+    """A second call is a no-op, so ``.env`` cannot be re-read mid-run."""
+    _home, project, _sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(f"{_LOAD_ENV_VAR}=from-project\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    config.load_env()
+    assert os.environ[_LOAD_ENV_VAR] == "from-project"
+    monkeypatch.delenv(_LOAD_ENV_VAR)
+    config.load_env()
+
+    assert _LOAD_ENV_VAR not in os.environ
+
+
+def test_load_env_force_reloads_the_dotenv(monkeypatch, tmp_path) -> None:
+    """``force=True`` clears the once-per-process latch (used by the tests themselves)."""
+    _home, project, _sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(f"{_LOAD_ENV_VAR}=from-project\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+
+    config.load_env()
+    monkeypatch.delenv(_LOAD_ENV_VAR)
+    config.load_env(force=True)
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-project"
+
+
+def test_load_env_survives_an_undiscoverable_home_directory(monkeypatch, tmp_path) -> None:
+    """When the home directory cannot be resolved, the search still stops at the root."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".env").write_text(f"{_LOAD_ENV_VAR}=from-project\n", encoding="utf-8")
+
+    def _no_home() -> Path:
+        raise RuntimeError("home directory cannot be determined")
+
+    monkeypatch.setattr(Path, "home", _no_home)
+    monkeypatch.delenv(_LOAD_ENV_VAR, raising=False)
+    monkeypatch.chdir(project)
+
+    config.load_env()
+
+    assert os.environ[_LOAD_ENV_VAR] == "from-project"
+
+
 # --- _resolve_secret: empty _FILE variant -------------------------------
 
 

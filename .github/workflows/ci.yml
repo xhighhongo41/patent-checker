@@ -1,12 +1,17 @@
 # CI for patent-checker.
 #
-# "check" runs lint, format check and the unit tests on Linux, "check-macos"
-# and "check-windows" run the unit tests on the other two desktop platforms,
-# and "container" builds the Docker image and drives it through
+# "check" runs lint, format check, the dependency audit and the unit tests on
+# Linux (Python 3.12 and 3.13), "check-macos" and "check-windows" run the unit
+# tests on the other two desktop platforms, "gitleaks" scans the history and
+# the diff for committed secrets, and "container" builds the Docker image,
+# scans it for known vulnerabilities and drives it through
 # tools/container_smoke.sh (docker compose up, /health, bearer token,
-# operator-notice gate). Unit tests never touch the network; the container
-# smoke test starts the server in degraded mode (no EPO OPS credentials)
-# with a throw-away bearer token that is never printed.
+# operator-notice gate, hardening, LAN example). Unit tests never touch the
+# network; the container smoke test starts the server in degraded mode (no
+# EPO OPS credentials) with a throw-away bearer token that is never printed.
+#
+# Every third-party action is pinned to a commit SHA (the tag it corresponds
+# to is in the trailing comment); Dependabot keeps the pins current.
 name: CI
 
 on:
@@ -27,20 +32,37 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Lint, format check and unit tests
-        run: tools/check.sh
+      - name: Lint and format check
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          sh -n install.sh
+
+      - name: Audit locked dependencies for known vulnerabilities
+        # `uv audit` is still marked experimental by uv; the plan's fallback
+        # is pip-audit over `uv export` if it breaks.
+        run: uv audit --locked --preview-features audit-command
+
+      - name: Unit tests
+        # Without --fixtures-required: the recorded upstream responses under
+        # tests/fixtures/ are not tracked, so their tests skip here.
+        run: uv run pytest -q
 
       - name: Bootstrap script dry run
         run: sh install.sh --dry-run
@@ -49,10 +71,10 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           python-version: "3.12"
@@ -70,10 +92,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
           python-version: "3.12"
@@ -87,17 +109,35 @@ jobs:
       - name: Bootstrap script dry run
         run: pwsh -NoProfile -File install.ps1 -DryRun
 
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Scan the history and the diff for secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No GITLEAKS_LICENSE: not needed for repositories owned by a
+          # personal account.
+
   container:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build the image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           load: true
@@ -106,7 +146,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Scan the image for known vulnerabilities
+        # Fails on HIGH/CRITICAL findings that have a fix; unfixed findings in
+        # the base image are reported but do not block (they cannot be acted
+        # on here).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: patent-checker:ci
+          format: table
+          exit-code: "1"
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
       - name: Smoke-test the image with docker compose
         env:
           PATENT_CHECKER_IMAGE: patent-checker:ci
         run: tools/container_smoke.sh
+
+      - name: Smoke-test the LAN/TLS example (Caddy in front)
+        # Pulls the Caddy image and mints a certificate from Caddy's internal
+        # CA. Informative only: a flaky pull or a slow CA bootstrap must not
+        # block the pipeline (see the plan's decision tree C4).
+        continue-on-error: true
+        env:
+          PATENT_CHECKER_IMAGE: patent-checker:ci
+        run: tools/lan_smoke.sh

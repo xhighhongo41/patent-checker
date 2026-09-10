@@ -1,12 +1,16 @@
 """Assembly of the patent-checker MCP server (FastMCP 4).
 
 This module owns everything that is shared between tool calls: the resolved
-settings, the long-lived EPO OPS and Google Patents clients, the response
-cache and the two locks that keep upstream pacing intact while FastMCP runs
-tools concurrently in worker threads. All of it lives in one
-:class:`ServerState`, which the server lifespan puts into the lifespan
-context under ``"state"``; the tools in :mod:`patent_checker.server.tools`
-read it from there.
+settings, the long-lived EPO OPS and Google Patents clients and the response
+cache. All of it lives in one :class:`ServerState`, which the server lifespan
+puts into the lifespan context under ``"state"``; the tools in
+:mod:`patent_checker.server.tools` read it from there. One state -- and
+therefore one OPS client -- serves the whole process, which is what makes the
+upstream pacing hold: the clients serialize their own upstream round trips
+internally (``OpsClient``'s instance lock, the module lock of
+:mod:`patent_checker.gp.fetch`), so FastMCP may run tool calls concurrently
+in worker threads while only one request at a time actually leaves for a
+given upstream.
 
 Both outbound clients are wrapped in
 :class:`~patent_checker.net.AllowlistTransport`, so the server can only ever
@@ -17,7 +21,7 @@ Transports differ in their trust model, which is reflected in what is built
 here and what the startup banner says:
 
 - ``http`` binds a TCP port and therefore requires a bearer token
-  (:class:`~fastmcp.server.auth.providers.jwt.StaticTokenVerifier`) plus
+  (:class:`~patent_checker.server.auth.ConstantTimeTokenVerifier`) plus
   Host/Origin protection; TLS is left to a reverse proxy.
 - ``stdio`` has no network surface and no authentication: the server runs
   with the permissions of whoever started it.
@@ -26,29 +30,27 @@ here and what the startup banner says:
 from __future__ import annotations
 
 import copy
-import importlib.metadata
 import sys
-import threading
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 import uvicorn.config
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.http import StarletteWithLifespan
 from fastmcp.server.lifespan import lifespan
 from fastmcp.server.middleware.rate_limiting import RateLimitingMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from patent_checker import config
+from patent_checker import __version__, config
 from patent_checker.cache import Cache
 from patent_checker.config import ConfigError
 from patent_checker.net import AllowlistTransport
 from patent_checker.ops.client import OpsClient
 from patent_checker.server import tools
+from patent_checker.server.auth import ConstantTimeTokenVerifier
 from patent_checker.server.settings import ServerSettings, describe
 
 SERVER_NAME = "patent-checker"
@@ -85,19 +87,16 @@ class ServerState:
             still work).
         gp_client: The shared Google Patents HTTP client.
         cache: The file cache for OPS responses.
-        ops_lock: Serializes OPS calls, so ``OpsClient``'s per-service
-            pacing holds across concurrent tool calls.
-        gp_lock: Serializes Google Patents calls, so the courtesy interval in
-            :mod:`patent_checker.gp.fetch` holds across concurrent tool
-            calls.
+
+    There is no lock here on purpose: pacing is enforced inside the clients
+    (see the module docstring), so a long-running tool call cannot block the
+    others.
     """
 
     settings: ServerSettings
     ops_client: OpsClient | None
     gp_client: httpx.Client
     cache: Cache
-    ops_lock: threading.Lock = field(default_factory=threading.Lock)
-    gp_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def build_state(
@@ -196,7 +195,7 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
     mcp: FastMCP = FastMCP(
         SERVER_NAME,
         instructions=INSTRUCTIONS,
-        version=importlib.metadata.version("patent-checker"),
+        version=__version__,
         auth=auth,
         lifespan=server_lifespan,
         # Only the mapped ToolError messages are meant to reach a client;
@@ -222,7 +221,7 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
         return JSONResponse(
             {
                 "status": "ok",
-                "version": importlib.metadata.version("patent-checker"),
+                "version": __version__,
                 "transport": settings.transport,
             }
         )
@@ -233,15 +232,17 @@ def build_server(settings: ServerSettings, *, state: ServerState | None = None) 
 def http_allowed_hosts(settings: ServerSettings) -> list[str]:
     """Return the Host-header values the http transport accepts.
 
-    Clients spell the Host header with or without the port, so both forms of
-    the bind host and of every configured extra host are listed, in
-    configuration order and without duplicates.
+    The bind host followed by every configured extra host, in configuration
+    order and without duplicates. Only bare host names are listed: FastMCP
+    strips a trailing ``:port`` (and the brackets of an IPv6 literal) from
+    both the incoming Host header and each configured entry before comparing
+    them, so a ``host:port`` spelling adds nothing and would be wrong for an
+    IPv6 address, whose own colons are part of the host.
     """
     hosts: list[str] = []
     for host in (settings.host, *settings.allowed_hosts):
-        for entry in (host, f"{host}:{settings.port}"):
-            if entry not in hosts:
-                hosts.append(entry)
+        if host not in hosts:
+            hosts.append(host)
     return hosts
 
 
@@ -283,7 +284,7 @@ def banner_lines(settings: ServerSettings, *, ops_configured: bool) -> list[str]
     """
     info = describe(settings)
     lines = [
-        f"{SERVER_NAME} MCP server {importlib.metadata.version('patent-checker')}",
+        f"{SERVER_NAME} MCP server {__version__}",
         f"transport: {info['transport']}",
         f"data_dir: {info['data_dir']}",
         f"request limit: {info['rps']}/s (burst {info['burst']})",
@@ -368,7 +369,7 @@ def run(settings: ServerSettings) -> None:
         mcp.run(transport="stdio", show_banner=False)
 
 
-def _build_auth(settings: ServerSettings) -> StaticTokenVerifier | None:
+def _build_auth(settings: ServerSettings) -> ConstantTimeTokenVerifier | None:
     """Return the auth provider for *settings* (http only).
 
     Raises:
@@ -381,4 +382,4 @@ def _build_auth(settings: ServerSettings) -> StaticTokenVerifier | None:
         return None
     if not settings.token:
         raise ConfigError("the http transport requires a bearer token, but none is configured")
-    return StaticTokenVerifier(tokens={settings.token: {"client_id": AUTH_CLIENT_ID, "scopes": []}})
+    return ConstantTimeTokenVerifier(settings.token, client_id=AUTH_CLIENT_ID)

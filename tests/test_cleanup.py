@@ -568,3 +568,54 @@ def test_code_owned_names_cover_exactly_what_the_package_writes() -> None:
     assert cleanup.REQUEST_LOG_RELATIVE == Path("raw") / "ops" / "headers.jsonl"
     assert cleanup.REQUEST_LOG_RELATIVE.parts[0] in cleanup.CODE_OWNED_NAMES
     assert os.sep not in "".join(cleanup.CODE_OWNED_NAMES)
+
+
+def test_execute_reports_a_permission_error_on_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that may not be removed is reported, not silently kept.
+
+    "Not empty" is a normal outcome (something unplanned lives there) and stays
+    silent, but a permission problem is something the operator has to see.
+    """
+    tree = _build_tree(tmp_path)
+    plan = plan_cleanup(data_base=tree.project, cache=_cache_for(tree))
+    doomed = tree.project / "raw" / "gp"
+    real_rmdir = Path.rmdir
+
+    def fake_rmdir(self: Path) -> None:
+        if self == doomed:
+            raise PermissionError("permission denied")
+        real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", fake_rmdir)
+
+    result = execute(plan)
+
+    assert [error["path"] for error in result["errors"]] == [str(doomed)]
+    assert "permission denied" in result["errors"][0]["error"]
+    # The rest of the plan still ran: only the one directory is left behind.
+    assert doomed.exists()
+    assert not (tree.project / "cache" / "ops" / "search").exists()
+
+
+def test_execute_keeps_quiet_about_a_directory_that_is_not_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that is still in use is left alone, without an error entry."""
+    tree = _build_tree(tmp_path)
+    plan = plan_cleanup(data_base=tree.project, cache=_cache_for(tree))
+    kept = tree.project / "raw" / "gp"
+    real_rmdir = Path.rmdir
+
+    def fake_rmdir(self: Path) -> None:
+        if self == kept:
+            raise OSError("Directory not empty")
+        real_rmdir(self)
+
+    monkeypatch.setattr(Path, "rmdir", fake_rmdir)
+
+    result = execute(plan)
+
+    assert result["errors"] == []
+    assert kept.exists()

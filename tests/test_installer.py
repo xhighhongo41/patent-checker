@@ -20,6 +20,7 @@ import pytest
 from patent_checker import consent
 from patent_checker.installer import (
     CONSENT_PROMPT,
+    TOKEN_IN_PROJECT_WARNING,
     InstallAborted,
     InstallOptions,
     InstallReport,
@@ -437,6 +438,106 @@ def test_append_toml_table_creates_a_new_file_readable_by_its_owner_only(tmp_pat
     append_toml_table(path, "mcp_servers.patent-checker", 'url = "http://127.0.0.1:8765/mcp"')
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_merge_json_restricts_an_existing_file_when_the_entry_holds_a_token(
+    tmp_path: Path,
+) -> None:
+    """A token must not inherit the world-readable mode of the file it lands in."""
+    path = tmp_path / "config.json"
+    path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    path.chmod(0o644)
+
+    merge_json(path, _add_server(SERVER_NAME, {"url": DEFAULT_URL}), sensitive=True)
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_merge_json_restricts_the_backup_of_a_file_that_holds_a_token(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"mcpServers": {}}\n', encoding="utf-8")
+    path.chmod(0o644)
+
+    merge_json(path, _add_server(SERVER_NAME, {"url": DEFAULT_URL}), sensitive=True)
+
+    assert stat.S_IMODE((tmp_path / "config.json.bak").stat().st_mode) == 0o600
+
+
+def test_merge_json_keeps_the_first_backup_when_it_runs_again(tmp_path: Path) -> None:
+    """The .bak holds what the user wrote before the installer ever ran."""
+    path = tmp_path / "config.json"
+    original = '{"mcpServers": {"notes": {"url": "https://notes.example/mcp"}}}\n'
+    path.write_text(original, encoding="utf-8")
+
+    merge_json(path, _add_server(SERVER_NAME, {"url": DEFAULT_URL}))
+    merge_json(path, _add_server(SERVER_NAME, {"url": "http://127.0.0.1:9000/mcp"}))
+
+    assert json.loads((tmp_path / "config.json.bak").read_text(encoding="utf-8")) == json.loads(
+        original
+    )
+
+
+def test_append_toml_table_keeps_the_first_backup_when_it_runs_again(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    original = 'model = "gpt-5-codex"\n'
+    path.write_text(original, encoding="utf-8")
+
+    append_toml_table(path, "mcp_servers.first", 'url = "http://127.0.0.1:8642/mcp"')
+    append_toml_table(path, "mcp_servers.second", 'url = "http://127.0.0.1:8642/mcp"')
+
+    assert (tmp_path / "config.toml.bak").read_text(encoding="utf-8") == original
+
+
+def test_append_toml_table_restores_the_file_without_touching_an_older_backup(
+    tmp_path: Path,
+) -> None:
+    """A rollback must not resurrect a .bak that belongs to an earlier run."""
+    path = tmp_path / "config.toml"
+    original = '[mcp_servers.other]\nurl = "https://other.example/mcp"\n'
+    path.write_text(original, encoding="utf-8")
+    stale = tmp_path / "config.toml.bak"
+    stale.write_text('model = "ancient"\n', encoding="utf-8")
+
+    result = append_toml_table(path, "mcp_servers.patent-checker", 'url = "unterminated')
+
+    assert result.outcome is Outcome.MANUAL
+    assert path.read_text(encoding="utf-8") == original
+    assert stale.read_text(encoding="utf-8") == 'model = "ancient"\n'
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_append_toml_table_restricts_an_existing_file_when_the_body_holds_a_token(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('model = "gpt-5-codex"\n', encoding="utf-8")
+    path.chmod(0o644)
+
+    append_toml_table(
+        path,
+        f"mcp_servers.{SERVER_NAME}",
+        f'url = "{DEFAULT_URL}"',
+        sensitive=True,
+    )
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE((tmp_path / "config.toml.bak").stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_append_toml_table_keeps_the_mode_of_a_file_that_only_gets_a_reference(
+    tmp_path: Path,
+) -> None:
+    """Without a token in it, the user's own mode is none of our business."""
+    path = tmp_path / "config.toml"
+    path.write_text('model = "gpt-5-codex"\n', encoding="utf-8")
+    path.chmod(0o644)
+
+    append_toml_table(path, f"mcp_servers.{SERVER_NAME}", f'bearer_token_env_var = "{ENV_TOKEN}"')
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
 
 
 def test_append_toml_table_reports_manual_for_a_file_that_does_not_parse(tmp_path: Path) -> None:
@@ -2080,3 +2181,272 @@ def test_format_report_names_the_agents_it_covered(
     )
 
     assert "Agents:  cursor, codex" in format_report(report)
+
+
+# --- v1.0: installer behaviour added by T4 ----------------------------------
+
+
+def test_install_with_token_env_writes_a_reference_and_never_asks_for_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--token-env needs no token value: the file holds a reference only."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False, token_env=True),
+        home=home,
+        cwd=cwd,
+        prompt_secret=_no_prompt,
+    )
+
+    assert report.mcp["cursor"].result.outcome is Outcome.WRITTEN
+    text = (home / ".cursor" / "mcp.json").read_text(encoding="utf-8")
+    assert "${env:PATENT_CHECKER_SERVER_TOKEN}" in text
+    assert TOKEN not in text
+
+
+def test_install_with_token_env_hands_copilot_cli_a_snippet_instead_of_failing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A host that expands no reference is a manual step with a reason, not an error."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("copilot-cli",), agree=True, skill=False, token_env=True),
+        home=home,
+        cwd=cwd,
+        prompt_secret=_no_prompt,
+    )
+
+    registration = report.mcp["copilot-cli"]
+    assert registration.result.outcome is Outcome.MANUAL
+    assert "token-env" in registration.result.message
+    assert registration.snippet is not None and "mcpServers" in registration.snippet
+    assert report.exit_code() == 0
+
+
+def test_install_attaches_a_snippet_when_the_configuration_cannot_be_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OSError on the way to the file turns into a manual step with the snippet."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise PermissionError(13, "Permission denied", str(home / ".cursor"))
+
+    monkeypatch.setattr("patent_checker.installer.agents.merge_json", refuse)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    registration = report.mcp["cursor"]
+    assert registration.result.outcome is Outcome.MANUAL
+    assert registration.snippet is not None
+    assert "mcpServers" in registration.snippet
+    assert TOKEN not in registration.snippet
+    assert TOKEN not in registration.result.message
+
+
+def test_install_resolves_the_token_before_copying_the_skill(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run that cannot obtain the token stops before any Skill is copied."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    with pytest.raises(InstallAborted):
+        _run_install(InstallOptions(agents=("cursor",), agree=True), home=home, cwd=cwd)
+
+    assert not (home / ".agents").exists()
+
+
+def test_install_report_exit_code_is_one_when_a_step_errored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A broken Skill source is a failure the exit code reports."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    def broken() -> Path:
+        raise InstallerError("the bundled Skill is missing")
+
+    monkeypatch.setattr("patent_checker.installer.skill_source", broken)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+
+    assert [result.outcome for result in report.skill] == [Outcome.ERROR]
+    assert report.exit_code() == 1
+
+
+def test_install_registers_codex_through_its_command_with_token_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--token-env uses `codex mcp add --bearer-token-env-var` when codex is on PATH."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+
+    report = _run_install(
+        InstallOptions(agents=("codex",), agree=True, skill=False, token_env=True),
+        home=home,
+        cwd=cwd,
+        which=lambda program: "/usr/local/bin/codex" if program == "codex" else None,
+        runner=_fake_runner(calls=calls),
+        prompt_secret=_no_prompt,
+    )
+
+    assert report.mcp["codex"].result.outcome is Outcome.REGISTERED_BY_CLI
+    assert calls == [
+        [
+            "codex",
+            "mcp",
+            "add",
+            SERVER_NAME,
+            "--url",
+            DEFAULT_URL,
+            "--bearer-token-env-var",
+            ENV_TOKEN,
+        ]
+    ]
+    assert not (home / ".codex" / "config.toml").exists()
+
+
+def test_install_falls_back_to_the_toml_file_when_the_codex_command_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("codex",), agree=True, skill=False, token_env=True),
+        home=home,
+        cwd=cwd,
+        which=lambda program: "/usr/local/bin/codex" if program == "codex" else None,
+        runner=_fake_runner(returncode=1, stderr="unknown flag"),
+        prompt_secret=_no_prompt,
+    )
+
+    assert report.mcp["codex"].result.outcome is Outcome.WRITTEN
+    text = (home / ".codex" / "config.toml").read_text(encoding="utf-8")
+    assert f'bearer_token_env_var = "{ENV_TOKEN}"' in text
+
+
+def test_install_tells_how_to_update_an_existing_codex_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    config = home / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text(f'[mcp_servers.{SERVER_NAME}]\nurl = "http://old/mcp"\n', encoding="utf-8")
+
+    report = _run_install(
+        InstallOptions(agents=("codex",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    result = report.mcp["codex"].result
+    assert result.outcome is Outcome.SKIPPED
+    assert f"[mcp_servers.{SERVER_NAME}]" in result.message
+    assert (
+        config.read_text(encoding="utf-8")
+        == f'[mcp_servers.{SERVER_NAME}]\nurl = "http://old/mcp"\n'
+    )
+
+
+def test_install_warns_about_token_files_written_below_the_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False, scope="project"),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+
+    assert report.token_files == [cwd / ".cursor" / "mcp.json"]
+    text = format_report(report)
+    assert TOKEN_IN_PROJECT_WARNING in text
+    assert TOKEN not in text
+
+
+def test_install_run_twice_updates_in_place_and_keeps_the_first_backup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Idempotency: the second run rewrites our entry only and never touches the original .bak."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    config = home / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    original = json.dumps({"mcpServers": {"other": {"url": "http://other/mcp"}}}, indent=2) + "\n"
+    config.write_text(original, encoding="utf-8")
+    options = InstallOptions(agents=("cursor",), agree=True, skill=False)
+
+    first = _run_install(options, home=home, cwd=cwd, environ={ENV_TOKEN: TOKEN})
+    after_first = config.read_text(encoding="utf-8")
+    second = _run_install(options, home=home, cwd=cwd, environ={ENV_TOKEN: "rotated-token"})
+
+    assert first.mcp["cursor"].result.outcome is Outcome.WRITTEN
+    assert second.mcp["cursor"].result.outcome is Outcome.WRITTEN
+    data = json.loads(config.read_text(encoding="utf-8"))
+    assert data["mcpServers"]["other"] == {"url": "http://other/mcp"}
+    assert data["mcpServers"][SERVER_NAME]["headers"] == {"Authorization": "Bearer rotated-token"}
+    backup = config.with_name(config.name + ".bak")
+    assert backup.read_text(encoding="utf-8") == original
+    assert after_first != config.read_text(encoding="utf-8")
+
+
+def test_install_replaces_an_existing_claude_code_entry_on_a_second_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`claude mcp add` refuses a taken name; the installer removes and re-adds it."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+
+    def runner(argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(list(argv))
+        if argv[2] == "add" and len(calls) == 1:
+            return subprocess.CompletedProcess(
+                list(argv), 1, "", f"MCP server {SERVER_NAME} already exists in .mcp.json\n"
+            )
+        return subprocess.CompletedProcess(list(argv), 0, "", "")
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False, scope="project"),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=lambda program: "/usr/local/bin/claude" if program == "claude" else None,
+        runner=runner,
+    )
+
+    assert report.mcp["claude-code"].result.outcome is Outcome.REGISTERED_BY_CLI
+    assert [call[:3] for call in calls] == [
+        ["claude", "mcp", "add"],
+        ["claude", "mcp", "remove"],
+        ["claude", "mcp", "add"],
+    ]
+    assert calls[1] == ["claude", "mcp", "remove", "--scope", "project", SERVER_NAME]
+
+
+def test_install_does_not_retry_a_claude_code_failure_that_is_not_a_duplicate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=lambda program: "/usr/local/bin/claude" if program == "claude" else None,
+        runner=_fake_runner(returncode=2, stderr="unknown option", calls=calls),
+    )
+
+    assert report.mcp["claude-code"].result.outcome is Outcome.MANUAL
+    assert len(calls) == 1

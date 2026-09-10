@@ -1,0 +1,15 @@
+# Dependabot keeps the locked Python dependencies (uv.lock) and the
+# commit-pinned GitHub Actions up to date. Pull requests arrive weekly and
+# are validated by the regular CI (lint, tests, container smoke, audit).
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

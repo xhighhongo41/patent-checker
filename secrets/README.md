@@ -46,17 +46,32 @@ and run `docker compose up -d --force-recreate`.
 Compose mounts these files into the container as-is, and the server runs as
 UID 1000. On a Linux host where your account is not UID 1000, mode `600`
 makes the files unreadable inside the container and the server fails to
-start. Either hand them to that UID:
+start. Two ways out, in order of preference:
+
+**1. Hand the files to that UID and keep `600`.** The files stay unreadable
+to every other account on the host, which is what `600` is for:
 
 ```sh
-sudo chown 1000:1000 secrets/*.txt   # then 600 works
+sudo chown 1000:1000 secrets/*.txt
+chmod 600 secrets/*.txt
 ```
 
-or keep them readable by the container and rely on the directory instead:
+**2. Guard the directory instead of the files.** If you cannot change the
+owner, take the search permission away from everyone else on the directory
+that holds them:
 
 ```sh
 chmod 700 secrets && chmod 644 secrets/*.txt
 ```
+
+Mode `644` looks permissive, but reaching a file means traversing its
+directory first: with `secrets/` at `700`, no other account on the host can
+enter it, so the files inside are unreadable to them whatever their own mode
+says. UID 1000 inside the container is not affected -- the bind mount hands
+it the file directly, without a lookup through the host directory. This is
+weaker than option 1 in one respect: anything that already has a handle on
+the directory (a backup job, a pre-existing shell inside it) keeps its
+access, so prefer option 1 where you can.
 
 Docker Desktop (macOS, Windows) maps ownership for you, so `600` is enough
 there.
@@ -80,7 +95,8 @@ $token = python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ## Keeping them out of git
 
-`.gitignore` excludes `secrets/*.txt`, so these files are never committed;
-this README is. Nothing here is recoverable from the repository -- back the
-token and the OPS credentials up wherever you keep your other secrets, and
-treat a leaked `server_token.txt` as a reason to rotate it.
+`.gitignore` excludes everything in this directory except this README, so
+these files are never committed. Nothing here is recoverable from the
+repository -- back the token and the OPS credentials up wherever you keep
+your other secrets, and treat a leaked `server_token.txt` as a reason to
+rotate it.

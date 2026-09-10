@@ -229,3 +229,12 @@ tests/fixtures/
 
 # Container secrets mounted by compose.yaml (secrets/README.md stays tracked)
 secrets/*.txt
+secrets/*
+!secrets/README.md
+
+# Local environment files of every flavour (.env itself is ignored above).
+# Only the committed template is exempt.
+.env.*
+!.env.example
+examples/*/secrets/*
+!examples/*/secrets/README.md

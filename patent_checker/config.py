@@ -12,7 +12,7 @@ from collections.abc import Collection
 from datetime import timedelta
 from pathlib import Path
 
-from dotenv import find_dotenv, load_dotenv
+from dotenv import load_dotenv
 
 # The only upstream hosts patent-checker is allowed to contact. Enforced by
 # ``patent_checker.net.AllowlistTransport`` before any connection is made.
@@ -33,23 +33,80 @@ _TTL_PATTERN = re.compile(r"^(\d+)([dh])$")
 # select a per-user data directory when ``PATENT_CHECKER_DATA_DIR`` is unset.
 _data_base_override: Path | None = None
 
+# Latch making :func:`load_env` read ``.env`` at most once per process: it is
+# called from several entry points, and re-reading would mean walking the
+# directory tree again on every credential lookup.
+_dotenv_loaded = False
+
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is missing or ambiguous."""
 
 
-def load_env() -> None:
-    """Load environment variables from the nearest ``.env`` file.
+def _dotenv_directories(start: Path, home: Path | None) -> list[Path]:
+    """Return the directories to search for ``.env``, nearest first.
+
+    The working directory and its parents, stopping *before* the home
+    directory and before the filesystem root: neither of those two is
+    searched. A ``.env`` sitting in the home directory almost always belongs
+    to another tool, and one at the root of a container image or a disk is
+    nobody's project configuration.
+
+    Args:
+        start: The directory to search from (the working directory).
+        home: The home directory to stop below, or ``None`` when it cannot
+            be determined; the root always stops the walk.
+
+    Returns:
+        The directories in search order, possibly empty.
+    """
+    root = Path(start.anchor)
+    directories: list[Path] = []
+    current = start
+    while current != root and current != home:
+        directories.append(current)
+        parent = current.parent
+        if parent == current:  # a relative path exhausts its parents at "."
+            break
+        current = parent
+    return directories
+
+
+def load_env(*, force: bool = False) -> None:
+    """Load environment variables from the nearest ``.env`` file, once per process.
 
     Searches upward from the current working directory (not from this
     module's own location) for the first ``.env`` file, so a CLI installed
     with ``uv tool install`` still picks up the ``.env`` of whatever folder
-    it is invoked from. A variable already present in the environment is
-    never overridden by the ``.env`` file (``override=False``, the default
-    of :func:`dotenv.load_dotenv`). Does nothing if no ``.env`` file is
-    found.
+    it is invoked from. The search never reaches the home directory or the
+    filesystem root (see :func:`_dotenv_directories`). A variable already
+    present in the environment is never overridden by the ``.env`` file
+    (``override=False``). Does nothing if no ``.env`` file is found.
+
+    Several entry points call this, so the file is read at most once per
+    process: repeating the walk would neither pick up new values (existing
+    variables are never overridden) nor be free.
+
+    Args:
+        force: Read ``.env`` again even if it was already read. Meant for
+            tests, which need each case to start from a clean slate.
     """
-    load_dotenv(find_dotenv(usecwd=True))
+    global _dotenv_loaded
+    if _dotenv_loaded and not force:
+        return
+    # Latched before the search, so an unsuccessful search is not repeated.
+    _dotenv_loaded = True
+    try:
+        home: Path | None = Path.home()
+    except (RuntimeError, OSError):
+        # No home directory resolvable (a service account, a stripped
+        # container): only the root stops the walk then.
+        home = None
+    for directory in _dotenv_directories(Path.cwd(), home):
+        candidate = directory / ".env"
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            return
 
 
 def set_data_base(path: Path | None) -> None:

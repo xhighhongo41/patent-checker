@@ -29,7 +29,7 @@ services:
     # Compose builds a missing image instead of pulling it, which breaks the
     # "download this one file and run it" path. To run a locally built image
     # instead: docker build -t patent-checker:dev . && PATENT_CHECKER_IMAGE=patent-checker:dev docker compose up -d
-    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:0.5}
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.0}
     ports:
       - "127.0.0.1:${PATENT_CHECKER_PORT:-8642}:8642"
     environment:
@@ -48,6 +48,18 @@ services:
       - server_token
     volumes:
       - patent-checker-data:/data
+    # Hardening. The server only ever writes under /data, so the rest of the
+    # filesystem is mounted read-only (Python gets a tmpfs for /tmp), every
+    # Linux capability is dropped, and no process inside can gain privileges
+    # through setuid binaries. Remove these four settings if your Docker
+    # engine does not support them; the server itself does not depend on them.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       # Same probe as the image's HEALTHCHECK, repeated so that the timings

@@ -1,0 +1,97 @@
+# Patent Checker behind a TLS-terminating reverse proxy, for a LAN or VPN.
+#
+# This is the "serve more than one machine" variant of the top-level
+# compose.yaml. Two things change: the server's port is no longer published
+# on the host at all, and Caddy listens on 443 in front of it, terminating
+# TLS and forwarding to the server over the private Compose network. The
+# bearer token is still required; TLS only keeps it from travelling in the
+# clear.
+#
+# Setup (see docs/deploy-lan.md for the details):
+#
+#   cp .env.example .env            # set PATENT_CHECKER_LAN_HOST and the consent
+#   # create secrets/ops_key.txt, secrets/ops_secret.txt, secrets/server_token.txt
+#   # (same three files as the top-level deployment; see ../../secrets/README.md)
+#   docker compose up -d --wait
+#
+# By default Caddy issues certificates from its own internal CA (`tls internal`
+# in the Caddyfile), which clients must trust once. If the host name is a
+# public DNS name that reaches this machine on port 80/443, switch the
+# Caddyfile to ACME instead and no client-side trust step is needed.
+
+services:
+  patent-checker:
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.0}
+    # No `ports:` on purpose: only Caddy can reach the server.
+    expose:
+      - "8642"
+    environment:
+      PATENT_CHECKER_OPERATOR_CONSENT: ${PATENT_CHECKER_OPERATOR_CONSENT:-}
+      # The names clients will put in the Host header. Caddy forwards the
+      # original Host header, so this must be the name in PATENT_CHECKER_LAN_HOST
+      # (add more, comma-separated, if the server is reached under several names).
+      PATENT_CHECKER_SERVER_ALLOWED_HOSTS: ${PATENT_CHECKER_LAN_HOST:?set PATENT_CHECKER_LAN_HOST in .env}
+      PATENT_CHECKER_OPS_KEY_FILE: /run/secrets/ops_key
+      PATENT_CHECKER_OPS_SECRET_FILE: /run/secrets/ops_secret
+      PATENT_CHECKER_SERVER_TOKEN_FILE: /run/secrets/server_token
+      PATENT_CHECKER_LOG_LEVEL: ${PATENT_CHECKER_LOG_LEVEL:-info}
+    secrets:
+      - ops_key
+      - ops_secret
+      - server_token
+    volumes:
+      - patent-checker-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  caddy:
+    image: caddy:2.11
+    depends_on:
+      patent-checker:
+        condition: service_healthy
+    ports:
+      # 443 on every interface by default; narrow it with PATENT_CHECKER_LAN_BIND
+      # (for example the VPN address) if the machine also faces the internet.
+      - "${PATENT_CHECKER_LAN_BIND:-0.0.0.0}:${PATENT_CHECKER_LAN_PORT:-443}:443"
+    environment:
+      PATENT_CHECKER_LAN_HOST: ${PATENT_CHECKER_LAN_HOST:?set PATENT_CHECKER_LAN_HOST in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+secrets:
+  ops_key:
+    file: ./secrets/ops_key.txt
+  ops_secret:
+    file: ./secrets/ops_secret.txt
+  server_token:
+    file: ./secrets/server_token.txt
+
+volumes:
+  patent-checker-data: {}
+  caddy-data: {}
+  caddy-config: {}
