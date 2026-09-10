@@ -122,23 +122,24 @@ for readme in README.md README_ja.md; do
 done
 
 # --- (i) server.json: version fields and the OCI tag ------------------------
-SERVER_JSON_CHECK=$(python3 - "$VERSION" <<'PY'
+# (a plain -c script through uv: a here-document inside $(...) hangs bash 3.2, and a
+# pyenv shim for python3 can stall in a non-interactive shell)
+SERVER_JSON_CHECK=$(uv run --no-sync python -c '
 import json, sys
 version = sys.argv[1]
 data = json.load(open("server.json", encoding="utf-8"))
 problems = []
 if data.get("version") != version:
-    problems.append(f"server.json version -> {data.get('version')} -> {version}")
+    problems.append(f"server.json version -> {data.get("version")} -> {version}")
 for package in data.get("packages", []):
     if "version" in package and package["version"] != version:
-        problems.append(f"server.json packages[{package.get('registryType')}].version -> {package['version']} -> {version}")
+        problems.append(f"server.json packages[{package.get(\"registryType\")}].version -> {package["version"]} -> {version}")
     if package.get("registryType") == "oci":
         tag = package.get("identifier", "").rsplit(":", 1)[-1]
         if tag != version:
             problems.append(f"server.json oci identifier tag -> {tag} -> {version}")
 print("\n".join(problems))
-PY
-)
+' "$VERSION")
 if [ -n "$SERVER_JSON_CHECK" ]; then
     echo "$SERVER_JSON_CHECK" >>"$FAILURES_FILE"
 fi
