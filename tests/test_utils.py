@@ -19,8 +19,7 @@ from patent_checker.utils import (
     usage_report,
     verify_batch,
 )
-
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+from tests._fixtures import fixture_path
 
 # X-Throttling-Control samples (see tests/test_ops_client.py for the source shape).
 _IDLE_HEADER = (
@@ -39,10 +38,7 @@ _BUSY_YELLOW_HEADER = (
 
 def _load_fixture(name: str) -> bytes:
     """Return the raw bytes of a saved OPS fixture, skipping if unavailable."""
-    path = FIXTURE_DIR / name
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_bytes()
+    return fixture_path(f"ops/{name}").read_bytes()
 
 
 # --- dedup_families ------------------------------------------------------

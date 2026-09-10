@@ -71,6 +71,30 @@ def test_wheel_bundles_the_skill_and_notice_files(wheel_names: list[str]) -> Non
     assert f"{prefix}licenses/LICENSE" in wheel_names
 
 
+def test_wheel_bundles_all_four_consent_notice_files(wheel_names: list[str]) -> None:
+    """Both languages of both notices ship in the wheel, not just the English operator one."""
+    for expected in (
+        "patent_checker/notices/consent-notice.en.md",
+        "patent_checker/notices/consent-notice.ja.md",
+        "patent_checker/notices/operator-notice.en.md",
+        "patent_checker/notices/operator-notice.ja.md",
+    ):
+        assert expected in wheel_names, expected
+
+
+def test_wheel_declares_the_patent_checker_console_script(
+    built_distributions: dict[str, Path], wheel_names: list[str]
+) -> None:
+    """``pip install``/``uvx`` exposes a ``patent-checker`` command."""
+    prefix = _dist_info_prefix(wheel_names)
+    assert f"{prefix}entry_points.txt" in wheel_names
+    with zipfile.ZipFile(built_distributions["wheel"]) as archive:
+        entry_points = archive.read(f"{prefix}entry_points.txt").decode("utf-8")
+    lines = [line.strip() for line in entry_points.splitlines()]
+    assert "[console_scripts]" in lines
+    assert "patent-checker = patent_checker.cli.main:main" in lines
+
+
 def test_wheel_metadata_declares_the_license_expression_and_author(
     built_distributions: dict[str, Path], wheel_names: list[str]
 ) -> None:

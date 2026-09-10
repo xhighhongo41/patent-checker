@@ -34,8 +34,7 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
-
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+from tests._fixtures import fixture_path
 
 # How long a cached legal-status response stays usable. The legal kind always
 # expires; the assertion just narrows the value away from ``None``.
@@ -47,10 +46,7 @@ _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in
 
 def _load_fixture(name: str) -> bytes:
     """Return the raw bytes of a saved OPS fixture, skipping if unavailable."""
-    path = FIXTURE_DIR / name
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_bytes()
+    return fixture_path(f"ops/{name}").read_bytes()
 
 
 class _StubOpsClient:

@@ -34,11 +34,20 @@ def _clean_environment(monkeypatch, tmp_path):
     directory, not from the current directory, so ``chdir`` alone is not
     enough. ``load_dotenv`` is replaced by a no-op (``load_env`` itself is
     still called, which one test asserts).
+
+    ``PATENT_CHECKER_DATA_DIR``/``PATENT_CHECKER_CACHE_DIR`` are left unset
+    here (tests that need them set their own value), but the *default* data
+    directory that :func:`config.user_data_dir` falls back to when neither is
+    set is redirected into ``tmp_path`` too: without this, the "defaults"
+    tests below would resolve a path under the real ``$HOME`` (or
+    ``$XDG_DATA_HOME``) of whoever runs the suite.
     """
     for name in _ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(config, "load_dotenv", lambda *args, **kwargs: False)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg-data-home"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
 
 
 def _consent(monkeypatch, value: str = server_settings.OPERATOR_NOTICE_VERSION) -> None:

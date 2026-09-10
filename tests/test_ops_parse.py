@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
@@ -17,18 +16,16 @@ from patent_checker.ops.parse import (
     parse_search_biblio_xml,
     parse_search_xml,
 )
+from tests._fixtures import FIXTURES_ROOT, fixture_path
 
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "ops"
+FIXTURE_DIR = FIXTURES_ROOT / "ops"
 
 _CPC_RE = re.compile(r"^[A-Z]\d{2}[A-Z]\d+/\d+$")
 
 
 def _load_fixture(name: str) -> bytes:
     """Return the raw bytes of a saved OPS fixture, skipping if unavailable."""
-    path = FIXTURE_DIR / name
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_bytes()
+    return fixture_path(f"ops/{name}").read_bytes()
 
 
 # --- Fixture-dependent tests: values below were confirmed against the raw

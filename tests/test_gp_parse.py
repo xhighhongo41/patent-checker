@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
 import pytest
 
 from patent_checker.gp.parse import GPatentDoc, parse_patent_html
+from tests._fixtures import FIXTURES_ROOT, fixture_path
 
-FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "gp"
+FIXTURE_DIR = FIXTURES_ROOT / "gp"
 
 _CPC_LEAF_RE = re.compile(r"^[A-Z]\d{2}[A-Z]\d+/\d+$")
 
 
 def _load_fixture(pub: str) -> str:
     """Return the saved Google Patents HTML for ``pub``, skipping if unavailable."""
-    path = FIXTURE_DIR / f"{pub}.html"
-    if not path.exists():
-        pytest.skip(f"fixture not available: {path}")
-    return path.read_text(encoding="utf-8")
+    return fixture_path(f"gp/{pub}.html").read_text(encoding="utf-8")
 
 
 # --- US11468338B2: values below were confirmed against the raw HTML by grep and
@@ -325,7 +322,9 @@ def test_every_fixture_yields_claims_or_fallback_text() -> None:
     """
     paths = sorted(FIXTURE_DIR.glob("*.html"))
     if not paths:
-        pytest.skip(f"fixtures not available: {FIXTURE_DIR}")
+        # Go through the shared helper so the "fixtures are required" switch
+        # of the test session applies to this sweep as well.
+        _load_fixture("US11468338B2")
 
     empty: list[str] = []
     for path in paths:
