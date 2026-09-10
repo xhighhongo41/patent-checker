@@ -1,6 +1,6 @@
-# Prior-art exploration report template (v0.2)
+# Prior-art exploration report template
 
-Structure established by the two v0.1 manual runs and the dry run. **There
+Structure established by the two validation runs and the dry run. **There
 is no verdict field** — that is deliberate and structural: this report
 records procedure and observations, never a legal conclusion. Fill in the
 bracketed parts. Write the report in the language you and the user are

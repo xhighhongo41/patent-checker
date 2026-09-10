@@ -974,6 +974,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         _print_json(_error_result("invalid_input", str(exc)))
         return 2
+    except (KeyError, TypeError, UnicodeDecodeError) as exc:
+        # The document was fetched but could not be read (unexpected markup,
+        # a corrupt cache entry): not the caller's input, not a service
+        # outage either, so it gets its own type and the external-failure
+        # exit code, never a traceback.
+        _print_json(_error_result("upstream_data", f"upstream data could not be read: {exc}"))
+        return 3
     except ConfigError as exc:
         # OPS credential problems keep their own error type, since a Skill/
         # agent may special-case them (e.g. point the user at `consent`

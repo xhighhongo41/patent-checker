@@ -1,7 +1,7 @@
-# INPADOC legal-status codes — frequent codes reference (v0.2)
+# INPADOC legal-status codes — frequent codes reference
 
 Codes and descriptions below were collected verbatim from real INPADOC
-legal responses during the v0.1 manual runs across six jurisdictions. This
+legal responses during the validation runs across six jurisdictions. This
 table anchors the meaning of the codes you will see most often; it is not
 exhaustive. Legal-event interpretation stays your job: read the full event
 list chronologically and let the latest decisive event determine the
@@ -11,8 +11,8 @@ guessing.
 General rules:
 
 - The authority for legal status is INPADOC (`patent-checker legal`).
-  Google Patents status labels are reference values only (v0.1 measured
-  disagreement in 5 of 10 sampled documents).
+  Google Patents status labels are reference values only (validation
+  measured disagreement in 5 of 10 sampled documents).
 - Judge per jurisdiction: the same concept is coded differently per office.
 - An event's presence proves procedure, not current force: e.g. a grant
   event followed by a lapse event means the right is no longer in force.
@@ -72,7 +72,7 @@ General rules:
 |---|---|---|
 | PCNP | PATENT CEASED THROUGH NON-PAYMENT OF RENEWAL FEE | Ceased (dead) — check the event date |
 
-## Known response quirks (v0.1 measured)
+## Known response quirks (measured during validation)
 
 - A GB "A" publication can return a legal response with no events at all;
   the tool retries the "B" publication automatically. If both are empty,
