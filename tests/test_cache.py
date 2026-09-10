@@ -1785,3 +1785,51 @@ def test_v0_3_compatibility_names_say_so_in_their_docstrings() -> None:
     declaration = source.index("NO_EXPIRY_KINDS: frozenset")
     comment_block = source[:declaration].rsplit("\n\n", 1)[-1]
     assert note in " ".join(comment_block.replace("#", " ").split())
+
+
+def test_replace_with_retry_survives_a_transiently_busy_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename refused twice (Windows-style PermissionError) is retried and succeeds."""
+    from patent_checker import cache as cache_module
+
+    source = tmp_path / "payload.tmp"
+    source.write_bytes(b"new")
+    target = tmp_path / "payload"
+    target.write_bytes(b"old")
+    real_replace = os.replace
+    refusals = {"left": 2}
+
+    def flaky_replace(src: str | Path, dst: str | Path) -> None:
+        if refusals["left"]:
+            refusals["left"] -= 1
+            raise PermissionError(13, "Access is denied")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(cache_module.os, "replace", flaky_replace)
+    monkeypatch.setattr(cache_module.time, "sleep", lambda _seconds: None)
+
+    cache_module._replace_with_retry(source, target, attempts=3)
+
+    assert target.read_bytes() == b"new"
+    assert not source.exists()
+
+
+def test_replace_with_retry_gives_up_after_the_last_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A target that never frees up surfaces the PermissionError after the retries."""
+    from patent_checker import cache as cache_module
+
+    source = tmp_path / "payload.tmp"
+    source.write_bytes(b"new")
+    target = tmp_path / "payload"
+
+    def refusing_replace(src: str | Path, dst: str | Path) -> None:
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(cache_module.os, "replace", refusing_replace)
+    monkeypatch.setattr(cache_module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(PermissionError):
+        cache_module._replace_with_retry(source, target, attempts=3)

@@ -93,6 +93,7 @@ import hashlib
 import json
 import os
 import re
+import time
 import uuid
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
@@ -148,6 +149,12 @@ _META_SUFFIX = ".meta.json"
 # front of it is ``<final name>.<pid>.<random>``, so two writers of the same
 # key cannot pick the same temporary file.
 _TMP_SUFFIX = ".tmp"
+
+# Windows only: how often and how long to retry a rename whose target is
+# momentarily held open by another thread or process (see
+# ``_replace_with_retry``).
+_REPLACE_ATTEMPTS = 20
+_REPLACE_RETRY_SECONDS = 0.01
 
 # The ``.<pid>.<random>`` part of a temporary name, stripped to recover the
 # final name the file was being written for.
@@ -988,7 +995,32 @@ def _replace_atomically(path: Path, payload: bytes) -> None:
     unique = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
     tmp_path = path.with_name(f"{path.name}.{unique}{_TMP_SUFFIX}")
     tmp_path.write_bytes(payload)
-    os.replace(tmp_path, path)
+    try:
+        _replace_with_retry(tmp_path, path)
+    except BaseException:
+        _unlink_quietly(tmp_path)
+        raise
+
+
+def _replace_with_retry(tmp_path: Path, path: Path, *, attempts: int | None = None) -> None:
+    """``os.replace`` that tolerates Windows refusing a momentarily busy target.
+
+    On POSIX the rename is atomic and never conflicts with a reader or with
+    another writer's rename. On Windows a destination that another thread or
+    process is replacing or reading at that instant makes ``os.replace``
+    raise ``PermissionError``; the state is transient, so the rename is
+    retried a few times with short pauses before the error is propagated.
+    """
+    if attempts is None:
+        attempts = _REPLACE_ATTEMPTS if os.name == "nt" else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(_REPLACE_RETRY_SECONDS * attempt)
 
 
 def _tmp_target_name(name: str) -> str | None:
