@@ -54,7 +54,7 @@ Security = "https://github.com/xhighhongo41/patent-checker/blob/main/SECURITY.md
 patent-checker = "patent_checker.cli.main:main"
 
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
