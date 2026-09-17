@@ -231,6 +231,81 @@ def test_skill_carries_no_internal_version_history() -> None:
         assert not re.search(r"\bv0\.[0-9]", text), f"{path.name} still cites a v0.x version"
 
 
+def test_skill_stays_an_entry_point_and_links_every_reference() -> None:
+    """SKILL.md stays short enough to be read whole; details live in references/."""
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    assert len(text.splitlines()) <= 450
+    for name in (
+        "follow-up-runs.md",
+        "ledger-format.md",
+        "report-template.md",
+        "update-report-template.md",
+        "legal-status-codes.md",
+    ):
+        assert (SKILL_DIR / "references" / name).is_file(), f"missing reference: {name}"
+        assert f"references/{name}" in text, f"SKILL.md never points at references/{name}"
+
+
+def test_skill_covers_repeated_runs_and_the_ledger_commands() -> None:
+    """Later runs, the ledger and its two read-only commands are part of the procedure."""
+    text = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    for needle in (
+        "patent-checker ledger status",
+        "patent-checker ledger check",
+        ".patent-checker/ledger/",
+        "known_family_ids",
+        "`fetched_at`",
+        "`pub_docdb`",
+        "baseline",
+        "follow-up",
+        "monitoring",
+    ):
+        assert needle in text, f"SKILL.md does not mention {needle!r}"
+
+
+def test_report_template_opens_with_the_changes_since_the_previous_run() -> None:
+    """A follow-up report leads with what changed, before the feature table."""
+    text = (SKILL_DIR / "references" / "report-template.md").read_text(encoding="utf-8")
+    changes = text.index("## Changes since the previous exploration")
+    assert text.index("Disclaimer") < changes < text.index("## 1. Technical features")
+    for heading in (
+        "### Target",
+        "### New documents",
+        "### Rights status and families",
+        "### Claims",
+        "### Observations",
+        "### Monitoring items",
+        "### Search coverage",
+        "### Checked and found unchanged",
+        "### Corrections of the previous report",
+    ):
+        assert heading in text[changes:], f"changes section lacks {heading!r}"
+    assert "cumulative" in text.lower()
+
+
+def test_update_report_template_keeps_the_safeguards_of_the_full_report() -> None:
+    """The short monitoring update still carries the disclaimer and states no verdict."""
+    text = (SKILL_DIR / "references" / "update-report-template.md").read_text(encoding="utf-8")
+    for marker in (
+        "Disclaimer",
+        "Scope and limitations",
+        "No search was run",
+        "Checked and found unchanged",
+        "Monitoring list",
+        "Response record",
+        "no verdict",
+    ):
+        assert marker.lower() in text.lower(), f"missing mandatory element: {marker}"
+
+
+def test_ledger_format_has_no_room_for_a_legal_conclusion() -> None:
+    """The ledger records three-valued observations, never a conclusion or a score."""
+    text = (SKILL_DIR / "references" / "ledger-format.md").read_text(encoding="utf-8")
+    for value in ("reads-on direction", "lacks", "unclear"):
+        assert value in text
+    assert not re.search(r"infring", text, flags=re.IGNORECASE)
+
+
 @pytest.mark.parametrize(
     ("readme", "sections"),
     [
