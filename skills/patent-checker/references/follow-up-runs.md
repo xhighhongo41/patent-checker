@@ -140,7 +140,9 @@ application is no longer the relevant text).
 
 ### F7. Rights status: what changed since last time
 Call `watch_check` for every open `watch.jsonl` entry, 25 publications per
-call, passing the stored snapshots as `previous`:
+call, passing the stored snapshots as `previous` (the whole list can be
+passed to every call: snapshots of publications a call does not ask about
+are ignored and counted under `ignored_previous`):
 
 ```
 watch_check(pubs=[...], previous=[<snapshot>, ...])
@@ -226,7 +228,9 @@ of the following run must say what could not be recovered.
 
 1. Read the latest report listed under `legacy`: target, date, version or
    commit, the documents of §5.1–§5.3, the monitoring list of §11 and its
-   next-check date, the response record of §8.
+   next-check date, the response record of §8. Earlier reports often cite
+   the application (`…A`) even where a patent was granted: put the granted
+   publication on the watch list, with its kind code.
 2. If a working directory of that run exists, read the feature table, the
    translation table, the adopted and rejected queries and the stage-1
    verdicts. Where verdict files are machine-readable, carry every family
@@ -251,7 +255,10 @@ of the following run must say what could not be recovered.
    them as the changes since the old run. An event the patent office
    recorded late with an earlier date cannot be seen this way, and changes
    of family membership cannot be derived at all unless the old working
-   directory holds the family results — say both in the report.
+   directory holds the family results — say both in the report. Where the
+   old working directory still holds the raw legal-status and family
+   results, compare them with the new ones and say which documents were
+   compared in full and which only by date.
 5. Run `patent-checker ledger check`, then continue with the follow-up run.
 
 ## Older servers

@@ -191,7 +191,7 @@ When a check fails for a publication that already has a snapshot, keep the
 old snapshot and set `snapshot_error`.
 
 ```json
-{"pub": "US.99999999.B2", "family_id": "99887766", "reason": "in-force", "added_run": "20260301-0930", "checked_run": "20260901-1015", "features": ["F3"], "observation": {"value": "lacks", "decisive_element": "claim 1: checksum comparison before rebuild", "run_id": "20260301-0930"}, "status_reading": {"summary": "granted; maintenance fee paid", "decisive_event": {"code": "MAFP", "date": "2025-11-04"}, "as_of": "2026-09-01T10:40:12+00:00", "run_id": "20260901-1015"}, "claims_read": {"pub": "US.99999999.B2", "source": "gp", "run_id": "20260301-0930"}, "next_check": "2027-03-01", "snapshot": {"pub": "US.99999999.B2", "snapshot_format": 1, "legal": {"fetched_at": "2026-09-01T10:40:12+00:00", "event_count": 2, "events": [["20210615", "STCF", "5f0c2a1e"], ["20251104", "MAFP", "b81d9c07"]]}, "family": {"fetched_at": "2026-09-01T10:40:16+00:00", "family_id": "99887766", "members": ["US.2099123456.A1", "US.99999999.B2"]}}}
+{"pub": "US.99999999.B2", "family_id": "99887766", "reason": "in-force", "added_run": "20260301-0930", "checked_run": "20260901-1015", "features": ["F3"], "observation": {"value": "lacks", "decisive_element": "claim 1: checksum comparison before rebuild", "run_id": "20260301-0930"}, "status_reading": {"summary": "granted; maintenance fee paid", "decisive_event": {"code": "MAFP", "date": "2025-11-04"}, "as_of": "2026-09-01T10:40:12+00:00", "run_id": "20260901-1015"}, "claims_read": {"pub": "US.99999999.B2", "source": "gp", "run_id": "20260301-0930"}, "next_check": "2027-03-01", "snapshot": {"pub": "US.99999999.B2", "snapshot_format": 1, "legal": {"fetched_at": "2026-09-01T10:40:12+00:00", "event_count": 2, "events": [["2021-06-15", "STCF", "5f0c2a1e"], ["2025-11-04", "MAFP", "b81d9c07"]]}, "family": {"fetched_at": "2026-09-01T10:40:16+00:00", "family_id": "99887766", "members": ["US.2099123456.A1", "US.99999999.B2"]}}}
 ```
 
 ## translation.md
@@ -219,6 +219,9 @@ which run added it. The checker only warns when the file is missing.
   the DOCDB side).
 - A `watch` entry without a kind code: `EP.9999999` names whatever kind is
   current, which changes when the patent is granted.
+- Watching the application (`CN.999999999.A`) after the patent was granted:
+  put the publication that carries the right (`…B`, `…B1`, `…B2`) on the
+  list. The family members in the first snapshot show which ones exist.
 - Storing a query together with its date window, which makes the next
   run's window a window of a window.
 - Renumbering features after one was removed.
