@@ -265,6 +265,26 @@ def test_include_artifacts_adds_only_what_the_package_does_not_write(tmp_path: P
     assert {item.scope for item in plan.items if item.category == "artifact"} == {"project"}
 
 
+def test_the_ledger_is_kept_by_default_and_removed_with_the_other_artifacts(
+    tmp_path: Path,
+) -> None:
+    """The ledger is an exploration artifact: kept by default, opt-in to delete."""
+    tree = _build_tree(tmp_path)
+    ledger = tree.project / "ledger" / "sample-app"
+    _write(ledger / "ledger.json", '{"format": 1, "target": "sample-app"}')
+    _write(ledger / "runs.jsonl", '{"run_id": "20260301-0930"}\n')
+
+    default_plan = plan_cleanup(data_base=tree.project, cache=_cache_for(tree))
+
+    planned = {item.path for item in default_plan.items}
+    assert not any(path.is_relative_to(tree.project / "ledger") for path in planned)
+    assert tree.project / "ledger" not in planned
+
+    opted_in = plan_cleanup(data_base=tree.project, cache=_cache_for(tree), include_artifacts=True)
+
+    assert tree.project / "ledger" in _paths_by_category(opted_in)["artifact"]
+
+
 def test_include_consent_adds_the_project_record_only(tmp_path: Path) -> None:
     """Without --shared, only the project-scoped consent record is planned."""
     tree = _build_tree(tmp_path)

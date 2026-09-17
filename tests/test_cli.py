@@ -1896,6 +1896,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "consent",
         "serve",
         "cache",
+        "ledger",
         "clean",
         "install",
     ):
@@ -2132,3 +2133,137 @@ def test_verify_rejects_an_oversized_input_payload(
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
     assert "Traceback" not in err
+
+
+# --- ledger (read-only view of the exploration ledger) --------------------
+
+
+def _write_minimal_ledger(data_dir: Path, target: str = "sample-app") -> Path:
+    """Write the smallest ledger ``ledger check`` accepts and return its directory."""
+    ledger_dir = data_dir / "ledger" / target
+    ledger_dir.mkdir(parents=True)
+    (ledger_dir / "ledger.json").write_text(
+        json.dumps({"format": 1, "target": target, "created_at": "2026-03-01T09:30:00+00:00"}),
+        encoding="utf-8",
+    )
+    run = {
+        "run_id": "20260301-0930",
+        "type": "watch",
+        "started_at": "2026-03-01T09:30:00+00:00",
+        "stage": "development",
+        "mode": "standard",
+        "server_version": "1.1.0",
+        "searched_through": None,
+    }
+    (ledger_dir / "runs.jsonl").write_text(json.dumps(run) + "\n", encoding="utf-8")
+    for name in ("features.jsonl", "queries.jsonl", "families.jsonl", "watch.jsonl"):
+        (ledger_dir / name).write_text("", encoding="utf-8")
+    (ledger_dir / "translation.md").write_text("# Translation table\n", encoding="utf-8")
+    return ledger_dir
+
+
+def test_ledger_status_without_a_ledger_reports_that_none_exists(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A project that was never explored has no ledger, which is an answer, not an error."""
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
+
+    rc, data = _invoke(["ledger", "status"], capsys)
+
+    assert rc == 0
+    assert data["exists"] is False
+    assert data["targets"] == []
+    assert data["legacy"] == {"reports": [], "explorations": []}
+    assert not (tmp_path / "data").exists()
+
+
+def test_ledger_status_summarizes_the_ledger_under_the_data_directory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """ledger status reads the ledger of the project the CLI is run from."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "status", "--target", "sample-app"], capsys)
+
+    assert rc == 0
+    assert data["exists"] is True
+    assert data["targets"] == ["sample-app"]
+    assert data["ledgers"][0]["runs"] == 1
+    assert data["ledgers"][0]["last_run"]["run_id"] == "20260301-0930"
+
+
+def test_ledger_check_accepts_a_correct_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A ledger that follows the format checks out with exit code 0."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "check"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is True
+    assert data["targets"][0]["errors"] == []
+
+
+def test_ledger_check_reports_findings_without_failing_the_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Findings are the command's result: it ran, so the exit code is 0 and "ok" is false."""
+    data_dir = tmp_path / "data"
+    ledger_dir = _write_minimal_ledger(data_dir)
+    (ledger_dir / "watch.jsonl").write_text("{not json}\n", encoding="utf-8")
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "check", "--target", "sample-app"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is False
+    finding = data["targets"][0]["errors"][0]
+    assert (finding["file"], finding["line"], finding["rule"]) == ("watch.jsonl", 1, "json")
+
+
+def test_ledger_check_without_a_ledger_reports_a_missing_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Checking where nothing was written yet names the problem instead of raising."""
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
+
+    rc, data = _invoke(["ledger", "check"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is False
+    assert data["targets"][0]["errors"][0]["rule"] == "missing-ledger"
+
+
+def test_ledger_commands_never_write_to_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The package only reads the ledger: both commands leave every file as it was."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    def state() -> dict[str, tuple[bytes, int]]:
+        return {
+            str(path.relative_to(data_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in sorted(data_dir.rglob("*"))
+            if path.is_file()
+        }
+
+    before = state()
+    _invoke(["ledger", "status"], capsys)
+    _invoke(["ledger", "check"], capsys)
+
+    assert state() == before
+
+
+def test_ledger_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    """``ledger`` alone is a usage error, like the other command groups."""
+    rc, data = _invoke(["ledger"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"

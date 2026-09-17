@@ -54,7 +54,7 @@ from typing import Any
 
 import httpx
 
-from patent_checker import __version__, cleanup, config, consent, installer, service
+from patent_checker import __version__, cleanup, config, consent, installer, ledger, service
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
@@ -538,6 +538,26 @@ def _cmd_cache_status(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _cmd_ledger_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Summarize the exploration ledgers of the project this command is run from.
+
+    Read-only: the ledger is written by the agent running the Skill, never by
+    this package. A project without a ledger is an ordinary answer
+    (``"exists": false``), not an error.
+    """
+    return ledger.status(config.data_base(), target=args.target)
+
+
+def _cmd_ledger_check(args: argparse.Namespace) -> dict[str, Any]:
+    """Verify the project's ledger against the ledger format.
+
+    Read-only. Findings are the result of the command rather than a failure
+    of it (like ``verify``): the exit code is 0 whenever the check ran, and
+    ``"ok"`` says whether the ledger passed.
+    """
+    return ledger.check(config.data_base(), target=args.target)
+
+
 def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
     """Select cache entries matching the given filters and, only with ``--yes``, delete them.
 
@@ -1005,6 +1025,27 @@ def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_consent_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``consent`` subcommand and its ``status``/``show``/``record`` children."""
+    ledger_parser = subparsers.add_parser(
+        "ledger", help="Inspect the exploration ledger the Skill keeps (read-only)"
+    )
+    ledger_subparsers = ledger_parser.add_subparsers(dest="ledger_command", required=True)
+
+    ledger_status_parser = ledger_subparsers.add_parser(
+        "status", help="Summarize the ledgers: runs, monitored publications, checks that are due"
+    )
+    ledger_status_parser.add_argument(
+        "--target", default=None, help="Only this exploration target (default: every target)"
+    )
+    ledger_status_parser.set_defaults(handler=_cmd_ledger_status)
+
+    ledger_check_parser = ledger_subparsers.add_parser(
+        "check", help="Verify a ledger against the ledger format and list what to fix"
+    )
+    ledger_check_parser.add_argument(
+        "--target", default=None, help="Only this exploration target (default: every target)"
+    )
+    ledger_check_parser.set_defaults(handler=_cmd_ledger_check)
+
     consent_parser = subparsers.add_parser("consent", help="Manage the legal-notice consent gate")
     consent_subparsers = consent_parser.add_subparsers(dest="consent_command", required=True)
 
