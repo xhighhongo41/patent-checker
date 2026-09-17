@@ -19,9 +19,11 @@ from patent_checker.cache import (
     CacheEntry,
     content_suffix,
     default_cache,
+    effective_ttl,
     format_timestamp,
     format_ttl,
     is_fresh,
+    key_has_kind_code,
     kind_subdir,
     normalize_timestamp,
     pub_key,
@@ -35,6 +37,12 @@ EXPIRING_KINDS: tuple[str, ...] = tuple(
 
 # Every kind stored under ``ops/``.
 OPS_KINDS: tuple[str, ...] = tuple(kind for kind in cache_mod.KINDS if kind != "gp")
+
+# Publication-keyed kinds that never expire under the default policy: the ones
+# the kind-code rule applies to.
+NEVER_EXPIRING_PUB_KINDS: tuple[str, ...] = tuple(
+    kind for kind in cache_mod.PUB_KINDS if DEFAULT_TTLS[kind] is None
+)
 
 
 def _ttl(kind: str) -> timedelta:
@@ -117,6 +125,102 @@ def test_content_suffix_unknown_kind_raises_value_error() -> None:
         content_suffix("bogus")
 
 
+# --- key_has_kind_code / effective_ttl ---------------------------------------
+
+# A publication asked for without a kind code, and the same publication asked
+# for with one; upstream resolves the first to whatever kind is current.
+KIND_CODE_LESS_KEY = "EP.1234567"
+KIND_CODED_KEY = "EP.1234567.A1"
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["US.11468338.B2", KIND_CODED_KEY, pub_key("US2024/0111636A1")],
+    ids=["granted-us", "published-ep", "us-application"],
+)
+def test_key_has_kind_code_true_for_a_three_part_key(key: str) -> None:
+    """A key spelled country.number.kind names one publication of a document."""
+    assert key_has_kind_code(key) is True
+
+
+@pytest.mark.parametrize(
+    "key",
+    [KIND_CODE_LESS_KEY, "US.11468338", pub_key("EP1234567")],
+    ids=["ep", "us", "from-pub-key"],
+)
+def test_key_has_kind_code_false_for_a_two_part_key(key: str) -> None:
+    """A key spelled country.number leaves the kind to whatever upstream serves."""
+    assert key_has_kind_code(key) is False
+
+
+def test_key_has_kind_code_false_for_a_search_key() -> None:
+    """A search key is a hex digest, not a publication number, so it has no kind code."""
+    assert key_has_kind_code(search_key("ti=drone", 1, 25)) is False
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_effective_ttl_of_a_kind_code_less_key_is_the_family_ttl(kind: str) -> None:
+    """A never-expiring kind asked for without a kind code follows the family TTL."""
+    assert effective_ttl(kind, KIND_CODE_LESS_KEY) == DEFAULT_TTLS["family"] == timedelta(days=30)
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_effective_ttl_of_a_key_with_a_kind_code_never_expires(kind: str) -> None:
+    """One publication's content does not change, so a kind-coded key keeps "never"."""
+    assert effective_ttl(kind, KIND_CODED_KEY) is None
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_effective_ttl_without_a_key_keeps_the_kinds_own_ttl(kind: str) -> None:
+    """A caller that names no key gets the kind's TTL, exactly as before v1.1."""
+    assert effective_ttl(kind, None) is None
+
+
+@pytest.mark.parametrize("kind", ["biblio", "legal", "family"])
+def test_effective_ttl_of_an_expiring_kind_ignores_the_key(kind: str) -> None:
+    """A kind that already expires is unaffected by the shape of the key."""
+    assert effective_ttl(kind, KIND_CODE_LESS_KEY) == DEFAULT_TTLS[kind]
+    assert effective_ttl(kind, KIND_CODED_KEY) == DEFAULT_TTLS[kind]
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_effective_ttl_follows_a_family_override_for_a_kind_code_less_key(kind: str) -> None:
+    """Shortening the family TTL shortens how long a kind-code-less entry is served."""
+    assert effective_ttl(kind, KIND_CODE_LESS_KEY, {"family": timedelta(days=10)}) == timedelta(
+        days=10
+    )
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_effective_ttl_a_never_expiring_family_keeps_kind_code_less_keys_forever(
+    kind: str,
+) -> None:
+    """An operator who makes families never expire says the same of kind-code-less keys."""
+    assert effective_ttl(kind, KIND_CODE_LESS_KEY, {"family": None}) is None
+
+
+def test_effective_ttl_a_finite_override_applies_to_every_key() -> None:
+    """A kind given a TTL of its own does not fall back to the family TTL at all."""
+    ttls = {"gp": timedelta(days=5)}
+
+    assert effective_ttl("gp", KIND_CODE_LESS_KEY, ttls) == timedelta(days=5)
+    assert effective_ttl("gp", KIND_CODED_KEY, ttls) == timedelta(days=5)
+
+
+def test_effective_ttl_of_a_search_kind_never_follows_the_family_ttl() -> None:
+    """The rule is about publication numbers, so a search key never triggers it."""
+    key = search_key("ti=drone", 1, 25)
+
+    assert effective_ttl("search", key) == DEFAULT_TTLS["search"]
+    assert effective_ttl("searchbib", key, {"searchbib": None}) is None
+
+
+def test_effective_ttl_unknown_kind_raises_value_error() -> None:
+    """An unknown kind has no TTL rather than a guessed one."""
+    with pytest.raises(ValueError):
+        effective_ttl("bogus", KIND_CODED_KEY)
+
+
 # --- is_fresh ----------------------------------------------------------------
 
 
@@ -128,10 +232,15 @@ def test_is_fresh_no_expiry_kinds_ignore_date(kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", sorted(cache_mod.NO_EXPIRY_KINDS))
-def test_is_fresh_no_expiry_kinds_ignore_unparseable_timestamp(kind: str) -> None:
-    """No-expiry kinds are fresh even when fetched_at cannot be parsed at all."""
+def test_is_fresh_no_expiry_kinds_reject_an_unparseable_timestamp(kind: str) -> None:
+    """A timestamp that cannot be read is not trusted, whatever the kind's TTL is.
+
+    Every result now reports when it was fetched, so an entry whose
+    fetched_at is unusable is missed and rewritten by the next fetch rather
+    than served forever.
+    """
     now = datetime(2026, 9, 2, 12, 0, 0)
-    assert is_fresh(kind, "not a timestamp", now) is True
+    assert is_fresh(kind, "not a timestamp", now) is False
 
 
 @pytest.mark.parametrize("kind", EXPIRING_KINDS)
@@ -226,6 +335,26 @@ def test_is_fresh_unknown_kind_raises_value_error() -> None:
     """An unknown kind is rejected rather than silently treated as fresh/stale."""
     with pytest.raises(ValueError):
         is_fresh("bogus", "2026-09-02T00:00:00", datetime(2026, 9, 2))
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_is_fresh_a_kind_code_less_key_expires_at_the_family_ttl(kind: str) -> None:
+    """Passing a kind-code-less key makes a never-expiring kind follow the family TTL."""
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    family_ttl = _ttl("family")
+    fresh = (now - family_ttl + timedelta(seconds=1)).isoformat(timespec="seconds")
+    stale = (now - family_ttl).isoformat(timespec="seconds")
+
+    assert is_fresh(kind, fresh, now, key=KIND_CODE_LESS_KEY) is True
+    assert is_fresh(kind, stale, now, key=KIND_CODE_LESS_KEY) is False
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_is_fresh_a_key_with_a_kind_code_stays_fresh_forever(kind: str) -> None:
+    """A kind-coded key keeps the kind's own "never expires" policy."""
+    now = datetime(2026, 9, 2, 12, 0, 0)
+
+    assert is_fresh(kind, "2020-01-01T00:00:00", now, key=KIND_CODED_KEY) is True
 
 
 # --- roots and paths ---------------------------------------------------------
@@ -581,6 +710,114 @@ def test_put_twice_overwrites_the_entry(tmp_path: Path) -> None:
     assert hit is not None
     assert hit.content == b"<new/>"
     assert hit.ident == "new"
+
+
+# --- keys without a kind code ------------------------------------------------
+
+
+def _body_for(kind: str) -> bytes:
+    """Return a small body of the right shape for *kind*."""
+    return b"<html></html>" if kind == "gp" else b"<claims/>"
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_get_misses_a_kind_code_less_entry_past_the_family_ttl(tmp_path: Path, kind: str) -> None:
+    """A request without a kind code resolves upstream to the newest publication.
+
+    So the stored answer must not be served forever: a B1 granted after the
+    A1 that was cached has to be picked up.
+    """
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put(kind, KIND_CODE_LESS_KEY, _body_for(kind), ident="EP1234567")
+    cache.put(kind, KIND_CODED_KEY, _body_for(kind), ident="EP1234567A1")
+
+    clock_value = written_at + _ttl("family") + timedelta(days=1)
+
+    assert cache.get(kind, KIND_CODE_LESS_KEY) is None
+    assert cache.get(kind, KIND_CODED_KEY) is not None
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_get_serves_a_kind_code_less_entry_before_the_family_ttl(tmp_path: Path, kind: str) -> None:
+    """Inside the family TTL a kind-code-less entry is still a plain hit."""
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put(kind, KIND_CODE_LESS_KEY, _body_for(kind), ident="EP1234567")
+
+    clock_value = written_at + _ttl("family") - timedelta(days=1)
+
+    hit = cache.get(kind, KIND_CODE_LESS_KEY)
+    assert hit is not None
+    assert hit.content == _body_for(kind)
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_get_misses_a_kind_code_less_entry_exactly_at_the_deadline(
+    tmp_path: Path, kind: str
+) -> None:
+    """The deadline itself expires, like every other TTL in this cache."""
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put(kind, KIND_CODE_LESS_KEY, _body_for(kind), ident="EP1234567")
+
+    clock_value = written_at + _ttl("family")
+
+    assert cache.get(kind, KIND_CODE_LESS_KEY) is None
+
+
+def test_entries_select_and_stats_agree_with_get_on_kind_code_less_keys(tmp_path: Path) -> None:
+    """One rule decides freshness: listing, selecting and getting cannot disagree."""
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("gp", KIND_CODE_LESS_KEY, b"<html></html>", ident="EP1234567")
+    cache.put("gp", KIND_CODED_KEY, b"<html></html>", ident="EP1234567A1")
+
+    clock_value = written_at + _ttl("family") + timedelta(days=1)
+
+    expired_in_entries = {entry.key for entry in cache.entries("gp") if entry.expired}
+    expired_in_select = {entry.key for entry in cache.select(kinds=["gp"], expired=True)}
+    missed_by_get = {
+        key for key in (KIND_CODE_LESS_KEY, KIND_CODED_KEY) if cache.get("gp", key) is None
+    }
+    stats = cache.stats()
+
+    assert expired_in_entries == expired_in_select == missed_by_get == {KIND_CODE_LESS_KEY}
+    assert stats["kinds"]["gp"]["expired"] == 1
+    assert stats["totals"]["expired"] == 1
+
+
+@pytest.mark.parametrize("kind", NEVER_EXPIRING_PUB_KINDS)
+def test_an_entry_whose_timestamp_cannot_be_read_misses_and_is_repaired(
+    tmp_path: Path, kind: str
+) -> None:
+    """A never-expiring entry with an unusable fetched_at is refetched, not served.
+
+    Nothing structural is wrong with it, so it is not "broken"; it is simply
+    not fresh, and the next write puts a usable timestamp back.
+    """
+    cache = Cache(tmp_path / "cache", clock=lambda: datetime(2026, 9, 1, 12, 0, 0))
+    cache.put(kind, KIND_CODED_KEY, _body_for(kind), ident="EP1234567A1")
+    meta_path = cache.meta_path(kind, KIND_CODED_KEY)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["fetched_at"] = "not-a-time"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    assert cache.get(kind, KIND_CODED_KEY) is None
+    (entry,) = cache.entries(kind)
+    assert entry.broken is False
+    assert entry.problem is None
+    assert entry.expired is True
+
+    cache.store(kind, KIND_CODED_KEY, _body_for(kind), ident="EP1234567A1")
+
+    hit = cache.get(kind, KIND_CODED_KEY)
+    assert hit is not None
+    assert hit.content == _body_for(kind)
 
 
 # --- eviction of expired search entries ------------------------------------

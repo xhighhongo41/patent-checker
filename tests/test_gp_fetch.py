@@ -430,3 +430,61 @@ def test_a_legacy_naive_sidecar_is_normalized_to_aware_utc_on_hit(cache: Cache) 
     # under must not matter, only that a naive value is read as local time.
     expected_instant = datetime.fromisoformat(naive).astimezone()
     assert datetime.fromisoformat(result.fetched_at) == expected_instant
+
+
+# --- keys without a kind code (v1.1) -----------------------------------------
+
+# The same document asked for without and with a kind code. Without one,
+# Google Patents answers with whatever publication is current.
+KIND_CODE_LESS_PUB = "EP1234567"
+KIND_CODED_PUB = "EP1234567B1"
+
+# What a later download of the kind-code-less page could bring back.
+GRANTED_PAGE_HTML = "<html><body>granted patent page</body></html>"
+
+
+def test_a_kind_code_less_page_is_downloaded_again_after_a_month(tmp_path: Path) -> None:
+    """A page cached without a kind code is refetched once its TTL has passed.
+
+    Otherwise the application as published would keep being served after the
+    patent was granted.
+    """
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    page_cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    first = _RecordingHandler(200, PAGE_HTML)
+    with _client(first) as client:
+        fetch_patent_html(KIND_CODE_LESS_PUB, client=client, cache=page_cache)
+
+    clock_value = written_at + timedelta(days=31)
+    later = _RecordingHandler(200, GRANTED_PAGE_HTML)
+    with _client(later) as client:
+        result = fetch_patent_html(KIND_CODE_LESS_PUB, client=client, cache=page_cache)
+
+    assert len(first.calls) == 1
+    assert len(later.calls) == 1
+    assert isinstance(result, FetchedPage)
+    assert result.cached is False
+    assert result.html == GRANTED_PAGE_HTML
+    hit = page_cache.get("gp", pub_key(KIND_CODE_LESS_PUB))
+    assert hit is not None
+    assert hit.content == GRANTED_PAGE_HTML.encode("utf-8")
+
+
+def test_a_page_with_a_kind_code_is_still_served_after_a_month(tmp_path: Path) -> None:
+    """One publication's page does not change, so a kind-coded entry stays a hit."""
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    page_cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    handler = _RecordingHandler(200, PAGE_HTML)
+    with _client(handler) as client:
+        fetch_patent_html(KIND_CODED_PUB, client=client, cache=page_cache)
+
+    clock_value = written_at + timedelta(days=31)
+    with httpx.Client(transport=httpx.MockTransport(_forbidden_handler)) as client:
+        result = fetch_patent_html(KIND_CODED_PUB, client=client, cache=page_cache)
+
+    assert isinstance(result, FetchedPage)
+    assert result.cached is True
+    assert result.html == PAGE_HTML
+    assert len(handler.calls) == 1

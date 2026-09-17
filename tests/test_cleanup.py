@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -619,3 +620,26 @@ def test_execute_keeps_quiet_about_a_directory_that_is_not_empty(
 
     assert result["errors"] == []
     assert kept.exists()
+
+
+# --- what ``cache clear --expired`` reclaims -------------------------------
+
+
+def test_clearing_expired_entries_reclaims_a_stale_kind_code_less_page(tmp_path: Path) -> None:
+    """A Google Patents page cached without a kind code becomes reclaimable once stale.
+
+    ``cache clear --expired`` is ``Cache.select(expired=True)``, so what the
+    command would offer to delete is asserted at that level; the planner
+    itself never looks at freshness.
+    """
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("gp", "EP.1234567", b"<html></html>", ident="EP1234567")
+    cache.put("gp", "EP.1234567.B1", b"<html></html>", ident="EP1234567B1")
+
+    clock_value = written_at + timedelta(days=31)
+
+    selected = cache.select(expired=True)
+
+    assert [(entry.kind, entry.key) for entry in selected] == [("gp", "EP.1234567")]
