@@ -11,7 +11,11 @@
 
 Patent Checker helps you explore published patents that may relate to your
 own software project, and to write down what you found as a dated,
-procedure-style report. It is built from two parts:
+procedure-style report. It is meant to be run more than once on the same
+project — as an idea, during development, before a release, before each
+update: a later run searches only what is new, re-checks the patents you
+are monitoring, and tells you what changed since last time. It is built
+from two parts:
 
 - an **MCP server** that fetches public patent data (EPO Open Patent
   Services and Google Patents) deterministically: searches, bibliographic
@@ -26,7 +30,7 @@ Patent Checker **does not decide whether anything infringes a patent**. Its
 reports contain observations, scope statements and open questions, never a
 verdict.
 
-**Status: stable release (v1.0).**
+**Status: stable release (v1.1).**
 
 ## Important notices
 
@@ -76,10 +80,16 @@ your agent ──(Skill: judgment)──► patent-checker MCP server ──► 
 3. The Skill screens the candidates in stages, maps claim elements to your
    features and writes a report: what was searched, what was found, how
    each candidate relates to your code, and what was *not* covered.
+4. The Skill also keeps a **ledger** of the exploration in your project
+   (features, queries, screened families, monitored patents and a snapshot
+   of their status). The next run starts from it: the server compares the
+   stored snapshots with the current records, and the new report opens with
+   what changed.
 
-The server only ever receives search expressions and publication numbers.
-Your source code and project description never leave your machine: the
-analysis happens inside your agent.
+The server only ever receives public patent data: search expressions,
+publication numbers, family identifiers, dates, and status snapshots it
+returned earlier. Your source code, your project description and the ledger
+never leave your machine: the analysis happens inside your agent.
 
 ## Prerequisites
 
@@ -396,6 +406,41 @@ supports delegation. One run is not exhaustive: repeated runs, different
 query vocabularies and a professional search will each find things a
 single run does not.
 
+### Running it again
+
+Ask again whenever the project has moved on, or when the date of the next
+check in the report has come:
+
+> Use the patent-checker skill to follow up on the earlier exploration of
+> this project.
+
+The Skill finds the ledger under `.patent-checker/ledger/<target>/` and
+proposes one of two kinds of run:
+
+- A **follow-up run** reads what changed in your code since the explored
+  commit, runs the earlier queries only for patents published since then
+  (new queries cover new features), screens only families it has not seen
+  before, re-checks every monitored patent, and re-reads a document only if
+  your feature, its claims, or an earlier reading changed. The report
+  describes the current state of everything and opens with **"Changes since
+  the previous exploration"**: changes of your project, new documents,
+  changes of legal status and of claims, observations that changed and why,
+  and the documents that were checked and found unchanged.
+- A **monitoring run** only re-checks the monitored patents and writes a
+  short `update-<target>-<YYYYMMDD-HHMM>.md`. It costs a small fraction of
+  an exploration, and says plainly that nothing was searched.
+
+Nothing is downloaded twice: claims stay in the cache for good, legal
+status is refreshed after a week and families after a month, and every
+result says when it was fetched, so a report can state what its facts are
+"as of". Measured during development, three weeks after the first
+exploration of a medium-sized project: the 17 stored queries returned 11
+hits for the new publication window instead of 712 for all time, 8 of them
+in families that had been screened already, and all 25 monitored patents
+were re-checked with about fifty upstream requests; a monitoring run made
+the same day needed none. If you explored a project with an earlier version, the Skill
+offers to import the latest report into a ledger first.
+
 ## Configuration
 
 Environment variables read by the server (`patent-checker serve`) and,
@@ -452,9 +497,17 @@ when the CLI is used from the project).
   `biblio`, `claims`, `legal`, `family`, `gp`, `search`, `searchbib`.
 - `patent-checker clean` lists the project's traces (search cache, request
   log, leftovers of older layouts) and, with `--yes`, deletes them. Reports,
-  your agent's exploration notes and the consent record are kept unless
-  you add `--include-artifacts` or `--include-consent`; `--shared` extends
-  the clean-up to the shared cache and the server's data directory.
+  your agent's exploration notes, the ledger and the consent record are kept
+  unless you add `--include-artifacts` or `--include-consent`; `--shared`
+  extends the clean-up to the shared cache and the server's data directory.
+- `patent-checker ledger status` summarises the ledgers of the project (runs,
+  monitored patents, checks that are due) and `patent-checker ledger check`
+  verifies one; both only read. The ledger is written by your agent, lives
+  with the reports, and is covered by the same choice of tracking it in
+  git or not: it is a dated record of what you knew, just as a report is.
+- A publication number without its kind code (`EP1234567`) means "whatever
+  is current", so claims fetched that way expire like a family instead of
+  being kept for good; with the kind code (`EP1234567B1`) they never expire.
 - With Compose, `docker compose down -v` removes the server's volume,
   cache and all.
 
@@ -471,9 +524,10 @@ Nothing is deleted without `--yes`.
 - It only ever connects to `ops.epo.org` and `patents.google.com`, from the
   server and from the command-line tool alike, and only writes below its
   own data directory. It has no code-execution tools.
-- It receives search expressions and publication numbers, nothing else, and
-  refuses oversized requests. Your code and documents are analysed by your
-  agent, on your machine. Authenticated clients can see where the server
+- It receives public patent data only — search expressions, publication
+  numbers, family identifiers, dates, and status snapshots it returned
+  earlier — and refuses oversized requests. Your code, your documents and
+  the ledger are handled by your agent, on your machine. Authenticated clients can see where the server
   keeps its data (`server_status`); nothing else about the host is exposed.
 - Incoming requests are rate-limited, and upstream requests are paced,
   serialised one at a time and cached so that a runaway agent cannot
@@ -503,7 +557,13 @@ Nothing is deleted without `--yes`.
   registered application, including its weekly fair-use quota. The server
   spaces its requests and honours OPS throttling headers, but it cannot know
   how many other clients share your credentials. Legal-status information
-  comes from OPS and is the authoritative value in reports.
+  comes from OPS and is the authoritative value in reports. That pacing
+  works inside one process: the server is one, but every `patent-checker`
+  command you run from a shell is its own. When you drive the CLI by hand
+  or from a script, put several queries into one `plan-check` call and
+  leave some fifteen seconds between search commands; an error mentioning
+  `403` means OPS throttled the search service, and waiting a quarter of
+  an hour clears it.
 - **Google Patents** is fetched one document page at a time, at a pace and
   volume comparable to a person reading in a browser, and every page is
   cached so it is not fetched twice. The search endpoint is deliberately not
@@ -566,6 +626,18 @@ have.
 
 ## Changelog
 
+- **v1.1** (2026-09): built for repeated runs. A per-project ledger carries
+  an exploration from one run to the next; follow-up runs search only newly
+  published patents and screen only new families; the new `watch_check` tool
+  compares the legal status and family of monitored patents with the
+  previous run; reports open with "Changes since the previous exploration",
+  and a short monitoring update exists for status-only checks. Every result
+  says when it was fetched (`fetched_at`), claims results name the
+  publication actually read (`pub_docdb`), claims requested without a kind
+  code no longer stay cached for good, `dedup_families` marks known
+  families, `usage_report` takes a start time, new `patent-checker watch`
+  and `patent-checker ledger status|check` commands. The container image
+  applies the distribution's security updates when it is built.
 - **v1.0** (2026-09): stable release. Constant-time bearer-token check,
   `.env` never read from your home directory or the filesystem root,
   request size limits, hardened container (read-only, no capabilities),

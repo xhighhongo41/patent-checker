@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
-from patent_checker import service
+from patent_checker import service, validation, watch
 from patent_checker.cache import DEFAULT_TTLS, Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp import fetch as gp_fetch
@@ -34,6 +34,7 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
+from patent_checker.validation import InvalidInput
 from tests._fixtures import fixture_path
 
 # How long a cached legal-status response stays usable. The legal kind always
@@ -42,6 +43,10 @@ LEGAL_TTL = DEFAULT_TTLS["legal"]
 assert LEGAL_TTL is not None
 
 _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
+
+# A fixed fetched_at, used wherever a test needs a deterministic value to
+# compare a full result dict against (real calls use the current time).
+FIXED_FETCHED_AT = "2026-09-02T10:00:00+00:00"
 
 
 def _load_fixture(name: str) -> bytes:
@@ -161,6 +166,7 @@ def _fetched_page(**overrides: Any) -> FetchedPage:
         "html": "<html></html>",
         "path": None,
         "cached": False,
+        "fetched_at": FIXED_FETCHED_AT,
     }
     fields.update(overrides)
     return FetchedPage(**fields)
@@ -212,6 +218,7 @@ def test_search_returns_page_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(search=b"<xml/>")
 
     result = service.search("ti=drone", client=stub)
@@ -223,6 +230,7 @@ def test_search_returns_page_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
     assert stub.calls == [("search", ("ti=drone",), {"begin": 1, "end": 25})]
 
@@ -332,6 +340,7 @@ def test_legal_returns_docdb_pub_and_events(monkeypatch: pytest.MonkeyPatch) -> 
     """legal keys the result by the DOCDB spelling of the requested publication."""
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(legal=b"<xml/>")
 
     data = _as_json(service.legal("US11468338B2", client=stub))
@@ -342,6 +351,7 @@ def test_legal_returns_docdb_pub_and_events(monkeypatch: pytest.MonkeyPatch) -> 
             {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
         ],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -352,6 +362,7 @@ def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> No
         "parse_family_xml",
         lambda xml: OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1")),
     )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(family=b"<xml/>")
 
     result = service.family("US.1.A1", client=stub)
@@ -360,6 +371,7 @@ def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> No
         "family_id": "100",
         "members": ["US.1.A1", "EP.2.A1"],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -372,6 +384,7 @@ def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> No
         pytest.param(lambda: service.biblio("US.1.A1", client=None), id="biblio"),
         pytest.param(lambda: service.legal("US.1.A1", client=None), id="legal"),
         pytest.param(lambda: service.family("US.1.A1", client=None), id="family"),
+        pytest.param(lambda: service.watch(["US.1.A1"], client=None), id="watch"),
     ],
 )
 @pytest.mark.usefixtures("no_outward_calls")
@@ -403,12 +416,14 @@ def test_claims_google_patents_route_without_gp_client(monkeypatch: pytest.Monke
     assert data == {
         "source": "gp",
         "pub": "US11468338B2",
+        "pub_docdb": "US.11468338.B2",
         "claims": [{"number": 1, "text": "1. A widget.", "depends_on": []}],
         "claims_fallback_text": "",
         "status_display": "Active",
         "expiration": "2040-01-01",
         "assignee": "Acme",
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -443,6 +458,7 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
         "parse_claims_xml",
         lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
     )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(claims=b"<xml/>")
 
     data = _as_json(service.claims("EP1234567A1", client=stub))
@@ -450,8 +466,10 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
     assert data == {
         "source": "ops-fulltext",
         "pub": "EP1234567A1",
+        "pub_docdb": "EP.1234567.A1",
         "claims": [{"number": 1, "text": "1. Claim text.", "depends_on": []}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -469,6 +487,7 @@ def test_claims_gp_unavailable_for_us_never_calls_ops(monkeypatch: pytest.Monkey
     assert result == {
         "unavailable": True,
         "pub": "US20240111636A1",
+        "pub_docdb": "US.2024111636.A1",
         "retry_after_hint": "wait a bit",
     }
     assert stub.calls == []
@@ -484,7 +503,12 @@ def test_claims_gp_unavailable_for_ep_without_client_is_unavailable(
 
     result = service.claims("EP1234567A1")
 
-    assert result == {"unavailable": True, "pub": "EP1234567A1", "retry_after_hint": "wait"}
+    assert result == {
+        "unavailable": True,
+        "pub": "EP1234567A1",
+        "pub_docdb": "EP.1234567.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 def test_claims_ops_fulltext_404_is_also_reported_unavailable(
@@ -500,7 +524,12 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 
     result = service.claims("WO2020123456A1", client=stub)
 
-    assert result == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert result == {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 def test_claims_ops_fulltext_server_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,6 +575,58 @@ def test_dedup_wraps_families_with_their_count(monkeypatch: pytest.MonkeyPatch) 
     result = service.dedup([{"pub": "US.1.A1", "family_id": "1"}])
 
     assert result == {"families": families, "count": 1}
+
+
+def test_dedup_known_family_ids_adds_known_flags_and_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing known_family_ids forwards it to dedup_families and adds new/known counts."""
+    families = [
+        {"family_id": "1", "members": ["US.1.A1"], "known": True},
+        {"family_id": "2", "members": ["US.2.A1"], "known": False},
+    ]
+    captured: dict[str, Any] = {}
+
+    def fake_dedup_families(hits: Any, known_family_ids: Any) -> list[dict[str, Any]]:
+        captured["hits"] = hits
+        captured["known_family_ids"] = known_family_ids
+        return families
+
+    monkeypatch.setattr(service, "dedup_families", fake_dedup_families)
+
+    result = service.dedup([{"pub": "US.1.A1", "family_id": "1"}], known_family_ids=["1"])
+
+    assert captured["known_family_ids"] == ["1"]
+    assert result == {
+        "families": families,
+        "count": 2,
+        "new_count": 1,
+        "known_count": 1,
+    }
+
+
+def test_dedup_known_family_ids_rejects_a_non_string_element() -> None:
+    """A non-string element of known_family_ids is refused before dedup_families runs."""
+    with pytest.raises(ValueError, match=r"known_family_ids\[0\]"):
+        service.dedup([{"pub": "US.1.A1", "family_id": "1"}], known_family_ids=[123])
+
+
+def test_dedup_known_family_ids_rejects_a_mapping_element() -> None:
+    """A family id is a string: a record that merely carries a "pub" is not one."""
+    with pytest.raises(InvalidInput, match=r"known_family_ids\[1\]"):
+        service.dedup(
+            [{"pub": "US.1.A1", "family_id": "1"}],
+            known_family_ids=["1", {"pub": "US.1.A1"}],
+        )
+
+
+def test_dedup_known_family_ids_rejects_more_than_the_batch_limit() -> None:
+    """known_family_ids is bounded by the same MAX_BATCH_RECORDS ceiling as hits."""
+    with pytest.raises(ValueError, match="10000"):
+        service.dedup(
+            [{"pub": "US.1.A1", "family_id": "1"}],
+            known_family_ids=["1"] * (service.MAX_BATCH_RECORDS + 1),
+        )
 
 
 def test_verify_returns_verify_batch_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,12 +842,19 @@ def test_claims_unavailable_result_is_never_cached(
     stub = _StubOpsClient(claims=not_found)
     cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
 
+    expected = {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
+
     first = service.claims("WO2020123456A1", client=stub, cache=cache)
-    assert first == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert first == expected
     assert len(stub.calls) == 1
 
     second = service.claims("WO2020123456A1", client=stub, cache=cache)
-    assert second == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert second == expected
     assert len(stub.calls) == 2
 
 
@@ -800,8 +888,10 @@ def test_claims_gp_route_uses_the_same_cache(
 
     assert "cached" not in first
     assert first["raw_path"] == str(cache.content_path("gp", pub_key("US11468338B2")))
+    assert "fetched_at" in first
     assert second["cached"] is True
     assert second["raw_path"] == first["raw_path"]
+    assert second["fetched_at"] == first["fetched_at"]
     assert len(requests) == 1
 
 
@@ -932,6 +1022,150 @@ def test_refresh_ignores_a_fresh_cache_entry_on_every_route(
     assert "cached" not in third
     assert third["raw_path"] == second["raw_path"]
     assert len(stub.calls) == 2
+
+
+# --- fetched_at (v1.1) -------------------------------------------------------
+
+# The cache kind/key each _CACHED_ROUTES entry above writes to, so a test can
+# reach in and hand-edit the sidecar it produces.
+_CACHED_ROUTE_CACHE_LOOKUP: dict[str, tuple[str, str]] = {
+    "search": ("search", search_key("ti=drone", 1, 25)),
+    "search_biblio": ("searchbib", search_key("ti=drone", 1, 25)),
+    "biblio": ("biblio", pub_key("US.1.A1")),
+    "legal": ("legal", pub_key("US.1.A1")),
+    "family": ("family", pub_key("US.1.A1")),
+    "claims": ("claims", pub_key("EP1234567A1")),
+}
+
+
+def _refreshable_stub() -> _StubOpsClient:
+    """Return a stub answering every method every _CACHED_ROUTES entry may call."""
+    return _StubOpsClient(
+        search=b"<xml/>",
+        search_biblio=b"<xml/>",
+        biblio=b"<xml/>",
+        legal=b"<xml/>",
+        family=b"<xml/>",
+        claims=b"<xml/>",
+    )
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_matches_between_a_fresh_fetch_and_the_cached_hit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
+) -> None:
+    """A cache hit reports the exact fetched_at the write that created it recorded."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+    call = _CACHED_ROUTES[route]
+
+    first = call(stub, cache, False)
+    second = call(stub, cache, False)
+
+    assert "fetched_at" in first
+    assert second["cached"] is True
+    assert second["fetched_at"] == first["fetched_at"]
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_without_a_cache_is_utc_offset_aware_and_second_precision(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """cache=None still reports a well-formed fetched_at (the current-time fallback)."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    call = _CACHED_ROUTES[route]
+
+    result = call(stub, None, False)
+
+    parsed = datetime.fromisoformat(result["fetched_at"])
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parsed.microsecond == 0
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_normalizes_a_legacy_naive_sidecar_on_hit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
+) -> None:
+    """A pre-v1.0 naive-local sidecar is reported as the equivalent aware UTC instant.
+
+    The comparison is by instant, not by string, so it does not depend on
+    the timezone the test happens to run under.
+    """
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    now = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(tmp_path, clock=lambda: now)
+    kind, key = _CACHED_ROUTE_CACHE_LOOKUP[route]
+    cache.put(kind, key, b"<xml/>", ident="legacy")
+    naive = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    meta_path = cache.meta_path(kind, key)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["fetched_at"] = naive
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    result = _CACHED_ROUTES[route](stub, cache, False)
+
+    assert result["cached"] is True
+    expected_instant = datetime.fromisoformat(naive).astimezone()
+    assert datetime.fromisoformat(result["fetched_at"]) == expected_instant
+
+
+def test_plan_check_result_entries_have_no_fetched_at() -> None:
+    """plan_check's per-query entries are hit counts, not fetch results, and carry no fetched_at."""
+    xml = _load_fixture("20260827-001753_search_ab40de2f9f.xml")
+    stub = _StubOpsClient(search=xml)
+
+    result = service.plan_check(["ta = computer"], client=stub)
+
+    assert "fetched_at" not in result["results"][0]
+
+
+def test_claims_unavailable_shape_has_no_fetched_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "could not be fetched from any source" shape carries no fetched_at."""
+    unavailable = GPUnavailable(pub="US20240111636A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+
+    result = service.claims("US20240111636A1")
+
+    assert "fetched_at" not in result
+
+
+# --- pub_docdb (v1.1) ---------------------------------------------------------
+
+
+def test_claims_gp_pub_docdb_uses_the_pages_own_publication_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gp source's pub_docdb reflects the number the page itself reports."""
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: _fetched_page())
+    monkeypatch.setattr(
+        service, "parse_patent_html", lambda html: _sample_gp_doc(pub_number="EP1234567B1")
+    )
+
+    result = service.claims("EP1234567")
+
+    assert result["pub_docdb"] == "EP.1234567.B1"
+
+
+def test_claims_gp_pub_docdb_falls_back_when_the_pages_number_is_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty or unparseable page pub_number falls back to the requested publication."""
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: _fetched_page())
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc(pub_number=""))
+
+    result = service.claims("US11468338B2")
+
+    assert result["pub_docdb"] == "US.11468338.B2"
 
 
 def test_refresh_replaces_the_cached_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1158,3 +1392,359 @@ def test_claims_gp_route_keeps_a_cached_page_the_parser_rejects(
         service.claims("US11468338B2", cache=cache)
 
     assert cache.get("gp", pub_key("US11468338B2")) is not None
+
+
+# --- watch (v1.1) ----------------------------------------------------------
+
+
+class _WatchOpsClient:
+    """OPS stand-in whose response body is the publication it was asked for.
+
+    The canned parsers of :func:`_watch_upstream` read that body back, so a
+    test can give every publication its own legal events and family without
+    having to fake any XML.
+    """
+
+    def __init__(self, failures: dict[str, BaseException] | None = None) -> None:
+        self.calls: list[tuple[str, str]] = []
+        self._failures = failures or {}
+
+    def legal(self, pub: str) -> bytes:
+        """Answer a legal-status request with the DOCDB spelling of *pub*."""
+        return self._answer("legal", pub)
+
+    def family(self, pub: str) -> bytes:
+        """Answer a family request with the DOCDB spelling of *pub*."""
+        return self._answer("family", pub)
+
+    def _answer(self, kind: str, pub: str) -> bytes:
+        key = pub_key(pub)
+        self.calls.append((kind, key))
+        failure = self._failures.get(key)
+        if failure is not None:
+            raise failure
+        return key.encode("utf-8")
+
+
+def _watch_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+    events: dict[str, tuple[OpsLegalEvent, ...]],
+    families: dict[str, OpsFamily],
+) -> None:
+    """Point the legal/family parsers at per-publication canned data.
+
+    Both dicts are read on every call, so a test can change what upstream
+    reports between two watch runs simply by editing them.
+    """
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events[xml.decode("utf-8")])
+    monkeypatch.setattr(service, "parse_family_xml", lambda xml: families[xml.decode("utf-8")])
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
+
+
+def _legal_event(
+    code: str = "PG25", desc: str = "Lapsed", gazette_date: str = "20240101"
+) -> OpsLegalEvent:
+    """Build one INPADOC legal event for the watch tests."""
+    return OpsLegalEvent(code=code, desc=desc, gazette_date=gazette_date, pre_lines=())
+
+
+def test_watch_first_run_records_a_snapshot_per_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without stored snapshots every publication is a first snapshot, and none changed."""
+    _watch_upstream(
+        monkeypatch,
+        {"US.1.A1": (_legal_event(),), "EP.2.A1": ()},
+        {
+            "US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",)),
+            "EP.2.A1": OpsFamily(family_id="200", members=("EP.2.A1",)),
+        },
+    )
+    client = _WatchOpsClient()
+
+    result = service.watch(["US.1.A1", "EP.2.A1"], client=client)
+
+    assert [entry["pub"] for entry in result["results"]] == ["US.1.A1", "EP.2.A1"]
+    assert all(entry["first_snapshot"] is True for entry in result["results"])
+    assert result["first_count"] == 2
+    assert result["changed_count"] == 0
+    assert result["unchanged_count"] == 0
+    assert result["error_count"] == 0
+    assert result["ignored_previous"] == 0
+    assert result["checked_at"] == FIXED_FETCHED_AT
+    assert "since" not in result
+    assert result["results"][0]["snapshot"]["snapshot_format"] == watch.SNAPSHOT_FORMAT
+
+
+def test_watch_with_the_stored_snapshots_reports_no_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same upstream data on the next run is reported as unchanged, not as first."""
+    _watch_upstream(
+        monkeypatch,
+        {"US.1.A1": (_legal_event(),)},
+        {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))},
+    )
+    client = _WatchOpsClient()
+    first = service.watch(["US.1.A1"], client=client)
+
+    second = service.watch(["US.1.A1"], previous=[first["results"][0]["snapshot"]], client=client)
+
+    entry = second["results"][0]
+    assert entry["first_snapshot"] is False
+    assert entry["changed"] is False
+    assert entry["legal"]["previous_fetched_at"] == FIXED_FETCHED_AT
+    assert second["unchanged_count"] == 1
+    assert second["changed_count"] == 0
+    assert second["first_count"] == 0
+
+
+def test_watch_reports_what_changed_since_the_stored_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new legal event and a new family member are reported against the snapshot."""
+    events = {"US.1.A1": (_legal_event(),)}
+    families = {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))}
+    _watch_upstream(monkeypatch, events, families)
+    client = _WatchOpsClient()
+    first = service.watch(["US.1.A1"], client=client)
+
+    # Upstream moves on between the two runs.
+    events["US.1.A1"] = (_legal_event(), _legal_event(code="MM4A", gazette_date="20250101"))
+    families["US.1.A1"] = OpsFamily(family_id="100", members=("US.1.A1", "JP.3.A"))
+
+    second = service.watch(["US.1.A1"], previous=[first["results"][0]["snapshot"]], client=client)
+
+    entry = second["results"][0]
+    assert entry["changed"] is True
+    assert entry["legal"]["new_events"] == [
+        {"code": "MM4A", "desc": "Lapsed", "gazette_date": "20250101", "pre_lines": []}
+    ]
+    assert entry["family"]["new_members"] == ["JP.3.A"]
+    assert second["changed_count"] == 1
+    assert second["unchanged_count"] == 0
+
+
+def test_watch_accepts_snapshots_that_went_through_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot stored in a ledger comes back as lists, and must still compare equal."""
+    _watch_upstream(
+        monkeypatch,
+        {"US.1.A1": (_legal_event(),)},
+        {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))},
+    )
+    client = _WatchOpsClient()
+    first = service.watch(["US.1.A1"], client=client)
+    stored = json.loads(json.dumps(first["results"][0]["snapshot"], ensure_ascii=False))
+
+    second = service.watch(["US.1.A1"], previous=[stored], client=client)
+
+    entry = second["results"][0]
+    assert entry["changed"] is False
+    assert entry["legal"]["new_events"] == []
+    assert entry["legal"]["missing_events"] == []
+
+
+def test_watch_reports_a_failed_publication_and_checks_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One publication OPS refuses does not stop the ones after it."""
+    _watch_upstream(
+        monkeypatch,
+        {"EP.2.A1": ()},
+        {"EP.2.A1": OpsFamily(family_id="200", members=("EP.2.A1",))},
+    )
+    failure = httpx.HTTPStatusError(
+        "503", request=httpx.Request("GET", "https://ops.epo.org"), response=httpx.Response(503)
+    )
+    client = _WatchOpsClient(failures={"US.1.A1": failure})
+
+    result = service.watch(["US.1.A1", "EP.2.A1"], client=client)
+
+    assert result["results"][0] == {
+        "pub": "US.1.A1",
+        "error_type": watch.ERROR_EXTERNAL_API,
+        "error": str(failure),
+    }
+    assert result["results"][1]["first_snapshot"] is True
+    assert result["error_count"] == 1
+    assert result["first_count"] == 1
+
+
+def test_watch_reports_unreadable_upstream_data_per_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body the parser rejects is that publication's error, not the whole call's."""
+
+    def parse_legal(xml: bytes) -> Any:
+        if xml == b"US.1.A1":
+            raise ValueError("unparseable body")
+        return ()
+
+    monkeypatch.setattr(service, "parse_legal_xml", parse_legal)
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="1", members=())
+    )
+    client = _WatchOpsClient()
+
+    result = service.watch(["US.1.A1", "EP.2.A1"], client=client)
+
+    assert result["results"][0]["error_type"] == watch.ERROR_UPSTREAM_DATA
+    assert "unparseable body" in result["results"][0]["error"]
+    assert result["results"][1]["first_snapshot"] is True
+    assert result["error_count"] == 1
+
+
+def test_watch_accepts_the_snapshot_of_a_publication_with_hundreds_of_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A snapshot outgrows the size of an ordinary batch element and must still come back.
+
+    An EP publication collects one lapse event per contracting state; a few
+    hundred events make a snapshot several times the generic element limit,
+    and refusing it would make the publication unwatchable from then on.
+    """
+    events = tuple(
+        _legal_event(desc=f"Lapsed in state {number}", gazette_date=f"2024{number % 12 + 1:02d}01")
+        for number in range(300)
+    )
+    _watch_upstream(
+        monkeypatch,
+        {"EP.2.A1": events},
+        {"EP.2.A1": OpsFamily(family_id="200", members=("EP.2.A1",))},
+    )
+    client = _WatchOpsClient()
+    first = service.watch(["EP.2.A1"], client=client)
+    snapshot = _as_json(first["results"][0]["snapshot"])
+    assert len(json.dumps(snapshot)) > validation.MAX_ITEM_CHARS
+
+    second = service.watch(["EP.2.A1"], previous=[snapshot], client=client)
+
+    assert second["results"][0]["changed"] is False
+    assert second["unchanged_count"] == 1
+
+
+def test_watch_still_bounds_the_size_of_one_stored_snapshot() -> None:
+    """The dedicated snapshot limit is a limit: an oversized element is refused unfetched."""
+    oversized = {
+        "pub": "EP.2.A1",
+        "snapshot_format": watch.SNAPSHOT_FORMAT,
+        "legal": {"events": [["20240101", "PG25", "0" * 8]] * 3000},
+        "family": {"members": []},
+    }
+    assert len(json.dumps(oversized)) > watch.MAX_SNAPSHOT_CHARS
+
+    with pytest.raises(InvalidInput, match=r"previous\[0\]"):
+        service.watch(["EP.2.A1"], previous=[oversized], client=_WatchOpsClient())
+
+
+def test_watch_rejects_an_empty_publication_list() -> None:
+    """A watch call with nothing to watch is the caller's mistake."""
+    with pytest.raises(InvalidInput, match="at least one"):
+        service.watch([], client=_WatchOpsClient())
+
+
+def test_watch_rejects_more_publications_than_the_limit() -> None:
+    """One call cannot turn into an unbounded number of OPS requests."""
+    pubs = [f"US.{number}.A1" for number in range(watch.MAX_WATCH_PUBS + 1)]
+
+    with pytest.raises(InvalidInput, match=str(watch.MAX_WATCH_PUBS)):
+        service.watch(pubs, client=_WatchOpsClient())
+
+
+def test_watch_rejects_an_unparseable_publication() -> None:
+    """An unparseable publication is refused before anything is fetched, naming its index."""
+    client = _WatchOpsClient()
+
+    with pytest.raises(InvalidInput, match=r"pubs\[1\]"):
+        service.watch(["US.1.A1", "not a pub"], client=client)
+
+    assert client.calls == []
+
+
+def test_watch_rejects_the_same_publication_twice() -> None:
+    """Two spellings of one publication would produce two results for one document."""
+    with pytest.raises(InvalidInput, match="US.11468338.B2"):
+        service.watch(["US11468338B2", "US.11468338.B2"], client=_WatchOpsClient())
+
+
+def test_watch_rejects_a_previous_payload_that_is_not_a_list() -> None:
+    """The stored snapshots are a list; anything else is refused before any request."""
+    with pytest.raises(InvalidInput, match="previous"):
+        service.watch(["US.1.A1"], previous={"pub": "US.1.A1"}, client=_WatchOpsClient())
+
+
+def test_watch_counts_stored_snapshots_it_was_not_asked_about(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ledger may hold more snapshots than this call covers; the rest are counted."""
+    _watch_upstream(
+        monkeypatch,
+        {"US.1.A1": ()},
+        {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))},
+    )
+    client = _WatchOpsClient()
+    first = service.watch(["US.1.A1"], client=client)
+    other = dict(first["results"][0]["snapshot"], pub="EP.2.A1")
+
+    second = service.watch(
+        ["US.1.A1"], previous=[first["results"][0]["snapshot"], other], client=client
+    )
+
+    assert second["ignored_previous"] == 1
+    assert second["results"][0]["first_snapshot"] is False
+
+
+def test_watch_reports_which_half_of_a_result_came_from_the_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both lookups go through the normal cache, and the result says when they were hits."""
+    _watch_upstream(
+        monkeypatch,
+        {"US.1.A1": (_legal_event(),)},
+        {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))},
+    )
+    client = _WatchOpsClient()
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+
+    first = service.watch(["US.1.A1"], client=client, cache=cache)
+    second = service.watch(["US.1.A1"], client=client, cache=cache)
+
+    assert first["results"][0]["cached"] == {"legal": False, "family": False}
+    assert second["results"][0]["cached"] == {"legal": True, "family": True}
+    assert len(client.calls) == 2
+
+
+def test_watch_since_reports_the_recent_events_and_the_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """since selects the events dated on or after it and is echoed in the result."""
+    _watch_upstream(
+        monkeypatch,
+        {
+            "US.1.A1": (
+                _legal_event(code="MM4A", gazette_date="20230101"),
+                _legal_event(code="PG25", gazette_date="20250101"),
+                _legal_event(code="XX1A", gazette_date=""),
+            )
+        },
+        {"US.1.A1": OpsFamily(family_id="100", members=("US.1.A1",))},
+    )
+
+    result = service.watch(["US.1.A1"], since="2024-01-01", client=_WatchOpsClient())
+
+    entry = result["results"][0]
+    assert [event["code"] for event in entry["legal"]["events_since"]] == ["PG25"]
+    assert entry["legal"]["undated_events"] == 1
+    assert result["since"] == "2024-01-01"
+
+
+def test_watch_rejects_an_unparseable_since() -> None:
+    """An unusable since is refused before any request, like every other bad argument."""
+    client = _WatchOpsClient()
+
+    with pytest.raises(InvalidInput, match="since"):
+        service.watch(["US.1.A1"], since="not a date", client=client)
+
+    assert client.calls == []

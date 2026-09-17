@@ -223,7 +223,7 @@ def _sample_gp_doc(**overrides: Any) -> GPatentDoc:
 
 
 def test_list_tools_matches_tool_names(settings: ServerSettings, make_state: Any) -> None:
-    """The server registers exactly the twelve documented tools."""
+    """The server registers exactly the thirteen documented tools."""
     mcp = build_server(settings, state=make_state())
 
     async def run() -> set[str]:
@@ -232,7 +232,23 @@ def test_list_tools_matches_tool_names(settings: ServerSettings, make_state: Any
 
     names = asyncio.run(run())
     assert names == set(tools.TOOL_NAMES)
-    assert len(tools.TOOL_NAMES) == 12
+    assert len(tools.TOOL_NAMES) == 13
+
+
+def test_tool_names_match_the_registered_functions_in_order() -> None:
+    """The documented names and the registered functions are one list, in one order.
+
+    ``TOOL_NAMES`` is what the Skill's tool table and the tests are checked
+    against, while ``_TOOL_FUNCTIONS`` is what the server actually
+    registers; a tool added to one and not the other would otherwise only
+    show up as a missing tool at run time.
+    """
+    assert [function.__name__ for function in tools._TOOL_FUNCTIONS] == list(tools.TOOL_NAMES)
+
+
+def test_watch_check_is_registered_next_to_the_tools_it_builds_on() -> None:
+    """watch_check reads legal status and family, and is listed right after them."""
+    assert tools.TOOL_NAMES.index("watch_check") == tools.TOOL_NAMES.index("get_family") + 1
 
 
 def test_every_tool_description_states_what_it_returns(
@@ -267,6 +283,7 @@ def test_every_tool_description_states_what_it_returns(
         "get_claims",
         "get_legal",
         "get_family",
+        "watch_check",
     ],
 )
 def test_cached_results_are_documented_for_the_cached_tools(
@@ -444,6 +461,113 @@ def test_get_family_returns_members(
     assert data["members"] == ["US.1.A1"]
 
 
+def test_watch_check_takes_a_first_snapshot_per_publication(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """Without stored snapshots watch_check records the current state and reports no change."""
+    event = OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20240101", pre_lines=())
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: (event,))
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=("US.1.A1",))
+    )
+    stub = _StubOpsClient(legal=b"<xml/>", family=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    data = _call(mcp, "watch_check", {"pubs": ["US11468338B2"]})
+
+    assert data["first_count"] == 1
+    assert data["changed_count"] == 0
+    entry = data["results"][0]
+    assert entry["pub"] == "US.11468338.B2"
+    assert entry["first_snapshot"] is True
+    assert entry["snapshot"]["pub"] == "US.11468338.B2"
+    assert [name for name, _, _ in stub.calls] == ["legal", "family"]
+
+
+def test_watch_check_compares_against_a_stored_snapshot(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """The snapshot of one call, handed back to the next, turns it into a comparison.
+
+    The second call is served from this server's cache (a watch run reads
+    through the normal TTLs and never forces a re-fetch), so the same data
+    is compared against itself: nothing changed, and the publication is
+    counted as unchanged rather than as a first snapshot.
+    """
+    event = OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20240101", pre_lines=())
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: (event,))
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=("US.1.A1",))
+    )
+    stub = _StubOpsClient(legal=b"<xml/>", family=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+    first = _call(mcp, "watch_check", {"pubs": ["US11468338B2"]})
+
+    data = _call(
+        mcp,
+        "watch_check",
+        {"pubs": ["US11468338B2"], "previous": [first["results"][0]["snapshot"]]},
+    )
+
+    entry = data["results"][0]
+    assert entry["first_snapshot"] is False
+    assert entry["changed"] is False
+    assert entry["cached"] == {"legal": True, "family": True}
+    assert data["unchanged_count"] == 1
+    assert [name for name, _, _ in stub.calls] == ["legal", "family"]
+
+
+def test_watch_check_accepts_the_snapshot_of_a_publication_with_hundreds_of_events(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """A stored snapshot may exceed the generic element limit and is still taken back."""
+    events = tuple(
+        OpsLegalEvent(
+            code="PG25", desc=f"Lapsed in state {number}", gazette_date="20240101", pre_lines=()
+        )
+        for number in range(300)
+    )
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="200", members=("EP.2.A1",))
+    )
+    stub = _StubOpsClient(legal=b"<xml/>", family=b"<xml/>")
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+    first = _call(mcp, "watch_check", {"pubs": ["EP.2.A1"]})
+    snapshot = first["results"][0]["snapshot"]
+    assert len(json.dumps(snapshot)) > tools.MAX_ITEM_CHARS
+
+    data = _call(mcp, "watch_check", {"pubs": ["EP.2.A1"], "previous": [snapshot]})
+
+    assert data["results"][0]["changed"] is False
+    assert data["unchanged_count"] == 1
+
+
+def test_watch_check_since_lists_the_recent_events(
+    monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
+) -> None:
+    """since narrows what each entry lists, without changing what counts as a change."""
+    monkeypatch.setattr(
+        service,
+        "parse_legal_xml",
+        lambda xml: (
+            OpsLegalEvent(code="MM4A", desc="Lapsed", gazette_date="20230101", pre_lines=()),
+            OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20250101", pre_lines=()),
+        ),
+    )
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=())
+    )
+    mcp = build_server(
+        settings, state=make_state(ops_client=_StubOpsClient(legal=b"<xml/>", family=b"<xml/>"))
+    )
+
+    data = _call(mcp, "watch_check", {"pubs": ["US11468338B2"], "since": "2024-01-01"})
+
+    assert data["since"] == "2024-01-01"
+    assert [event["code"] for event in data["results"][0]["legal"]["events_since"]] == ["PG25"]
+
+
 def test_get_claims_uses_the_shared_google_patents_client(
     monkeypatch: pytest.MonkeyPatch, settings: ServerSettings, make_state: Any
 ) -> None:
@@ -456,7 +580,13 @@ def test_get_claims_uses_the_shared_google_patents_client(
         captured["pub"] = pub
         captured["client"] = client
         captured["cache"] = cache
-        return FetchedPage(pub=pub, html="<html></html>", path=None, cached=False)
+        return FetchedPage(
+            pub=pub,
+            html="<html></html>",
+            path=None,
+            cached=False,
+            fetched_at="2026-09-02T10:00:00+00:00",
+        )
 
     monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
@@ -499,6 +629,50 @@ def test_dedup_families_collapses_hits(settings: ServerSettings, make_state: Any
 
     assert data["count"] == 1
     assert len(data["families"]) == 1
+
+
+def test_dedup_families_known_family_ids_reports_known_and_new(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """known_family_ids marks each family and adds new_count/known_count."""
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(
+        mcp,
+        "dedup_families",
+        {
+            "hits": [
+                {"pub": "US11468338B2", "family_id": "100"},
+                {"pub": "EP1672502A1", "family_id": "200"},
+            ],
+            "known_family_ids": ["100"],
+        },
+    )
+
+    assert data["new_count"] == 1
+    assert data["known_count"] == 1
+    families_by_id = {family["family_id"]: family for family in data["families"]}
+    assert families_by_id["100"]["known"] is True
+    assert families_by_id["200"]["known"] is False
+
+
+def test_dedup_families_known_family_ids_oversized_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """An oversized known_family_ids payload is refused like any other batch."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(
+            mcp,
+            "dedup_families",
+            {
+                "hits": [{"pub": "US11468338B2", "family_id": "100"}],
+                "known_family_ids": ["x"] * (tools.MAX_RECORDS + 1),
+            },
+        )
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
 def test_verify_batch_reports_missing_publications(
@@ -565,6 +739,38 @@ def test_usage_report_uses_the_shared_log_path_helper(
 
     assert data["path"] == str(utils.ops_headers_path(settings.data_base))
     assert data["path"] == str(tmp_path / "raw" / "ops" / "headers.jsonl")
+
+
+def test_usage_report_since_narrows_the_summary(
+    settings: ServerSettings, make_state: Any, tmp_path: Path
+) -> None:
+    """since restricts the summary to requests at or after it."""
+    log_dir = tmp_path / "raw" / "ops"
+    log_dir.mkdir(parents=True)
+    lines = [
+        json.dumps({"at": "2026-01-01T00:00:00", "kind": "search", "url": "u1", "status": 200}),
+        json.dumps({"at": "2026-01-03T00:00:00", "kind": "biblio", "url": "u2", "status": 200}),
+    ]
+    (log_dir / "headers.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(mcp, "usage_report", {"since": "2026-01-02"})
+
+    assert data["total_requests"] == 1
+    assert data["by_kind"] == {"biblio": 1}
+    assert data["since"] == "2026-01-02T00:00:00"
+
+
+def test_usage_report_invalid_since_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """An unparseable since is refused before the log is even read."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "usage_report", {"since": "not a date"})
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
 def test_server_status_reports_the_running_configuration(
@@ -697,6 +903,15 @@ def test_server_status_reports_the_package_version(
         ("search_plan_check", {"queries": []}),
         ("search_plan_check", {"queries": ["ti=drone"] * (tools.MAX_QUERIES + 1)}),
         ("search_plan_check", {"queries": [""]}),
+        ("watch_check", {"pubs": []}),
+        ("watch_check", {"pubs": ["not a publication"]}),
+        ("watch_check", {"pubs": ["US11468338B2"] * (tools.MAX_WATCH_PUBS + 1)}),
+        ("watch_check", {"pubs": ["US11468338B2"], "since": "not a date"}),
+        ("watch_check", {"pubs": ["US11468338B2", "US.11468338.B2"]}),
+        (
+            "watch_check",
+            {"pubs": ["US11468338B2"], "previous": [{"pub": "US.11468338.B2"}]},
+        ),
     ],
 )
 def test_invalid_input_is_reported_as_invalid_input(
@@ -946,6 +1161,7 @@ def test_an_unusable_paging_window_is_refused_before_any_request(
         ("get_biblio", {"pub": "US11468338B2"}),
         ("get_legal", {"pub": "US11468338B2"}),
         ("get_family", {"pub": "US11468338B2"}),
+        ("watch_check", {"pubs": ["US11468338B2"]}),
     ],
 )
 def test_ops_tools_without_credentials_report_ops_not_configured(

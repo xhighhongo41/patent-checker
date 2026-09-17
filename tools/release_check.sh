@@ -129,18 +129,25 @@ import json, sys
 version = sys.argv[1]
 data = json.load(open("server.json", encoding="utf-8"))
 problems = []
-if data.get("version") != version:
-    problems.append(f"server.json version -> {data.get("version")} -> {version}")
+declared = data.get("version")
+if declared != version:
+    problems.append(f"server.json version -> {declared} -> {version}")
 for package in data.get("packages", []):
-    if "version" in package and package["version"] != version:
-        problems.append(f"server.json packages[{package.get(\"registryType\")}].version -> {package["version"]} -> {version}")
-    if package.get("registryType") == "oci":
+    kind = package.get("registryType")
+    declared = package.get("version")
+    if declared is not None and declared != version:
+        problems.append(f"server.json packages[{kind}].version -> {declared} -> {version}")
+    if kind == "oci":
         tag = package.get("identifier", "").rsplit(":", 1)[-1]
         if tag != version:
             problems.append(f"server.json oci identifier tag -> {tag} -> {version}")
 print("\n".join(problems))
 ' "$VERSION")
-if [ -n "$SERVER_JSON_CHECK" ]; then
+SERVER_JSON_STATUS=$?
+# A check that cannot run must never read as "nothing to report".
+if [ "$SERVER_JSON_STATUS" -ne 0 ]; then
+    echo "server.json -> the version check itself failed (exit $SERVER_JSON_STATUS) -> a check that runs" >>"$FAILURES_FILE"
+elif [ -n "$SERVER_JSON_CHECK" ]; then
     echo "$SERVER_JSON_CHECK" >>"$FAILURES_FILE"
 fi
 

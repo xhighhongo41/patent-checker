@@ -24,11 +24,12 @@ import threading
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 
-from patent_checker.cache import Cache, pub_key
+from patent_checker.cache import Cache, format_timestamp, normalize_timestamp, pub_key
 from patent_checker.net import allowlist_transport
 from patent_checker.pubnum import parse_pubnum
 
@@ -65,12 +66,18 @@ class FetchedPage:
         path: The body file in the cache, or ``None`` when the caller passed
             no cache and the page was therefore not stored.
         cached: True when the page came from the cache without a request.
+        fetched_at: UTC, offset-aware, seconds-precision ISO 8601 timestamp
+            of when this page was captured. For a cache hit this is the
+            cache's own recorded timestamp (normalized to this format even
+            when the sidecar predates v1.0); for a fresh download it is
+            when the download completed.
     """
 
     pub: str
     html: str
     path: Path | None
     cached: bool
+    fetched_at: str
 
 
 @dataclass(frozen=True)
@@ -179,7 +186,13 @@ def fetch_patent_html(
                     normalized,
                 )
             else:
-                return FetchedPage(pub=normalized, html=html, path=hit.path, cached=True)
+                return FetchedPage(
+                    pub=normalized,
+                    html=html,
+                    path=hit.path,
+                    cached=True,
+                    fetched_at=normalize_timestamp(hit.fetched_at),
+                )
 
     url = GP_URL_TEMPLATE.format(pub=normalized)
     with _request_lock, ExitStack() as stack:
@@ -199,5 +212,11 @@ def fetch_patent_html(
     resp.raise_for_status()
     html = resp.text
     body = html.encode("utf-8")
-    path = None if cache is None else cache.put("gp", key, body, ident=normalized)
-    return FetchedPage(pub=normalized, html=html, path=path, cached=False)
+    if cache is None:
+        path = None
+        fetched_at = format_timestamp(datetime.now())
+    else:
+        stored = cache.store("gp", key, body, ident=normalized)
+        path = stored.path
+        fetched_at = stored.fetched_at
+    return FetchedPage(pub=normalized, html=html, path=path, cached=False, fetched_at=fetched_at)

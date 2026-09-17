@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -262,6 +263,26 @@ def test_include_artifacts_adds_only_what_the_package_does_not_write(tmp_path: P
         tree.project / "exploration-x",
     }
     assert {item.scope for item in plan.items if item.category == "artifact"} == {"project"}
+
+
+def test_the_ledger_is_kept_by_default_and_removed_with_the_other_artifacts(
+    tmp_path: Path,
+) -> None:
+    """The ledger is an exploration artifact: kept by default, opt-in to delete."""
+    tree = _build_tree(tmp_path)
+    ledger = tree.project / "ledger" / "sample-app"
+    _write(ledger / "ledger.json", '{"format": 1, "target": "sample-app"}')
+    _write(ledger / "runs.jsonl", '{"run_id": "20260301-0930"}\n')
+
+    default_plan = plan_cleanup(data_base=tree.project, cache=_cache_for(tree))
+
+    planned = {item.path for item in default_plan.items}
+    assert not any(path.is_relative_to(tree.project / "ledger") for path in planned)
+    assert tree.project / "ledger" not in planned
+
+    opted_in = plan_cleanup(data_base=tree.project, cache=_cache_for(tree), include_artifacts=True)
+
+    assert tree.project / "ledger" in _paths_by_category(opted_in)["artifact"]
 
 
 def test_include_consent_adds_the_project_record_only(tmp_path: Path) -> None:
@@ -619,3 +640,26 @@ def test_execute_keeps_quiet_about_a_directory_that_is_not_empty(
 
     assert result["errors"] == []
     assert kept.exists()
+
+
+# --- what ``cache clear --expired`` reclaims -------------------------------
+
+
+def test_clearing_expired_entries_reclaims_a_stale_kind_code_less_page(tmp_path: Path) -> None:
+    """A Google Patents page cached without a kind code becomes reclaimable once stale.
+
+    ``cache clear --expired`` is ``Cache.select(expired=True)``, so what the
+    command would offer to delete is asserted at that level; the planner
+    itself never looks at freshness.
+    """
+    written_at = datetime(2026, 9, 1, 12, 0, 0)
+    clock_value = written_at
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("gp", "EP.1234567", b"<html></html>", ident="EP1234567")
+    cache.put("gp", "EP.1234567.B1", b"<html></html>", ident="EP1234567B1")
+
+    clock_value = written_at + timedelta(days=31)
+
+    selected = cache.select(expired=True)
+
+    assert [(entry.kind, entry.key) for entry in selected] == [("gp", "EP.1234567")]

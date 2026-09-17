@@ -47,7 +47,7 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from patent_checker import __version__, service, utils, validation
+from patent_checker import __version__, service, utils, validation, watch
 from patent_checker.cache import format_ttl
 from patent_checker.config import ConfigError
 from patent_checker.ops.client import MAX_RANGE_END, MAX_RANGE_SPAN
@@ -66,6 +66,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "get_claims",
     "get_legal",
     "get_family",
+    "watch_check",
     "normalize_pubnum",
     "dedup_families",
     "verify_batch",
@@ -79,6 +80,7 @@ TOOL_NAMES: tuple[str, ...] = (
 MAX_CQL_LENGTH = 4000
 MAX_QUERIES = 50
 MAX_RECORDS = service.MAX_BATCH_RECORDS  # shared with the CLI's dedup/verify validation
+MAX_WATCH_PUBS = watch.MAX_WATCH_PUBS  # shared with the CLI's and the service's watch check
 # Per-element and per-payload ceilings, shared with the CLI through
 # :mod:`patent_checker.validation`.
 MAX_ITEM_CHARS = validation.MAX_ITEM_CHARS
@@ -278,6 +280,32 @@ def _validate_size(items: Sequence[Any], label: str) -> None:
     )
 
 
+def _validate_watch_pubs(pubs: Sequence[Any]) -> None:
+    """Check a watch list: bounded, and every element a publication number.
+
+    The service layer checks the same things (so no front end can forget
+    to), but doing it here is what keeps a mistyped publication on the
+    ``invalid_input`` path before any OPS request is made.
+
+    Raises:
+        InvalidInput: If *pubs* is empty, holds more than
+            :data:`MAX_WATCH_PUBS` entries, breaks the shared element/
+            payload size limits, or holds an element that is not a
+            parseable publication number.
+    """
+    validation.validate_batch(
+        pubs,
+        label="pubs",
+        max_records=MAX_WATCH_PUBS,
+        max_item_chars=MAX_ITEM_CHARS,
+        max_payload_chars=MAX_PAYLOAD_CHARS,
+    )
+    if not pubs:
+        raise InvalidInput("pubs must contain at least one publication number")
+    for pub in pubs:
+        _validate_pub(pub)
+
+
 def _validate_hits(hits: Sequence[Any], label: str) -> None:
     """Check a ``dedup_families`` payload: bounded, and every element a mapping.
 
@@ -309,9 +337,11 @@ def ops_search(cql: str, begin: int = 1, end: int = 25, *, ctx: Context) -> dict
     family id; use get_biblio or ops_search_biblio for titles and abstracts.
 
     Returns ``{"query", "total", "begin", "end", "hits": [{"pub",
-    "family_id"}], "raw_path"}``, where "total" is the full hit count of the
-    query, not of this page. A ``"cached": true`` entry means the result was
-    served from this server's cache instead of a fresh OPS request.
+    "family_id"}], "raw_path", "fetched_at"}``, where "total" is the full hit
+    count of the query, not of this page, and "fetched_at" is the UTC instant
+    the data was captured (a cache hit reports when it was originally
+    fetched, not now). A ``"cached": true`` entry means the result was served
+    from this server's cache instead of a fresh OPS request.
 
     Args:
         cql: EPO CQL query expression, e.g. ``ti=drone and pd within
@@ -333,10 +363,12 @@ def ops_search_biblio(cql: str, begin: int = 1, end: int = 25, *, ctx: Context) 
     yields title, abstract, applicants, inventors, classifications and
     citations for every hit, so no follow-up get_biblio call is needed.
 
-    Returns ``{"total", "begin", "end", "docs": [...], "raw_path"}``, where
-    each doc carries the get_biblio fields. A ``"cached": true`` entry means
-    the result was served from this server's cache instead of a fresh OPS
-    request.
+    Returns ``{"total", "begin", "end", "docs": [...], "raw_path",
+    "fetched_at"}``, where each doc carries the get_biblio fields and
+    "fetched_at" is the UTC instant the data was captured (a cache hit
+    reports when it was originally fetched, not now). A ``"cached": true``
+    entry means the result was served from this server's cache instead of a
+    fresh OPS request.
 
     Args:
         cql: EPO CQL query expression.
@@ -388,7 +420,9 @@ def get_biblio(pub: str, *, ctx: Context) -> dict[str, Any]:
 
     Returns ``{"pub", "family_id", "title", "abstract", "applicants",
     "inventors", "ipc", "cpc", "publication_date", "cited_patents",
-    "npl_citation_count", "raw_path"}``. A ``"cached": true`` entry means the
+    "npl_citation_count", "raw_path", "fetched_at"}``, where "fetched_at" is
+    the UTC instant the record was captured (a cache hit reports when it was
+    originally fetched, not now). A ``"cached": true`` entry means the
     result was served from this server's cache instead of a fresh OPS
     request.
 
@@ -409,12 +443,17 @@ def get_claims(pub: str, *, ctx: Context) -> dict[str, Any]:
     serve, the OPS full-text route is used as a fallback. A document no
     source carries is a normal result, not an error.
 
-    Returns ``{"source": "gp", "pub", "claims": [{"number", "text",
-    "depends_on"}], "claims_fallback_text", "status_display", "expiration",
-    "assignee"}``, or ``{"source": "ops-fulltext", "pub", "claims",
-    "raw_path"}`` (a ``"cached": true`` entry means it was served from this
-    server's cache instead of a fresh OPS request), or ``{"unavailable":
-    true, "pub", "retry_after_hint"}`` when neither source has the document.
+    Returns ``{"source": "gp", "pub", "pub_docdb", "claims": [{"number",
+    "text", "depends_on"}], "claims_fallback_text", "status_display",
+    "expiration", "assignee", "raw_path", "fetched_at"}``, or ``{"source":
+    "ops-fulltext", "pub", "pub_docdb", "claims", "raw_path", "fetched_at"}``
+    (a ``"cached": true`` entry means it was served from this server's cache
+    instead of a fresh OPS request), or ``{"unavailable": true, "pub",
+    "pub_docdb", "retry_after_hint"}`` when neither source has the document.
+    "pub_docdb" is the DOCDB spelling of the publication actually read (the
+    number the "gp" page itself reports, or the requested publication
+    otherwise); "fetched_at" is the UTC instant the data was captured (a
+    cache hit reports when it was originally fetched, not now).
 
     Args:
         pub: Publication number in any common spelling.
@@ -434,11 +473,13 @@ def get_legal(pub: str, *, ctx: Context) -> dict[str, Any]:
     whether a patent is in force is the caller's job, not this tool's.
 
     Returns ``{"pub" (DOCDB spelling), "events": [{"code", "desc",
-    "gazette_date", "pre_lines"}], "raw_path"}``. When OPS reports no event
-    at all, "events" is empty and a "note" entry says so: that is an answer,
-    not a failed lookup, and it does not mean the publication is dead. A
-    ``"cached": true`` entry means the result was served from this server's
-    cache instead of a fresh OPS request.
+    "gazette_date", "pre_lines"}], "raw_path", "fetched_at"}``, where
+    "fetched_at" is the UTC instant the data was captured (a cache hit
+    reports when it was originally fetched, not now). When OPS reports no
+    event at all, "events" is empty and a "note" entry says so: that is an
+    answer, not a failed lookup, and it does not mean the publication is
+    dead. A ``"cached": true`` entry means the result was served from this
+    server's cache instead of a fresh OPS request.
 
     Args:
         pub: Publication number in any common spelling.
@@ -453,8 +494,11 @@ def get_family(pub: str, *, ctx: Context) -> dict[str, Any]:
     """Fetch the simple patent family of one publication from EPO OPS.
 
     Returns ``{"family_id", "members": [publication numbers in DOCDB
-    spelling], "raw_path"}``. A ``"cached": true`` entry means the result was
-    served from this server's cache instead of a fresh OPS request.
+    spelling], "raw_path", "fetched_at"}``, where "fetched_at" is the UTC
+    instant the data was captured (a cache hit reports when it was
+    originally fetched, not now). A ``"cached": true`` entry means the
+    result was served from this server's cache instead of a fresh OPS
+    request.
 
     Args:
         pub: Publication number in any common spelling.
@@ -463,6 +507,79 @@ def get_family(pub: str, *, ctx: Context) -> dict[str, Any]:
     with _mapped_errors():
         _validate_pub(pub)
         return service.family(pub, client=state.ops_client, cache=state.cache)
+
+
+def watch_check(
+    pubs: list[str],
+    previous: list[dict[str, Any]] | None = None,
+    since: str | None = None,
+    *,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Check watched publications for legal-status and family changes since an earlier run.
+
+    Fetches the INPADOC legal status and the simple family of every listed
+    publication (through this server's cache, exactly as get_legal and
+    get_family do) and returns a compact "snapshot" of each. Store that
+    snapshot verbatim and pass it back under *previous* on the next run:
+    the result then also says, per publication, whether anything changed,
+    which legal events are new (in full), which are no longer reported, and
+    which family members appeared or vanished. Nothing is interpreted here:
+    an event that is no longer reported is as likely to be a correction of
+    the office's record as a change of rights, and saying which is the
+    caller's job.
+
+    Returns ``{"results": [...], "changed_count", "unchanged_count",
+    "first_count", "error_count", "ignored_previous", "checked_at"}``, plus
+    ``"since"`` when that bound was given. One result per publication, in
+    the order given, either ``{"pub" (DOCDB spelling), "changed",
+    "first_snapshot", "legal": {"fetched_at", "previous_fetched_at",
+    "new_events", "missing_events"}, "family": {"fetched_at",
+    "previous_fetched_at", "new_members", "missing_members",
+    "family_id_changed"}, "snapshot", "cached": {"legal": bool, "family":
+    bool}}`` -- where a ``"cached": true`` half was served from this
+    server's cache instead of a fresh OPS request -- or ``{"pub",
+    "error_type", "error"}`` for a publication that could not be checked,
+    which leaves the others checked and its stored snapshot still valid.
+    ``"first_snapshot": true`` means there was nothing to compare against,
+    so ``"changed"`` is false; ``"unchanged_count"`` counts only the
+    publications that had a stored snapshot and did not change. With
+    *since*, each entry's "legal" also carries ``"events_since"`` (the
+    current events dated on or after it, in full) and ``"undated_events"``
+    (how many events carried no readable gazette date); neither influences
+    ``"changed"``. Needs EPO OPS: unavailable in degraded mode.
+
+    Args:
+        pubs: Publication numbers to check, at most 25 per call, each one
+            given once (any common spelling).
+        previous: The ``snapshot`` entries an earlier run returned, handed
+            back unchanged. Snapshots for publications this call does not
+            ask about are ignored and counted under "ignored_previous".
+        since: Optional ISO 8601 date (``"2026-09-17"``) or date-time; when
+            given, each entry also lists its legal events from that date on.
+    """
+    state = _state(ctx)
+    with _mapped_errors():
+        _validate_watch_pubs(pubs)
+        if previous is not None:
+            # A stored snapshot is larger than the elements the generic limit
+            # was sized for (one event key per legal event), so it has its own.
+            validation.validate_batch(
+                previous,
+                label="previous",
+                max_records=MAX_RECORDS,
+                max_item_chars=watch.MAX_SNAPSHOT_CHARS,
+                max_payload_chars=MAX_PAYLOAD_CHARS,
+            )
+        if since is not None:
+            validation.parse_since(since)
+        return service.watch(
+            pubs,
+            previous=previous,
+            since=since,
+            client=state.ops_client,
+            cache=state.cache,
+        )
 
 
 # --- offline tools -------------------------------------------------------
@@ -485,7 +602,9 @@ def normalize_pubnum(text: str, *, ctx: Context) -> dict[str, Any]:
         return service.normalize(text)
 
 
-def dedup_families(hits: list[dict[str, Any]], *, ctx: Context) -> dict[str, Any]:
+def dedup_families(
+    hits: list[dict[str, Any]], known_family_ids: list[str] | None = None, *, ctx: Context
+) -> dict[str, Any]:
     """Collapse search hits into one record per patent family.
 
     Offline: no request is made. Hits found by several queries or under
@@ -493,17 +612,27 @@ def dedup_families(hits: list[dict[str, Any]], *, ctx: Context) -> dict[str, Any
     representative publication is chosen per family.
 
     Returns ``{"families": [...], "count"}``, where each family record keeps
-    every member publication next to the representative hit to read.
+    every member publication next to the representative hit to read. When
+    *known_family_ids* is given, each family record also carries
+    ``"known": bool`` (true when its "family_id" is one of
+    *known_family_ids*; always false for a record keyed by publication
+    number, since it had no family_id), and the result also carries
+    ``"new_count"``/``"known_count"``.
 
     Args:
         hits: Search hits, each with at least ``"pub"`` and ``"family_id"``;
             the optional ``"abstract"``, ``"publication_date"`` and
             ``"query_id"`` keys influence which member is chosen as the
             representative.
+        known_family_ids: Family ids already reviewed in a previous run of
+            this exploration, so repeat runs can tell which families are
+            new.
     """
     with _mapped_errors():
         _validate_hits(hits, "hits")
-        return service.dedup(hits)
+        if known_family_ids is not None:
+            _validate_size(known_family_ids, "known_family_ids")
+        return service.dedup(hits, known_family_ids)
 
 
 def verify_batch(
@@ -531,7 +660,7 @@ def verify_batch(
         return service.verify(input_pubs, output_records)
 
 
-def usage_report(*, ctx: Context) -> dict[str, Any]:
+def usage_report(since: str | None = None, *, ctx: Context) -> dict[str, Any]:
     """Summarize this server's own EPO OPS request log.
 
     Offline: reads the local ``headers.jsonl`` written by every OPS request.
@@ -542,11 +671,18 @@ def usage_report(*, ctx: Context) -> dict[str, Any]:
     Returns ``{"available": false, "path"}`` when no request has been logged
     yet, otherwise ``{"available": true, "path", "total_requests",
     "by_kind", "by_status", "non_green_events", "system_states", "first_at",
-    "last_at", "today", "skipped_lines"}``.
+    "last_at", "today", "skipped_lines"}``, plus ``"since"`` (the local bound
+    the comparison used) and ``"undated_lines"`` when *since* is given.
+
+    Args:
+        since: Optional ISO 8601 date (``"2026-09-17"``) or date-time; when
+            given, only requests at or after it are summarized.
     """
     state = _state(ctx)
     with _mapped_errors():
-        return service.usage(utils.ops_headers_path(state.settings.data_base))
+        if since is not None:
+            validation.parse_since(since)
+        return service.usage(utils.ops_headers_path(state.settings.data_base), since=since)
 
 
 def server_status(*, ctx: Context) -> dict[str, Any]:
@@ -596,6 +732,7 @@ _TOOL_FUNCTIONS = (
     get_claims,
     get_legal,
     get_family,
+    watch_check,
     normalize_pubnum,
     dedup_families,
     verify_batch,

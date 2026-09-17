@@ -61,6 +61,17 @@ from ``$PATENT_CHECKER_CACHE_TTL`` via
 while ``fetched_at + ttl`` is strictly after "now", so an entry exactly at
 its deadline has expired.
 
+The kind code of a publication-keyed entry is optional
+(``EP.1234567.A1`` names one publication, ``EP.1234567`` does not), and a
+request without one is answered upstream with whatever publication is
+current. A never-expiring kind (``claims``, ``gp``) keyed without a kind
+code therefore follows the ``family`` TTL instead of being kept forever, so
+a B1 granted after the cached A1 is picked up; overriding ``family`` moves
+that deadline with it, and a kind given a finite TTL of its own keeps it
+for every key (:func:`effective_ttl`). An entry whose ``fetched_at`` cannot
+be read is never served either, whatever its TTL: the next fetch rewrites
+it with a usable timestamp.
+
 Durability
 ----------
 
@@ -305,6 +316,42 @@ def _parse_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def format_timestamp(moment: datetime) -> str:
+    """Return *moment* as the canonical ``fetched_at`` string: UTC, offset-aware, seconds.
+
+    A naive *moment* is read as local time (like :func:`_as_aware`), then
+    converted to UTC so that a later change of time zone or DST cannot make
+    an entry look younger or older than it is. This is the format every
+    sidecar has carried since v1.0; the service layer's own ``fetched_at``
+    result field is built with it too, so a fresh fetch and its later
+    cached replay report the same value.
+
+    Args:
+        moment: The instant to format.
+    """
+    return _as_aware(moment).astimezone(UTC).isoformat(timespec="seconds")
+
+
+def normalize_timestamp(value: str) -> str:
+    """Return a sidecar's ``fetched_at`` in the canonical form :func:`format_timestamp` produces.
+
+    A sidecar written before v1.0 carries a naive local timestamp; this
+    reads it as local time and renders it as offset-aware UTC, so a caller
+    never has to special-case which era a sidecar came from.
+
+    Args:
+        value: A ``fetched_at`` string as read from a sidecar, offset-aware
+            or naive.
+
+    Raises:
+        ValueError: If *value* is not a parseable ISO 8601 timestamp.
+    """
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"cannot parse timestamp: {value!r}")
+    return format_timestamp(parsed)
+
+
 def kind_subdir(kind: str) -> Path:
     """Return the directory of *kind* relative to its root.
 
@@ -336,42 +383,102 @@ def content_suffix(kind: str) -> str:
     return ".html" if kind == "gp" else ".xml"
 
 
+def key_has_kind_code(key: str) -> bool:
+    """Return True if *key* is a publication key that names a kind code.
+
+    The DOCDB spelling a publication key uses is ``<country>.<number>`` with
+    an optional ``.<kind>``, so three dot-separated parts mean one specific
+    publication (``EP.1234567.A1``) and two mean "whichever publication of
+    this document is current" (``EP.1234567``). A search key is a hex digest
+    with no dots at all, so it answers ``False``.
+
+    Args:
+        key: Cache key, as produced by :func:`pub_key` or :func:`search_key`.
+    """
+    return key.count(".") == 2
+
+
+def effective_ttl(
+    kind: str,
+    key: str | None,
+    ttls: Mapping[str, timedelta | None] | None = None,
+) -> timedelta | None:
+    """Return the time-to-live that actually applies to *kind* keyed by *key*.
+
+    This is the kind's own TTL, except for the one case the kind alone
+    cannot describe: a never-expiring, publication-keyed kind asked for
+    without a kind code. Such a request is resolved upstream to whatever
+    publication is current, so the answer stored for it is only as durable
+    as the family it was taken from and follows the ``family`` TTL. An
+    operator who makes families never expire says the same of these keys; an
+    operator who gives the kind a finite TTL of its own keeps it for every
+    key.
+
+    Args:
+        kind: One of :data:`KINDS`.
+        key: The cache key the entry is stored under, or ``None`` when the
+            caller is asking about the kind alone.
+        ttls: Per-kind TTL overrides. Kinds missing from it, and every kind
+            when it is ``None``, fall back to :data:`DEFAULT_TTLS`.
+
+    Returns:
+        The time-to-live, or ``None`` when the entry never expires.
+
+    Raises:
+        ValueError: If *kind* is not one of :data:`KINDS`.
+    """
+    _check_kind(kind)
+    table = DEFAULT_TTLS if ttls is None else ttls
+    ttl = table.get(kind, DEFAULT_TTLS[kind])
+    if ttl is not None or key is None or kind not in PUB_KINDS or key_has_kind_code(key):
+        return ttl
+    # "Never expires" was decided for the content of one publication; this key
+    # stands for whichever publication of the family is current instead, which
+    # is exactly what the family TTL already measures.
+    return table.get("family", DEFAULT_TTLS["family"])
+
+
 def is_fresh(
     kind: str,
     fetched_at: str,
     now: datetime,
     *,
     ttls: Mapping[str, timedelta | None] | None = None,
+    key: str | None = None,
 ) -> bool:
     """Return True if an entry of *kind* fetched at *fetched_at* is still usable.
 
     The entry is fresh while ``fetched_at + ttl`` is strictly after *now*;
     an entry exactly at its deadline has expired. A ``None`` TTL means the
-    kind never expires, in which case *fetched_at* is not even parsed.
+    entry never expires. Which TTL applies is :func:`effective_ttl`'s
+    decision, the single place the kind-code rule is written down.
 
     Args:
         kind: One of :data:`KINDS`.
         fetched_at: ISO 8601 timestamp the entry was written with. It may
             be offset-aware (written since v1.0) or naive (written earlier,
             and read as local time); a value that cannot be parsed counts
-            as expired.
+            as expired, whatever the TTL is.
         now: The moment freshness is evaluated at. A naive value is read as
             local time, like a naive *fetched_at*.
         ttls: Per-kind TTL overrides. Kinds missing from it, and every kind
             when it is ``None``, fall back to :data:`DEFAULT_TTLS`.
+        key: The cache key the entry is stored under, which decides the TTL
+            of a never-expiring kind stored without a kind code. Omitting it
+            evaluates the kind's own TTL, as before v1.1.
 
     Raises:
         ValueError: If *kind* is not one of :data:`KINDS`.
     """
-    _check_kind(kind)
-    effective = DEFAULT_TTLS if ttls is None else ttls
-    ttl = effective.get(kind, DEFAULT_TTLS[kind])
-    if ttl is None:
-        return True
+    ttl = effective_ttl(kind, key, ttls)
     fetched_at_dt = _parse_timestamp(fetched_at)
     if fetched_at_dt is None:
-        # A malformed timestamp means "do not trust it".
+        # A malformed timestamp means "do not trust it": the entry misses and
+        # the next fetch writes a usable one in its place. Every result now
+        # reports when it was fetched, so it cannot be served without one.
         return False
+    if ttl is None:
+        return True
     return fetched_at_dt + ttl > _as_aware(now)
 
 
@@ -506,7 +613,11 @@ class Cache:
 
         A missing body file, a missing, unreadable or incomplete sidecar, a
         body whose size no longer matches the sidecar, and an expired entry
-        are all reported as a plain miss rather than raising.
+        are all reported as a plain miss rather than raising. How long an
+        entry stays fresh follows from the kind *and* the key
+        (:func:`effective_ttl`); an entry whose recorded ``fetched_at``
+        cannot be read is a miss too, so a hit always carries a usable
+        timestamp.
 
         Args:
             kind: One of :data:`KINDS`.
@@ -528,7 +639,7 @@ class Cache:
         fetched_at = meta["fetched_at"]
         ident = meta["ident"]
 
-        if not is_fresh(kind, fetched_at, self._clock(), ttls=self._ttls):
+        if not is_fresh(kind, fetched_at, self._clock(), ttls=self._ttls, key=key):
             return None
 
         try:
@@ -549,7 +660,7 @@ class Cache:
             path=content_path,
         )
 
-    def put(self, kind: str, key: str, content: bytes, *, ident: str) -> Path:
+    def store(self, kind: str, key: str, content: bytes, *, ident: str) -> CacheHit:
         """Write *content* and its sidecar for *kind*/*key*, replacing any prior entry.
 
         Both files are written to a uniquely named ``.tmp`` sibling and
@@ -557,7 +668,62 @@ class Cache:
         mid-write cannot leave a good sidecar pointing at a half-written
         body and two writers of the same key cannot collide. For
         search-keyed kinds, the expired entries of the same kind are
-        removed afterwards, at most once a minute.
+        removed afterwards, at most once a minute. This is what :meth:`put`
+        delegates to; use this method instead when the caller also needs
+        the ``fetched_at`` this write recorded, so a fresh fetch and the
+        cache hit that later serves it agree on the same value.
+
+        Args:
+            kind: One of :data:`KINDS`.
+            key: Cache key, as produced by :func:`pub_key` or
+                :func:`search_key`.
+            content: The response body to cache.
+            ident: Human-readable identifier (CQL query or publication
+                number) recorded in the sidecar.
+
+        Returns:
+            The entry exactly as written: :attr:`CacheHit.content` is
+            *content*, :attr:`CacheHit.fetched_at` is the timestamp
+            recorded in the sidecar (:func:`format_timestamp` of "now"),
+            and :attr:`CacheHit.path` is the body file's path.
+
+        Raises:
+            ValueError: If *kind* is not one of :data:`KINDS`, or *key* is
+                not made of the characters a cache key may use.
+            OSError: If the entry cannot be written.
+        """
+        _check_key(key)
+        content_path = self.content_path(kind, key)
+        content_path.parent.mkdir(parents=True, exist_ok=True)
+        # The body goes in first: a reader that sees the sidecar then always
+        # sees a body at least as new as it.
+        _replace_atomically(content_path, content)
+
+        now = self._clock()
+        fetched_at = format_timestamp(now)
+        meta = {
+            "kind": kind,
+            "key": key,
+            "ident": ident,
+            "fetched_at": fetched_at,
+            "size": len(content),
+        }
+        _replace_atomically(
+            self.meta_path(kind, key),
+            json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+        )
+
+        if kind in LOCAL_KINDS:
+            self._evict_expired(kind, now, keep=key)
+
+        return CacheHit(content=content, fetched_at=fetched_at, ident=ident, path=content_path)
+
+    def put(self, kind: str, key: str, content: bytes, *, ident: str) -> Path:
+        """Write *content* and its sidecar for *kind*/*key*, replacing any prior entry.
+
+        A thin wrapper over :meth:`store`, kept for callers that only need
+        the body path back; see :meth:`store` for the write itself, its
+        durability guarantees and the search-kind eviction sweep.
 
         Args:
             kind: One of :data:`KINDS`.
@@ -575,32 +741,7 @@ class Cache:
                 not made of the characters a cache key may use.
             OSError: If the entry cannot be written.
         """
-        _check_key(key)
-        content_path = self.content_path(kind, key)
-        content_path.parent.mkdir(parents=True, exist_ok=True)
-        # The body goes in first: a reader that sees the sidecar then always
-        # sees a body at least as new as it.
-        _replace_atomically(content_path, content)
-
-        now = self._clock()
-        meta = {
-            "kind": kind,
-            "key": key,
-            "ident": ident,
-            # Stored as UTC so that a change of time zone (or of DST) cannot
-            # make an entry look younger or older than it is.
-            "fetched_at": _as_aware(now).astimezone(UTC).isoformat(timespec="seconds"),
-            "size": len(content),
-        }
-        _replace_atomically(
-            self.meta_path(kind, key),
-            json.dumps(meta, ensure_ascii=False).encode("utf-8"),
-        )
-
-        if kind in LOCAL_KINDS:
-            self._evict_expired(kind, now, keep=key)
-
-        return content_path
+        return self.store(kind, key, content, ident=ident).path
 
     def entries(self, kind: str | None = None) -> list[CacheEntry]:
         """Return every entry found on disk, across one or all kinds.
@@ -883,7 +1024,7 @@ class Cache:
             meta = self._read_meta(meta_path)
             if meta is None or "fetched_at" not in meta:
                 continue
-            if is_fresh(kind, meta["fetched_at"], now, ttls=self._ttls):
+            if is_fresh(kind, meta["fetched_at"], now, ttls=self._ttls, key=key):
                 continue
             _unlink_quietly(meta_path.with_name(f"{key}{suffix}"))
             _unlink_quietly(meta_path)
@@ -967,7 +1108,9 @@ class Cache:
         ident = meta.get("ident") if meta is not None else None
         fetched_at = meta.get("fetched_at") if meta is not None else None
         expired = (
-            False if broken else not is_fresh(kind, fetched_at, self._clock(), ttls=self._ttls)
+            False
+            if broken
+            else not is_fresh(kind, fetched_at, self._clock(), ttls=self._ttls, key=key)
         )
 
         return CacheEntry(

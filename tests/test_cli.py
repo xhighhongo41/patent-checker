@@ -42,6 +42,11 @@ from patent_checker.ops.parse import (
     OpsSearchPage,
 )
 
+# A fixed fetched_at, used wherever a test needs a deterministic value to
+# compare a full result dict against (a cache-free call uses the current
+# time otherwise).
+FIXED_FETCHED_AT = "2026-09-02T10:00:00+00:00"
+
 
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,6 +191,7 @@ def test_search_success(
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
 
     rc, data = _invoke(["search", "ti=drone"], capsys)
 
@@ -197,6 +203,7 @@ def test_search_success(
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -390,11 +397,134 @@ def test_family_success(
     monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(family=b"<xml/>"))
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
     monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
     assert rc == 0
-    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": None}
+    assert data == {
+        "family_id": "100",
+        "members": ["US.1.A1", "EP.2.A1"],
+        "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
+    }
+
+
+# --- watch ----------------------------------------------------------------
+
+
+def _watch_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``watch`` reach a canned legal-status and family response."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(
+        cli_main, "OpsClient", lambda: _StubOpsClient(legal=b"<xml/>", family=b"<xml/>")
+    )
+    event = OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20240101", pre_lines=())
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: (event,))
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=("US.1.A1",))
+    )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
+
+
+def test_watch_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """watch prints one result per publication, each with the snapshot to store."""
+    _watch_upstream(monkeypatch)
+
+    rc, data = _invoke(["watch", "US.1.A1"], capsys)
+
+    assert rc == 0
+    assert data["first_count"] == 1
+    assert data["changed_count"] == 0
+    assert data["checked_at"] == FIXED_FETCHED_AT
+    entry = data["results"][0]
+    assert entry["pub"] == "US.1.A1"
+    assert entry["first_snapshot"] is True
+    assert entry["snapshot"]["pub"] == "US.1.A1"
+
+
+def test_watch_previous_reads_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--previous takes the snapshots of an earlier run from a JSON array file."""
+    _watch_upstream(monkeypatch)
+    _rc, first = _invoke(["watch", "US.1.A1"], capsys)
+    snapshots = tmp_path / "snapshots.json"
+    snapshots.write_text(json.dumps([first["results"][0]["snapshot"]]), encoding="utf-8")
+
+    rc, data = _invoke(["watch", "US.1.A1", "--previous", str(snapshots)], capsys)
+
+    assert rc == 0
+    assert data["results"][0]["first_snapshot"] is False
+    assert data["results"][0]["changed"] is False
+    assert data["unchanged_count"] == 1
+
+
+def test_watch_previous_reads_stdin_when_the_path_is_dash(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--previous - reads the stored snapshots from stdin, like dedup's hits file."""
+    _watch_upstream(monkeypatch)
+    _rc, first = _invoke(["watch", "US.1.A1"], capsys)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps([first["results"][0]["snapshot"]])))
+
+    rc, data = _invoke(["watch", "US.1.A1", "--previous", "-"], capsys)
+
+    assert rc == 0
+    assert data["results"][0]["first_snapshot"] is False
+
+
+def test_watch_since_lists_the_recent_events(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--since reaches the service and narrows what each entry lists."""
+    _watch_upstream(monkeypatch)
+
+    rc, data = _invoke(["watch", "US.1.A1", "--since", "2024-01-01"], capsys)
+
+    assert rc == 0
+    assert data["since"] == "2024-01-01"
+    assert [event["code"] for event in data["results"][0]["legal"]["events_since"]] == ["PG25"]
+
+
+def test_watch_unparseable_publication_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A publication number that cannot be parsed is invalid_input, exit code 2."""
+    _watch_upstream(monkeypatch)
+
+    rc, data, err = _invoke_with_stderr(["watch", "not a pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_previous_that_is_not_an_array_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --previous file holding something other than a JSON array is refused, exit code 2."""
+    _watch_upstream(monkeypatch)
+    snapshots = tmp_path / "snapshots.json"
+    snapshots.write_text(json.dumps({"pub": "US.1.A1"}), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["watch", "US.1.A1", "--previous", str(snapshots)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_without_ops_configured_is_ops_not_configured_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """watch needs OPS: without credentials it reports ops_not_configured, exit code 4."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
+
+    rc, data = _invoke(["watch", "US.1.A1"], capsys)
+
+    assert rc == 4
+    assert data["error"]["type"] == "ops_not_configured"
 
 
 # --- claims (route selection) -------------------------------------------
@@ -426,7 +556,13 @@ def test_claims_google_patents_route(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """When Google Patents has the page, claims is read from it (source='gp')."""
-    page = FetchedPage(pub="US11468338B2", html="<html></html>", path=None, cached=False)
+    page = FetchedPage(
+        pub="US11468338B2",
+        html="<html></html>",
+        path=None,
+        cached=False,
+        fetched_at=FIXED_FETCHED_AT,
+    )
     monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: page)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
@@ -480,6 +616,7 @@ def test_claims_unavailable_when_no_fallback_route(
     assert data == {
         "unavailable": True,
         "pub": "US20240111636A1",
+        "pub_docdb": "US.2024111636.A1",
         "retry_after_hint": "wait a bit",
     }
 
@@ -499,7 +636,12 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
     rc, data = _invoke(["claims", "WO2020123456A1"], capsys)
 
     assert rc == 0
-    assert data == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert data == {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 # --- --refresh ------------------------------------------------------------
@@ -514,6 +656,7 @@ _REFRESHABLE_COMMANDS = [
     ("legal", "US.1.A1", "legal"),
     ("family", "US.1.A1", "family"),
     ("plan-check", "ti=drone", "plan_check"),
+    ("watch", "US.1.A1", "watch"),
 ]
 
 
@@ -666,6 +809,85 @@ def test_batch_limit_is_shared_with_the_mcp_server() -> None:
     assert server_tools.MAX_RECORDS == service.MAX_BATCH_RECORDS
 
 
+def test_dedup_known_reports_new_and_known_families(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--known marks families already reviewed and reports new_count/known_count."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(
+        json.dumps(
+            [
+                {"pub": "US.1.A1", "family_id": "100"},
+                {"pub": "EP.2.A1", "family_id": "200"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps(["100"]), encoding="utf-8")
+
+    rc, data = _invoke(["dedup", str(hits_path), "--known", str(known_path)], capsys)
+
+    assert rc == 0
+    assert data["new_count"] == 1
+    assert data["known_count"] == 1
+    families_by_id = {family["family_id"]: family for family in data["families"]}
+    assert families_by_id["100"]["known"] is True
+    assert families_by_id["200"]["known"] is False
+
+
+def test_dedup_without_known_has_no_new_count_or_known_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without --known the output is exactly the pre-existing shape."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+
+    rc, data = _invoke(["dedup", str(hits_path)], capsys)
+
+    assert rc == 0
+    assert "new_count" not in data
+    assert "known_count" not in data
+    assert "known" not in data["families"][0]
+
+
+def test_dedup_known_non_array_json_is_invalid_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --known file that is not a JSON array is rejected, not a crash."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(
+        ["dedup", str(hits_path), "--known", str(known_path)], capsys
+    )
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_dedup_known_rejects_a_non_string_element(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --known element that is not a string names its position."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps(["100", 5]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(
+        ["dedup", str(hits_path), "--known", str(known_path)], capsys
+    )
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "--known[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
 def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """verify --input/--output cross-checks two JSON array files."""
     input_path = tmp_path / "input.json"
@@ -768,6 +990,35 @@ def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
 
     assert rc == 0
     assert data == fake
+
+
+def test_usage_since_is_forwarded_to_the_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--since reaches service.usage_report as the parsed datetime, keyword-only."""
+    captured: dict[str, Any] = {}
+
+    def fake_usage_report(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"available": False, "path": "/tmp/headers.jsonl"}
+
+    monkeypatch.setattr(service, "usage_report", fake_usage_report)
+
+    rc, _data = _invoke(["usage", "--since", "2026-09-17"], capsys)
+
+    assert rc == 0
+    assert captured["kwargs"]["since"] == datetime(2026, 9, 17, 0, 0, 0)
+
+
+def test_usage_invalid_since_is_invalid_input(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unparseable --since is invalid_input, exit code 2."""
+    rc, data = _invoke(["usage", "--since", "not a date"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
 
 
 # --- .env, output encoding and I/O failures --------------------------------
@@ -876,6 +1127,7 @@ _SERVICE_ROUTES: tuple[tuple[str, list[str], str], ...] = (
     ("legal", ["legal", "US.1.A1"], "legal"),
     ("family", ["family", "US.1.A1"], "family"),
     ("claims", ["claims", "EP1672502A1"], "claims"),
+    ("watch", ["watch", "US.1.A1"], "watch"),
     ("usage", ["usage"], "usage"),
 )
 
@@ -1636,6 +1888,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "claims",
         "legal",
         "family",
+        "watch",
         "normalize",
         "dedup",
         "verify",
@@ -1643,6 +1896,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "consent",
         "serve",
         "cache",
+        "ledger",
         "clean",
         "install",
     ):
@@ -1879,3 +2133,137 @@ def test_verify_rejects_an_oversized_input_payload(
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
     assert "Traceback" not in err
+
+
+# --- ledger (read-only view of the exploration ledger) --------------------
+
+
+def _write_minimal_ledger(data_dir: Path, target: str = "sample-app") -> Path:
+    """Write the smallest ledger ``ledger check`` accepts and return its directory."""
+    ledger_dir = data_dir / "ledger" / target
+    ledger_dir.mkdir(parents=True)
+    (ledger_dir / "ledger.json").write_text(
+        json.dumps({"format": 1, "target": target, "created_at": "2026-03-01T09:30:00+00:00"}),
+        encoding="utf-8",
+    )
+    run = {
+        "run_id": "20260301-0930",
+        "type": "watch",
+        "started_at": "2026-03-01T09:30:00+00:00",
+        "stage": "development",
+        "mode": "standard",
+        "server_version": "1.1.0",
+        "searched_through": None,
+    }
+    (ledger_dir / "runs.jsonl").write_text(json.dumps(run) + "\n", encoding="utf-8")
+    for name in ("features.jsonl", "queries.jsonl", "families.jsonl", "watch.jsonl"):
+        (ledger_dir / name).write_text("", encoding="utf-8")
+    (ledger_dir / "translation.md").write_text("# Translation table\n", encoding="utf-8")
+    return ledger_dir
+
+
+def test_ledger_status_without_a_ledger_reports_that_none_exists(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A project that was never explored has no ledger, which is an answer, not an error."""
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
+
+    rc, data = _invoke(["ledger", "status"], capsys)
+
+    assert rc == 0
+    assert data["exists"] is False
+    assert data["targets"] == []
+    assert data["legacy"] == {"reports": [], "explorations": []}
+    assert not (tmp_path / "data").exists()
+
+
+def test_ledger_status_summarizes_the_ledger_under_the_data_directory(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """ledger status reads the ledger of the project the CLI is run from."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "status", "--target", "sample-app"], capsys)
+
+    assert rc == 0
+    assert data["exists"] is True
+    assert data["targets"] == ["sample-app"]
+    assert data["ledgers"][0]["runs"] == 1
+    assert data["ledgers"][0]["last_run"]["run_id"] == "20260301-0930"
+
+
+def test_ledger_check_accepts_a_correct_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A ledger that follows the format checks out with exit code 0."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "check"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is True
+    assert data["targets"][0]["errors"] == []
+
+
+def test_ledger_check_reports_findings_without_failing_the_command(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Findings are the command's result: it ran, so the exit code is 0 and "ok" is false."""
+    data_dir = tmp_path / "data"
+    ledger_dir = _write_minimal_ledger(data_dir)
+    (ledger_dir / "watch.jsonl").write_text("{not json}\n", encoding="utf-8")
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    rc, data = _invoke(["ledger", "check", "--target", "sample-app"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is False
+    finding = data["targets"][0]["errors"][0]
+    assert (finding["file"], finding["line"], finding["rule"]) == ("watch.jsonl", 1, "json")
+
+
+def test_ledger_check_without_a_ledger_reports_a_missing_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """Checking where nothing was written yet names the problem instead of raising."""
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
+
+    rc, data = _invoke(["ledger", "check"], capsys)
+
+    assert rc == 0
+    assert data["ok"] is False
+    assert data["targets"][0]["errors"][0]["rule"] == "missing-ledger"
+
+
+def test_ledger_commands_never_write_to_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The package only reads the ledger: both commands leave every file as it was."""
+    data_dir = tmp_path / "data"
+    _write_minimal_ledger(data_dir)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
+
+    def state() -> dict[str, tuple[bytes, int]]:
+        return {
+            str(path.relative_to(data_dir)): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in sorted(data_dir.rglob("*"))
+            if path.is_file()
+        }
+
+    before = state()
+    _invoke(["ledger", "status"], capsys)
+    _invoke(["ledger", "check"], capsys)
+
+    assert state() == before
+
+
+def test_ledger_requires_a_subcommand(capsys: pytest.CaptureFixture[str]) -> None:
+    """``ledger`` alone is a usage error, like the other command groups."""
+    rc, data = _invoke(["ledger"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"

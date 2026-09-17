@@ -54,7 +54,7 @@ from typing import Any
 
 import httpx
 
-from patent_checker import __version__, cleanup, config, consent, installer, service
+from patent_checker import __version__, cleanup, config, consent, installer, ledger, service
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient
@@ -221,6 +221,21 @@ def _check_pub_strings(pubs: Sequence[Any], label: str) -> None:
             )
 
 
+def _check_known_family_ids(family_ids: Sequence[Any], label: str) -> None:
+    """Check a ``dedup --known`` payload: a bounded list of family-id strings.
+
+    Raises:
+        ValueError: If the payload is too large or an element is not a
+            string. The message names the offending index.
+    """
+    _check_batch_size(family_ids, label)
+    for index, family_id in enumerate(family_ids):
+        if not isinstance(family_id, str):
+            raise ValueError(
+                f"{label}[{index}] must be a family-id string, got {type(family_id).__name__}"
+            )
+
+
 def _check_output_records(records: Sequence[Any], label: str) -> None:
     """Check a ``verify --output`` payload: strings or objects carrying ``"pub"``.
 
@@ -327,6 +342,32 @@ def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
         return service.family(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
+def _cmd_watch(args: argparse.Namespace) -> dict[str, Any]:
+    """Check watched publications for legal-status and family changes.
+
+    ``--previous`` names a JSON array file of the snapshots an earlier run
+    returned (or ``-`` for stdin); without it every publication is reported
+    as a first snapshot. The snapshots are checked by the service layer,
+    which is where the same rules apply to the MCP server.
+
+    Raises:
+        ValueError: If a publication number, the stored snapshots or
+            ``--since`` is not what the service layer accepts.
+    """
+    previous = None
+    if args.previous is not None:
+        previous = _read_json_array(args.previous, allow_stdin=True)
+    with _ops_client() as client:
+        return service.watch(
+            args.pubs,
+            previous=previous,
+            since=args.since,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
+        )
+
+
 # --- offline helpers -----------------------------------------------------
 
 
@@ -338,13 +379,23 @@ def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
     """Collapse a list of search hits into one record per patent family.
 
+    ``--known`` names a JSON array file of family ids already reviewed in an
+    earlier run (never stdin, unlike the hits file); when given, the result
+    also reports which families are new.
+
     Raises:
         ValueError: If the payload is not a well-formed, bounded list of
-            hits (see :func:`_check_hits`).
+            hits (see :func:`_check_hits`), or ``--known`` is not a
+            well-formed, bounded list of family-id strings (see
+            :func:`_check_known_family_ids`).
     """
     hits = _read_json_array(args.path, allow_stdin=True)
     _check_hits(hits, "hits")
-    return service.dedup(hits)
+    known_family_ids = None
+    if args.known is not None:
+        known_family_ids = _read_json_array(args.known)
+        _check_known_family_ids(known_family_ids, "--known")
+    return service.dedup(hits, known_family_ids)
 
 
 def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
@@ -362,8 +413,13 @@ def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _cmd_usage(args: argparse.Namespace) -> dict[str, Any]:
-    """Summarize the local OPS request-header log."""
-    return service.usage()
+    """Summarize the local OPS request-header log.
+
+    Raises:
+        ValueError: If ``--since`` is given and is not a parseable ISO 8601
+            date or date-time.
+    """
+    return service.usage(since=args.since)
 
 
 # --- serve -----------------------------------------------------------------
@@ -480,6 +536,26 @@ def _cmd_cache_status(args: argparse.Namespace) -> dict[str, Any]:
         **cache.stats(),
         "legacy": cleanup.legacy_summary(config.data_base(), cache),
     }
+
+
+def _cmd_ledger_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Summarize the exploration ledgers of the project this command is run from.
+
+    Read-only: the ledger is written by the agent running the Skill, never by
+    this package. A project without a ledger is an ordinary answer
+    (``"exists": false``), not an error.
+    """
+    return ledger.status(config.data_base(), target=args.target)
+
+
+def _cmd_ledger_check(args: argparse.Namespace) -> dict[str, Any]:
+    """Verify the project's ledger against the ledger format.
+
+    Read-only. Findings are the result of the command rather than a failure
+    of it (like ``verify``): the exit code is 0 whenever the check ran, and
+    ``"ok"`` says whether the ledger passed.
+    """
+    return ledger.check(config.data_base(), target=args.target)
 
 
 def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
@@ -765,6 +841,24 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_refresh_flag(family_parser)
     family_parser.set_defaults(handler=_cmd_family)
 
+    watch_parser = subparsers.add_parser(
+        "watch", help="Check watched publications for legal-status and family changes"
+    )
+    watch_parser.add_argument("pubs", nargs="+", metavar="PUB", help="Publication number to check")
+    watch_parser.add_argument(
+        "--previous",
+        metavar="SNAPSHOTS_JSON_PATH",
+        default=None,
+        help="JSON array file of the snapshots an earlier run returned, or '-' for stdin",
+    )
+    watch_parser.add_argument(
+        "--since",
+        default=None,
+        help="Also list the legal events at/after this ISO 8601 date or date-time",
+    )
+    _add_refresh_flag(watch_parser)
+    watch_parser.set_defaults(handler=_cmd_watch)
+
     normalize_parser = subparsers.add_parser("normalize", help="Normalize a publication number")
     normalize_parser.add_argument("text", help="Publication number in any supported spelling")
     normalize_parser.set_defaults(handler=_cmd_normalize)
@@ -772,6 +866,12 @@ def _build_parser() -> argparse.ArgumentParser:
     dedup_parser = subparsers.add_parser("dedup", help="Collapse search hits into families")
     dedup_parser.add_argument(
         "path", metavar="HITS_JSON_PATH", help="JSON array file, or '-' for stdin"
+    )
+    dedup_parser.add_argument(
+        "--known",
+        metavar="FAMILY_IDS_JSON_PATH",
+        default=None,
+        help="JSON array file of family ids already reviewed in an earlier run",
     )
     dedup_parser.set_defaults(handler=_cmd_dedup)
 
@@ -781,6 +881,11 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.set_defaults(handler=_cmd_verify)
 
     usage_parser = subparsers.add_parser("usage", help="Summarize the local OPS request-header log")
+    usage_parser.add_argument(
+        "--since",
+        default=None,
+        help="Only summarize requests at/after this ISO 8601 date or date-time",
+    )
     usage_parser.set_defaults(handler=_cmd_usage)
 
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server")
@@ -920,6 +1025,27 @@ def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
 
 def _add_consent_parser(subparsers: argparse._SubParsersAction) -> None:
     """Register the ``consent`` subcommand and its ``status``/``show``/``record`` children."""
+    ledger_parser = subparsers.add_parser(
+        "ledger", help="Inspect the exploration ledger the Skill keeps (read-only)"
+    )
+    ledger_subparsers = ledger_parser.add_subparsers(dest="ledger_command", required=True)
+
+    ledger_status_parser = ledger_subparsers.add_parser(
+        "status", help="Summarize the ledgers: runs, monitored publications, checks that are due"
+    )
+    ledger_status_parser.add_argument(
+        "--target", default=None, help="Only this exploration target (default: every target)"
+    )
+    ledger_status_parser.set_defaults(handler=_cmd_ledger_status)
+
+    ledger_check_parser = ledger_subparsers.add_parser(
+        "check", help="Verify a ledger against the ledger format and list what to fix"
+    )
+    ledger_check_parser.add_argument(
+        "--target", default=None, help="Only this exploration target (default: every target)"
+    )
+    ledger_check_parser.set_defaults(handler=_cmd_ledger_check)
+
     consent_parser = subparsers.add_parser("consent", help="Manage the legal-notice consent gate")
     consent_subparsers = consent_parser.add_subparsers(dest="consent_command", required=True)
 
