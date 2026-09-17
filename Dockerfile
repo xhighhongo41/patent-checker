@@ -66,6 +66,14 @@ LABEL org.opencontainers.image.source="https://github.com/xhighhongo41/patent-ch
       org.opencontainers.image.vendor="xhighhongo41" \
       io.modelcontextprotocol.server.name="io.github.xhighhongo41/patent-checker"
 
+# Security fixes of the base distribution land in the package archive before
+# the upstream Python image is rebuilt, so they are applied at build time
+# instead of waiting for the next base image. Nothing is installed: this
+# only upgrades what the base image already carries.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/*
+
 # An unprivileged user owns /data, the only path the server ever writes to.
 RUN useradd --uid 1000 --user-group --create-home app \
     && mkdir -p /data \
