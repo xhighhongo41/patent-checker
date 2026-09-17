@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from patent_checker.validation import (
     MAX_ITEM_CHARS,
     MAX_PAYLOAD_CHARS,
+    InvalidInput,
+    parse_since,
     validate_batch,
 )
 
@@ -123,3 +127,51 @@ def test_the_default_limits_are_the_documented_ones() -> None:
     """The two shared ceilings are the ones the documentation and tools rely on."""
     assert MAX_ITEM_CHARS == 4096
     assert MAX_PAYLOAD_CHARS == 4 * 1024 * 1024
+
+
+# --- parse_since -------------------------------------------------------------
+
+
+def test_parse_since_accepts_a_bare_date_as_that_days_midnight() -> None:
+    """A date-only value becomes that day's midnight, naive."""
+    assert parse_since("2026-09-17") == datetime(2026, 9, 17, 0, 0, 0)
+
+
+def test_parse_since_accepts_a_naive_date_time() -> None:
+    """A full date-time without an offset is returned as given, naive."""
+    assert parse_since("2026-09-17T09:00:00") == datetime(2026, 9, 17, 9, 0, 0)
+
+
+def test_parse_since_accepts_an_offset_aware_date_time() -> None:
+    """An offset-aware date-time keeps its offset."""
+    assert parse_since("2026-09-17T09:00:00+00:00") == datetime(2026, 9, 17, 9, 0, 0, tzinfo=UTC)
+
+
+def test_parse_since_rejects_a_non_string() -> None:
+    """A non-string value is rejected before any parsing is attempted."""
+    with pytest.raises(InvalidInput, match="since must be a string"):
+        parse_since(20260917)  # type: ignore[arg-type]
+
+
+def test_parse_since_rejects_an_empty_string() -> None:
+    """An empty (or blank) value is rejected rather than parsed as "now"."""
+    with pytest.raises(InvalidInput, match="since must not be empty"):
+        parse_since("   ")
+
+
+def test_parse_since_rejects_a_control_character() -> None:
+    """A control character is refused, naming its position."""
+    with pytest.raises(InvalidInput, match="control character"):
+        parse_since("2026-09-17\x00")
+
+
+def test_parse_since_rejects_an_unparseable_value() -> None:
+    """A value that is not an ISO 8601 date or date-time names the accepted formats."""
+    with pytest.raises(InvalidInput, match="ISO 8601"):
+        parse_since("not a date")
+
+
+def test_parse_since_uses_the_given_label_in_every_message() -> None:
+    """The label argument opens the error message, for a caller with its own argument name."""
+    with pytest.raises(InvalidInput, match=r"^known_since must not be empty"):
+        parse_since("", label="known_since")

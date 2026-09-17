@@ -221,6 +221,21 @@ def _check_pub_strings(pubs: Sequence[Any], label: str) -> None:
             )
 
 
+def _check_known_family_ids(family_ids: Sequence[Any], label: str) -> None:
+    """Check a ``dedup --known`` payload: a bounded list of family-id strings.
+
+    Raises:
+        ValueError: If the payload is too large or an element is not a
+            string. The message names the offending index.
+    """
+    _check_batch_size(family_ids, label)
+    for index, family_id in enumerate(family_ids):
+        if not isinstance(family_id, str):
+            raise ValueError(
+                f"{label}[{index}] must be a family-id string, got {type(family_id).__name__}"
+            )
+
+
 def _check_output_records(records: Sequence[Any], label: str) -> None:
     """Check a ``verify --output`` payload: strings or objects carrying ``"pub"``.
 
@@ -338,13 +353,23 @@ def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
     """Collapse a list of search hits into one record per patent family.
 
+    ``--known`` names a JSON array file of family ids already reviewed in an
+    earlier run (never stdin, unlike the hits file); when given, the result
+    also reports which families are new.
+
     Raises:
         ValueError: If the payload is not a well-formed, bounded list of
-            hits (see :func:`_check_hits`).
+            hits (see :func:`_check_hits`), or ``--known`` is not a
+            well-formed, bounded list of family-id strings (see
+            :func:`_check_known_family_ids`).
     """
     hits = _read_json_array(args.path, allow_stdin=True)
     _check_hits(hits, "hits")
-    return service.dedup(hits)
+    known_family_ids = None
+    if args.known is not None:
+        known_family_ids = _read_json_array(args.known)
+        _check_known_family_ids(known_family_ids, "--known")
+    return service.dedup(hits, known_family_ids)
 
 
 def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
@@ -362,8 +387,13 @@ def _cmd_verify(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _cmd_usage(args: argparse.Namespace) -> dict[str, Any]:
-    """Summarize the local OPS request-header log."""
-    return service.usage()
+    """Summarize the local OPS request-header log.
+
+    Raises:
+        ValueError: If ``--since`` is given and is not a parseable ISO 8601
+            date or date-time.
+    """
+    return service.usage(since=args.since)
 
 
 # --- serve -----------------------------------------------------------------
@@ -773,6 +803,12 @@ def _build_parser() -> argparse.ArgumentParser:
     dedup_parser.add_argument(
         "path", metavar="HITS_JSON_PATH", help="JSON array file, or '-' for stdin"
     )
+    dedup_parser.add_argument(
+        "--known",
+        metavar="FAMILY_IDS_JSON_PATH",
+        default=None,
+        help="JSON array file of family ids already reviewed in an earlier run",
+    )
     dedup_parser.set_defaults(handler=_cmd_dedup)
 
     verify_parser = subparsers.add_parser("verify", help="Cross-check a delegated batch's output")
@@ -781,6 +817,11 @@ def _build_parser() -> argparse.ArgumentParser:
     verify_parser.set_defaults(handler=_cmd_verify)
 
     usage_parser = subparsers.add_parser("usage", help="Summarize the local OPS request-header log")
+    usage_parser.add_argument(
+        "--since",
+        default=None,
+        help="Only summarize requests at/after this ISO 8601 date or date-time",
+    )
     usage_parser.set_defaults(handler=_cmd_usage)
 
     serve_parser = subparsers.add_parser("serve", help="Run the MCP server")

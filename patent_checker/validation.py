@@ -18,7 +18,9 @@ reading upstream data, which no change of the arguments would fix.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 
@@ -31,6 +33,9 @@ class InvalidInput(ValueError):
     catch this class alone.
     """
 
+
+# C0 controls and DEL, rejected in any free-text argument this module checks.
+_CONTROL_CHARACTERS_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 # Ceiling on one element of a batch. Generous next to a publication number or
 # a search hit; it exists so a single element cannot carry a whole document.
@@ -128,3 +133,39 @@ def validate_batch(
                 f"{label} is larger than {max_payload_chars} characters in total "
                 f"(the limit is reached at {position})"
             )
+
+
+def parse_since(value: str, *, label: str = "since") -> datetime:
+    """Parse a usage-report "since" bound: an ISO 8601 date or date-time.
+
+    A bare date (``"2026-09-17"``) is read as that day's midnight, naive;
+    a full date-time may be naive or offset-aware
+    (``"2026-09-17T09:00:00"``, ``"2026-09-17T09:00:00+09:00"``).
+
+    Args:
+        value: The caller-supplied bound.
+        label: The caller's name for *value*, used to open the error
+            message.
+
+    Returns:
+        The parsed ``datetime``.
+
+    Raises:
+        InvalidInput: If *value* is not a string, is empty (or blank),
+            contains a control character, or is not a parseable ISO 8601
+            date or date-time.
+    """
+    if not isinstance(value, str):
+        raise InvalidInput(f"{label} must be a string, got {type(value).__name__}")
+    if not value.strip():
+        raise InvalidInput(f"{label} must not be empty")
+    match = _CONTROL_CHARACTERS_RE.search(value)
+    if match is not None:
+        raise InvalidInput(f"{label} contains a control character at position {match.start()}")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise InvalidInput(
+            f"{label} must be an ISO 8601 date (YYYY-MM-DD) or date-time "
+            f"(YYYY-MM-DDTHH:MM:SS[+HH:MM]), got {value!r}"
+        ) from exc

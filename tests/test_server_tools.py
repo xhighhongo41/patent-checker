@@ -456,7 +456,13 @@ def test_get_claims_uses_the_shared_google_patents_client(
         captured["pub"] = pub
         captured["client"] = client
         captured["cache"] = cache
-        return FetchedPage(pub=pub, html="<html></html>", path=None, cached=False)
+        return FetchedPage(
+            pub=pub,
+            html="<html></html>",
+            path=None,
+            cached=False,
+            fetched_at="2026-09-02T10:00:00+00:00",
+        )
 
     monkeypatch.setattr(service, "fetch_patent_html", fake_fetch)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
@@ -499,6 +505,50 @@ def test_dedup_families_collapses_hits(settings: ServerSettings, make_state: Any
 
     assert data["count"] == 1
     assert len(data["families"]) == 1
+
+
+def test_dedup_families_known_family_ids_reports_known_and_new(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """known_family_ids marks each family and adds new_count/known_count."""
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(
+        mcp,
+        "dedup_families",
+        {
+            "hits": [
+                {"pub": "US11468338B2", "family_id": "100"},
+                {"pub": "EP1672502A1", "family_id": "200"},
+            ],
+            "known_family_ids": ["100"],
+        },
+    )
+
+    assert data["new_count"] == 1
+    assert data["known_count"] == 1
+    families_by_id = {family["family_id"]: family for family in data["families"]}
+    assert families_by_id["100"]["known"] is True
+    assert families_by_id["200"]["known"] is False
+
+
+def test_dedup_families_known_family_ids_oversized_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """An oversized known_family_ids payload is refused like any other batch."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(
+            mcp,
+            "dedup_families",
+            {
+                "hits": [{"pub": "US11468338B2", "family_id": "100"}],
+                "known_family_ids": ["x"] * (tools.MAX_RECORDS + 1),
+            },
+        )
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
 def test_verify_batch_reports_missing_publications(
@@ -565,6 +615,38 @@ def test_usage_report_uses_the_shared_log_path_helper(
 
     assert data["path"] == str(utils.ops_headers_path(settings.data_base))
     assert data["path"] == str(tmp_path / "raw" / "ops" / "headers.jsonl")
+
+
+def test_usage_report_since_narrows_the_summary(
+    settings: ServerSettings, make_state: Any, tmp_path: Path
+) -> None:
+    """since restricts the summary to requests at or after it."""
+    log_dir = tmp_path / "raw" / "ops"
+    log_dir.mkdir(parents=True)
+    lines = [
+        json.dumps({"at": "2026-01-01T00:00:00", "kind": "search", "url": "u1", "status": 200}),
+        json.dumps({"at": "2026-01-03T00:00:00", "kind": "biblio", "url": "u2", "status": 200}),
+    ]
+    (log_dir / "headers.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(mcp, "usage_report", {"since": "2026-01-02"})
+
+    assert data["total_requests"] == 1
+    assert data["by_kind"] == {"biblio": 1}
+    assert data["since"] == "2026-01-02T00:00:00"
+
+
+def test_usage_report_invalid_since_is_invalid_input(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """An unparseable since is refused before the log is even read."""
+    mcp = build_server(settings, state=make_state())
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "usage_report", {"since": "not a date"})
+
+    assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
 def test_server_status_reports_the_running_configuration(

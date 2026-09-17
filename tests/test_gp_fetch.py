@@ -7,8 +7,10 @@ leaves the machine, and the cache the fetcher is handed is rooted in
 
 from __future__ import annotations
 
+import json
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -358,3 +360,73 @@ def test_concurrent_fetches_are_serialized_and_keep_the_courtesy_interval(
     assert max_in_flight == 1
     assert len(starts) == 2
     assert starts[1] - starts[0] >= fetch.MIN_INTERVAL_SECONDS
+
+
+# --- fetched_at (v1.1) -------------------------------------------------------
+
+
+def test_fresh_fetch_reports_a_utc_offset_aware_second_precision_fetched_at(
+    cache: Cache,
+) -> None:
+    """A freshly downloaded page carries a well-formed, cache-matching fetched_at."""
+    handler = _RecordingHandler(200, PAGE_HTML)
+    with _client(handler) as client:
+        result = fetch_patent_html(PUB, client=client, cache=cache)
+
+    assert isinstance(result, FetchedPage)
+    parsed = datetime.fromisoformat(result.fetched_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parsed.microsecond == 0
+    hit = cache.get("gp", pub_key(PUB))
+    assert hit is not None
+    assert hit.fetched_at == result.fetched_at
+
+
+def test_cached_hit_reports_the_same_fetched_at_the_fresh_fetch_recorded(
+    cache: Cache,
+) -> None:
+    """A cache hit reports exactly the fetched_at the write that created it recorded."""
+    handler = _RecordingHandler(200, PAGE_HTML)
+    with _client(handler) as client:
+        first = fetch_patent_html(PUB, client=client, cache=cache)
+    assert isinstance(first, FetchedPage)
+
+    with httpx.Client(transport=httpx.MockTransport(_forbidden_handler)) as client:
+        second = fetch_patent_html(PUB, client=client, cache=cache)
+
+    assert isinstance(second, FetchedPage)
+    assert second.cached is True
+    assert second.fetched_at == first.fetched_at
+
+
+def test_without_a_cache_fetched_at_is_still_present_and_well_formed() -> None:
+    """cache=None still reports a UTC, offset-aware, seconds-precision fetched_at."""
+    handler = _RecordingHandler(200, PAGE_HTML)
+    with _client(handler) as client:
+        result = fetch_patent_html(PUB, client=client)
+
+    assert isinstance(result, FetchedPage)
+    parsed = datetime.fromisoformat(result.fetched_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_a_legacy_naive_sidecar_is_normalized_to_aware_utc_on_hit(cache: Cache) -> None:
+    """A pre-v1.0 naive-local fetched_at is reported as the equivalent aware UTC instant."""
+    cache.put("gp", pub_key(PUB), PAGE_HTML.encode("utf-8"), ident=PUB)
+    naive = "2026-09-02T09:00:00"
+    meta_path = cache.meta_path("gp", pub_key(PUB))
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["fetched_at"] = naive
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    with httpx.Client(transport=httpx.MockTransport(_forbidden_handler)) as client:
+        result = fetch_patent_html(PUB, client=client, cache=cache)
+
+    assert isinstance(result, FetchedPage)
+    assert result.cached is True
+    # Compared as instants, not as strings: the local timezone the test runs
+    # under must not matter, only that a naive value is read as local time.
+    expected_instant = datetime.fromisoformat(naive).astimezone()
+    assert datetime.fromisoformat(result.fetched_at) == expected_instant

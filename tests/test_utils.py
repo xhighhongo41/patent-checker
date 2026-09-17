@@ -6,7 +6,7 @@ client instead of a real OpsClient/httpx transport.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -155,6 +155,55 @@ def test_dedup_families_representative_carries_all_original_keys() -> None:
     hits = [{"pub": "US.1.A1", "family_id": "1", "custom": "value", "abstract": "x"}]
     rep = dedup_families(hits)[0]["representative"]
     assert rep == {"pub": "US.1.A1", "family_id": "1", "custom": "value", "abstract": "x"}
+
+
+# --- dedup_families: known_family_ids (v1.1) ------------------------------
+
+
+def test_dedup_families_without_known_family_ids_is_unchanged() -> None:
+    """Omitting known_family_ids (the default) never adds a "known" key."""
+    hits = [{"pub": "US.1.A1", "family_id": "1"}, {"pub": "US.2.A1"}]
+
+    result = dedup_families(hits)
+
+    assert all("known" not in family for family in result)
+
+
+def test_dedup_families_marks_a_family_id_present_in_known_family_ids() -> None:
+    """A family whose family_id is in known_family_ids is reported as known."""
+    hits = [{"pub": "US.1.A1", "family_id": "100"}]
+
+    result = dedup_families(hits, known_family_ids=["100"])
+
+    assert result[0]["known"] is True
+
+
+def test_dedup_families_marks_a_family_id_absent_from_known_family_ids_as_new() -> None:
+    """A family whose family_id is not in known_family_ids is reported as new."""
+    hits = [{"pub": "US.1.A1", "family_id": "200"}]
+
+    result = dedup_families(hits, known_family_ids=["100"])
+
+    assert result[0]["known"] is False
+
+
+def test_dedup_families_pub_keyed_record_is_never_known() -> None:
+    """A record keyed by pub (no family_id at all) is always reported as not known."""
+    hits = [{"pub": "US.1.A1"}]
+
+    result = dedup_families(hits, known_family_ids=["US.1.A1"])
+
+    assert result[0]["family_id"] == ""
+    assert result[0]["known"] is False
+
+
+def test_dedup_families_known_family_ids_empty_collection_still_adds_the_key() -> None:
+    """An empty (but not None) known_family_ids still turns the flag on, all False."""
+    hits = [{"pub": "US.1.A1", "family_id": "100"}]
+
+    result = dedup_families(hits, known_family_ids=[])
+
+    assert result[0]["known"] is False
 
 
 # --- verify_batch ---------------------------------------------------------
@@ -466,6 +515,120 @@ def test_usage_report_aggregates_and_skips_broken_lines(tmp_path: Path) -> None:
     assert result["today"]["total_requests"] == 2
     assert result["today"]["by_kind"] == {"search": 1, "biblio": 1}
     assert result["skipped_lines"] == 1
+
+
+# --- usage_report: since (v1.1) -----------------------------------------
+
+
+def test_usage_report_without_since_has_no_since_or_undated_lines_keys(tmp_path: Path) -> None:
+    """Omitting since leaves the result exactly as before this parameter existed."""
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        '{"at": "not-a-timestamp", "kind": "search", "url": "u", "status": 200}\n',
+        encoding="utf-8",
+    )
+
+    result = usage_report(path)
+
+    assert "since" not in result
+    assert "undated_lines" not in result
+    assert result["total_requests"] == 1
+
+
+def test_usage_report_since_none_matches_the_call_without_it(tmp_path: Path) -> None:
+    """Passing since=None explicitly is exactly the same as omitting it."""
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        '{"at": "2026-01-01T00:00:00", "kind": "search", "url": "u", "status": 200}\n',
+        encoding="utf-8",
+    )
+
+    assert usage_report(path) == usage_report(path, since=None)
+
+
+def test_usage_report_since_splits_lines_before_and_after(tmp_path: Path) -> None:
+    """Only lines whose "at" is at or after since are aggregated."""
+    lines = [
+        '{"at": "2026-01-01T23:59:59", "kind": "search", "url": "u1", "status": 200}',
+        '{"at": "2026-01-02T00:00:00", "kind": "biblio", "url": "u2", "status": 200}',
+        '{"at": "2026-01-03T00:00:00", "kind": "biblio", "url": "u3", "status": 200}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path, since=datetime(2026, 1, 2, 0, 0, 0))
+
+    assert result["total_requests"] == 2
+    assert result["by_kind"] == {"biblio": 2}
+    assert result["first_at"] == "2026-01-02T00:00:00"
+    assert result["last_at"] == "2026-01-03T00:00:00"
+    assert result["since"] == "2026-01-02T00:00:00"
+    assert result["undated_lines"] == 0
+
+
+def test_usage_report_since_boundary_is_inclusive(tmp_path: Path) -> None:
+    """An "at" exactly equal to since is included."""
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        '{"at": "2026-01-02T00:00:00", "kind": "search", "url": "u", "status": 200}\n',
+        encoding="utf-8",
+    )
+
+    result = usage_report(path, since=datetime(2026, 1, 2, 0, 0, 0))
+
+    assert result["total_requests"] == 1
+
+
+def test_usage_report_since_reports_an_offset_aware_bound_as_local_naive(tmp_path: Path) -> None:
+    """The "since" field is always local and naive, whatever form since was given in.
+
+    Compared against the same ``.astimezone()`` conversion the implementation
+    uses, so the assertion does not depend on which timezone the test happens
+    to run under.
+    """
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        '{"at": "2026-01-02T00:00:00", "kind": "search", "url": "u", "status": 200}\n',
+        encoding="utf-8",
+    )
+    aware_since = datetime(2026, 1, 2, 3, 0, 0, tzinfo=UTC)
+
+    result = usage_report(path, since=aware_since)
+
+    expected = aware_since.astimezone().replace(tzinfo=None)
+    assert result["since"] == expected.isoformat(timespec="seconds")
+
+
+def test_usage_report_since_compares_an_offset_aware_at_as_local_naive(tmp_path: Path) -> None:
+    """A log line's own "at", when offset-aware, is converted to local naive before comparing."""
+    aware_at = "2026-01-02T03:00:00+00:00"
+    path = tmp_path / "headers.jsonl"
+    path.write_text(
+        f'{{"at": "{aware_at}", "kind": "search", "url": "u", "status": 200}}\n',
+        encoding="utf-8",
+    )
+    since_bound = datetime.fromisoformat(aware_at).astimezone().replace(tzinfo=None)
+
+    result = usage_report(path, since=since_bound)
+
+    assert result["total_requests"] == 1
+    assert result["undated_lines"] == 0
+
+
+def test_usage_report_since_counts_an_unparseable_at_as_undated(tmp_path: Path) -> None:
+    """A line whose "at" cannot be parsed is excluded and counted separately, not skipped_lines."""
+    lines = [
+        '{"at": "not-a-timestamp", "kind": "search", "url": "u1", "status": 200}',
+        '{"at": "2026-01-02T00:00:00", "kind": "search", "url": "u2", "status": 200}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path, since=datetime(2026, 1, 1, 0, 0, 0))
+
+    assert result["total_requests"] == 1
+    assert result["undated_lines"] == 1
+    assert result["skipped_lines"] == 0
 
 
 # --- Input-shape errors (v1.0: TypeError normalized to ValueError) ----------

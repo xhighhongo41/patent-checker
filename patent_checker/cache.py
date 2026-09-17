@@ -305,6 +305,42 @@ def _parse_timestamp(value: Any) -> datetime | None:
         return None
 
 
+def format_timestamp(moment: datetime) -> str:
+    """Return *moment* as the canonical ``fetched_at`` string: UTC, offset-aware, seconds.
+
+    A naive *moment* is read as local time (like :func:`_as_aware`), then
+    converted to UTC so that a later change of time zone or DST cannot make
+    an entry look younger or older than it is. This is the format every
+    sidecar has carried since v1.0; the service layer's own ``fetched_at``
+    result field is built with it too, so a fresh fetch and its later
+    cached replay report the same value.
+
+    Args:
+        moment: The instant to format.
+    """
+    return _as_aware(moment).astimezone(UTC).isoformat(timespec="seconds")
+
+
+def normalize_timestamp(value: str) -> str:
+    """Return a sidecar's ``fetched_at`` in the canonical form :func:`format_timestamp` produces.
+
+    A sidecar written before v1.0 carries a naive local timestamp; this
+    reads it as local time and renders it as offset-aware UTC, so a caller
+    never has to special-case which era a sidecar came from.
+
+    Args:
+        value: A ``fetched_at`` string as read from a sidecar, offset-aware
+            or naive.
+
+    Raises:
+        ValueError: If *value* is not a parseable ISO 8601 timestamp.
+    """
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"cannot parse timestamp: {value!r}")
+    return format_timestamp(parsed)
+
+
 def kind_subdir(kind: str) -> Path:
     """Return the directory of *kind* relative to its root.
 
@@ -549,7 +585,7 @@ class Cache:
             path=content_path,
         )
 
-    def put(self, kind: str, key: str, content: bytes, *, ident: str) -> Path:
+    def store(self, kind: str, key: str, content: bytes, *, ident: str) -> CacheHit:
         """Write *content* and its sidecar for *kind*/*key*, replacing any prior entry.
 
         Both files are written to a uniquely named ``.tmp`` sibling and
@@ -557,7 +593,62 @@ class Cache:
         mid-write cannot leave a good sidecar pointing at a half-written
         body and two writers of the same key cannot collide. For
         search-keyed kinds, the expired entries of the same kind are
-        removed afterwards, at most once a minute.
+        removed afterwards, at most once a minute. This is what :meth:`put`
+        delegates to; use this method instead when the caller also needs
+        the ``fetched_at`` this write recorded, so a fresh fetch and the
+        cache hit that later serves it agree on the same value.
+
+        Args:
+            kind: One of :data:`KINDS`.
+            key: Cache key, as produced by :func:`pub_key` or
+                :func:`search_key`.
+            content: The response body to cache.
+            ident: Human-readable identifier (CQL query or publication
+                number) recorded in the sidecar.
+
+        Returns:
+            The entry exactly as written: :attr:`CacheHit.content` is
+            *content*, :attr:`CacheHit.fetched_at` is the timestamp
+            recorded in the sidecar (:func:`format_timestamp` of "now"),
+            and :attr:`CacheHit.path` is the body file's path.
+
+        Raises:
+            ValueError: If *kind* is not one of :data:`KINDS`, or *key* is
+                not made of the characters a cache key may use.
+            OSError: If the entry cannot be written.
+        """
+        _check_key(key)
+        content_path = self.content_path(kind, key)
+        content_path.parent.mkdir(parents=True, exist_ok=True)
+        # The body goes in first: a reader that sees the sidecar then always
+        # sees a body at least as new as it.
+        _replace_atomically(content_path, content)
+
+        now = self._clock()
+        fetched_at = format_timestamp(now)
+        meta = {
+            "kind": kind,
+            "key": key,
+            "ident": ident,
+            "fetched_at": fetched_at,
+            "size": len(content),
+        }
+        _replace_atomically(
+            self.meta_path(kind, key),
+            json.dumps(meta, ensure_ascii=False).encode("utf-8"),
+        )
+
+        if kind in LOCAL_KINDS:
+            self._evict_expired(kind, now, keep=key)
+
+        return CacheHit(content=content, fetched_at=fetched_at, ident=ident, path=content_path)
+
+    def put(self, kind: str, key: str, content: bytes, *, ident: str) -> Path:
+        """Write *content* and its sidecar for *kind*/*key*, replacing any prior entry.
+
+        A thin wrapper over :meth:`store`, kept for callers that only need
+        the body path back; see :meth:`store` for the write itself, its
+        durability guarantees and the search-kind eviction sweep.
 
         Args:
             kind: One of :data:`KINDS`.
@@ -575,32 +666,7 @@ class Cache:
                 not made of the characters a cache key may use.
             OSError: If the entry cannot be written.
         """
-        _check_key(key)
-        content_path = self.content_path(kind, key)
-        content_path.parent.mkdir(parents=True, exist_ok=True)
-        # The body goes in first: a reader that sees the sidecar then always
-        # sees a body at least as new as it.
-        _replace_atomically(content_path, content)
-
-        now = self._clock()
-        meta = {
-            "kind": kind,
-            "key": key,
-            "ident": ident,
-            # Stored as UTC so that a change of time zone (or of DST) cannot
-            # make an entry look younger or older than it is.
-            "fetched_at": _as_aware(now).astimezone(UTC).isoformat(timespec="seconds"),
-            "size": len(content),
-        }
-        _replace_atomically(
-            self.meta_path(kind, key),
-            json.dumps(meta, ensure_ascii=False).encode("utf-8"),
-        )
-
-        if kind in LOCAL_KINDS:
-            self._evict_expired(kind, now, keep=key)
-
-        return content_path
+        return self.store(kind, key, content, ident=ident).path
 
     def entries(self, kind: str | None = None) -> list[CacheEntry]:
         """Return every entry found on disk, across one or all kinds.

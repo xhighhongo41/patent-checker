@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +45,10 @@ REPRESENTATIVE_COUNTRY_ORDER: tuple[str, ...] = (
 )
 
 
-def dedup_families(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def dedup_families(
+    hits: Sequence[Mapping[str, Any]],
+    known_family_ids: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
     """Collapse search hits into one record per patent family.
 
     This mechanizes the stage-1 screening prep step: search results (which
@@ -76,17 +79,29 @@ def dedup_families(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
        lowest).
     4. Whichever hit appeared first in *hits*.
 
+    Args:
+        hits: Search hits to collapse.
+        known_family_ids: Family ids already reviewed in an earlier run.
+            When given (even as an empty collection), every family record
+            gains a ``"known"`` flag; when omitted (``None``), the output is
+            exactly the same as before this flag existed.
+
     Returns:
         One record per family, in the order each family first appears in
         *hits*: ``{"family_id": str, "representative": dict (all keys of the
         chosen hit), "members": [pub, ...] (input order), "query_ids": [str,
-        ...] (merged from every member, first-seen order, deduplicated)}``.
+        ...] (merged from every member, first-seen order, deduplicated)}``,
+        plus ``"known": bool`` (True when "family_id" is in
+        *known_family_ids*; always False for a record keyed by publication
+        number, since it carried no family_id) when *known_family_ids* is
+        not ``None``.
 
     Raises:
         KeyError: If a hit is missing the required ``"pub"`` key.
         ValueError: If a hit is not a mapping, or its ``"pub"`` is not a
             string; the message names the offending position.
     """
+    known_set = None if known_family_ids is None else set(known_family_ids)
     order: list[str] = []
     groups: dict[str, list[int]] = {}
     for index, hit in enumerate(hits):
@@ -117,14 +132,17 @@ def dedup_families(hits: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         raw_query_ids = (hits[i].get("query_id") for i in indices)
         query_ids = _dedup_preserve_order(qid for qid in raw_query_ids if qid is not None)
         representative = dict(_select_representative(indices, hits))
-        families.append(
-            {
-                "family_id": family_id_out,
-                "representative": representative,
-                "members": members,
-                "query_ids": query_ids,
-            }
-        )
+        record: dict[str, Any] = {
+            "family_id": family_id_out,
+            "representative": representative,
+            "members": members,
+            "query_ids": query_ids,
+        }
+        if known_set is not None:
+            # An empty family_id_out means this record was keyed by pub
+            # (no family_id at all), which is never "known".
+            record["known"] = bool(family_id_out) and family_id_out in known_set
+        families.append(record)
     return families
 
 
@@ -274,7 +292,7 @@ def ops_headers_path(data_base: Path | None = None) -> Path:
     return data_base / "raw" / "ops" / OPS_HEADERS_FILENAME
 
 
-def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
+def usage_report(headers_path: Path | None = None, since: datetime | None = None) -> dict[str, Any]:
     """Summarize an OPS request-header log (``headers.jsonl``).
 
     Each line of the log is one JSON object appended by
@@ -285,7 +303,25 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
     line that is not valid JSON, or that is valid JSON but not an object, is
     skipped and counted in ``"skipped_lines"`` rather than
     raising; so is a field whose value has an unexpected type (a numeric
-    ``"at"``, for instance, simply counts towards no day).
+    ``"at"``, for instance, simply counts towards no day, unless *since* is
+    given, in which case it is excluded and counted in
+    ``"undated_lines"`` instead, see below).
+
+    Args:
+        headers_path: Log file to read. Resolved from :func:`ops_headers_path`
+            when ``None``.
+        since: When given, only lines whose ``"at"`` is at or after it are
+            aggregated (including "first_at"/"last_at" and "today", which are
+            then built from that narrowed set only). ``"at"`` is always a
+            naive local timestamp (as written by ``OpsClient``); an
+            offset-aware *since* is converted to local time and its offset
+            dropped before the comparison, and the same is done to an
+            offset-aware ``"at"`` value, so both sides are always compared as
+            local, naive instants. A line whose ``"at"`` cannot be parsed as
+            a timestamp is excluded and counted in ``"undated_lines"``
+            instead of ``"skipped_lines"`` (its JSON was still well-formed).
+            Omitting *since* leaves every line, and the returned shape,
+            exactly as before this parameter existed.
 
     Returns:
         ``{"available": False, "path": str}`` when the log file does not
@@ -295,11 +331,15 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
         "yellow"/"red"/"black"), "system_states": {"idle"/"busy"/"overloaded":
         count}, "first_at": str, "last_at": str, "today": {"date":
         "YYYY-MM-DD" (local), "total_requests": int, "by_kind": {...}},
-        "skipped_lines": int}``.
+        "skipped_lines": int}``, plus ``"since": str`` (the local, naive,
+        seconds-precision bound the comparison used) and ``"undated_lines":
+        int`` when *since* is given.
     """
     path = headers_path if headers_path is not None else ops_headers_path()
     if not path.exists():
         return {"available": False, "path": str(path)}
+
+    since_local = None if since is None else _as_local_naive(since)
 
     today = datetime.now().date()
     total_requests = 0
@@ -310,6 +350,7 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
     first_at: str | None = None
     last_at: str | None = None
     skipped_lines = 0
+    undated_lines = 0
     today_total = 0
     today_by_kind: dict[str, int] = {}
 
@@ -329,6 +370,18 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
                 skipped_lines += 1
                 continue
 
+            at = record.get("at", "")
+            if not isinstance(at, str):
+                at = str(at)
+
+            if since_local is not None:
+                at_local = _log_at_as_local_naive(at)
+                if at_local is None:
+                    undated_lines += 1
+                    continue
+                if at_local < since_local:
+                    continue
+
             total_requests += 1
             kind = record.get("kind", "")
             by_kind[kind] = by_kind.get(kind, 0) + 1
@@ -346,9 +399,6 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
             if system in ("idle", "busy", "overloaded"):
                 system_states[system] = system_states.get(system, 0) + 1
 
-            at = record.get("at", "")
-            if not isinstance(at, str):
-                at = str(at)
             if first_at is None:
                 first_at = at
             last_at = at
@@ -356,7 +406,7 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
                 today_total += 1
                 today_by_kind[kind] = today_by_kind.get(kind, 0) + 1
 
-    return {
+    result = {
         "available": True,
         "path": str(path),
         "total_requests": total_requests,
@@ -373,6 +423,10 @@ def usage_report(headers_path: Path | None = None) -> dict[str, Any]:
         },
         "skipped_lines": skipped_lines,
     }
+    if since_local is not None:
+        result["since"] = since_local.isoformat(timespec="seconds")
+        result["undated_lines"] = undated_lines
+    return result
 
 
 # --- Private helpers ---------------------------------------------------
@@ -541,3 +595,23 @@ def _local_date(at: Any) -> Any:
         return datetime.fromisoformat(at).date()
     except (TypeError, ValueError):
         return None
+
+
+def _as_local_naive(moment: datetime) -> datetime:
+    """Return *moment* as a naive local datetime, matching how log timestamps are written.
+
+    An offset-aware value is converted to local time and its tzinfo dropped;
+    a naive value is assumed to already be local time and returned as is.
+    """
+    if moment.tzinfo is not None:
+        return moment.astimezone().replace(tzinfo=None)
+    return moment
+
+
+def _log_at_as_local_naive(at: str) -> datetime | None:
+    """Return a log line's ``"at"`` value as a naive local datetime, or None if unparseable."""
+    try:
+        parsed = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    return _as_local_naive(parsed)

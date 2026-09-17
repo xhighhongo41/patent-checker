@@ -42,6 +42,11 @@ from patent_checker.ops.parse import (
     OpsSearchPage,
 )
 
+# A fixed fetched_at, used wherever a test needs a deterministic value to
+# compare a full result dict against (a cache-free call uses the current
+# time otherwise).
+FIXED_FETCHED_AT = "2026-09-02T10:00:00+00:00"
+
 
 @pytest.fixture(autouse=True)
 def _no_cache(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -186,6 +191,7 @@ def test_search_success(
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
 
     rc, data = _invoke(["search", "ti=drone"], capsys)
 
@@ -197,6 +203,7 @@ def test_search_success(
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -390,11 +397,17 @@ def test_family_success(
     monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(family=b"<xml/>"))
     family = OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1"))
     monkeypatch.setattr(service, "parse_family_xml", lambda xml: family)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
 
     rc, data = _invoke(["family", "US.1.A1"], capsys)
 
     assert rc == 0
-    assert data == {"family_id": "100", "members": ["US.1.A1", "EP.2.A1"], "raw_path": None}
+    assert data == {
+        "family_id": "100",
+        "members": ["US.1.A1", "EP.2.A1"],
+        "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
+    }
 
 
 # --- claims (route selection) -------------------------------------------
@@ -426,7 +439,13 @@ def test_claims_google_patents_route(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """When Google Patents has the page, claims is read from it (source='gp')."""
-    page = FetchedPage(pub="US11468338B2", html="<html></html>", path=None, cached=False)
+    page = FetchedPage(
+        pub="US11468338B2",
+        html="<html></html>",
+        path=None,
+        cached=False,
+        fetched_at=FIXED_FETCHED_AT,
+    )
     monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: page)
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
 
@@ -480,6 +499,7 @@ def test_claims_unavailable_when_no_fallback_route(
     assert data == {
         "unavailable": True,
         "pub": "US20240111636A1",
+        "pub_docdb": "US.2024111636.A1",
         "retry_after_hint": "wait a bit",
     }
 
@@ -499,7 +519,12 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
     rc, data = _invoke(["claims", "WO2020123456A1"], capsys)
 
     assert rc == 0
-    assert data == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert data == {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 # --- --refresh ------------------------------------------------------------
@@ -666,6 +691,85 @@ def test_batch_limit_is_shared_with_the_mcp_server() -> None:
     assert server_tools.MAX_RECORDS == service.MAX_BATCH_RECORDS
 
 
+def test_dedup_known_reports_new_and_known_families(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--known marks families already reviewed and reports new_count/known_count."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(
+        json.dumps(
+            [
+                {"pub": "US.1.A1", "family_id": "100"},
+                {"pub": "EP.2.A1", "family_id": "200"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps(["100"]), encoding="utf-8")
+
+    rc, data = _invoke(["dedup", str(hits_path), "--known", str(known_path)], capsys)
+
+    assert rc == 0
+    assert data["new_count"] == 1
+    assert data["known_count"] == 1
+    families_by_id = {family["family_id"]: family for family in data["families"]}
+    assert families_by_id["100"]["known"] is True
+    assert families_by_id["200"]["known"] is False
+
+
+def test_dedup_without_known_has_no_new_count_or_known_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without --known the output is exactly the pre-existing shape."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+
+    rc, data = _invoke(["dedup", str(hits_path)], capsys)
+
+    assert rc == 0
+    assert "new_count" not in data
+    assert "known_count" not in data
+    assert "known" not in data["families"][0]
+
+
+def test_dedup_known_non_array_json_is_invalid_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --known file that is not a JSON array is rejected, not a crash."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps({"not": "a list"}), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(
+        ["dedup", str(hits_path), "--known", str(known_path)], capsys
+    )
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_dedup_known_rejects_a_non_string_element(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --known element that is not a string names its position."""
+    hits_path = tmp_path / "hits.json"
+    hits_path.write_text(json.dumps([{"pub": "US.1.A1", "family_id": "100"}]), encoding="utf-8")
+    known_path = tmp_path / "known.json"
+    known_path.write_text(json.dumps(["100", 5]), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(
+        ["dedup", str(hits_path), "--known", str(known_path)], capsys
+    )
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "--known[1]" in data["error"]["message"]
+    assert "Traceback" not in err
+
+
 def test_verify_success(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """verify --input/--output cross-checks two JSON array files."""
     input_path = tmp_path / "input.json"
@@ -768,6 +872,35 @@ def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFi
 
     assert rc == 0
     assert data == fake
+
+
+def test_usage_since_is_forwarded_to_the_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--since reaches service.usage_report as the parsed datetime, keyword-only."""
+    captured: dict[str, Any] = {}
+
+    def fake_usage_report(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {"available": False, "path": "/tmp/headers.jsonl"}
+
+    monkeypatch.setattr(service, "usage_report", fake_usage_report)
+
+    rc, _data = _invoke(["usage", "--since", "2026-09-17"], capsys)
+
+    assert rc == 0
+    assert captured["kwargs"]["since"] == datetime(2026, 9, 17, 0, 0, 0)
+
+
+def test_usage_invalid_since_is_invalid_input(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unparseable --since is invalid_input, exit code 2."""
+    rc, data = _invoke(["usage", "--since", "not a date"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
 
 
 # --- .env, output encoding and I/O failures --------------------------------

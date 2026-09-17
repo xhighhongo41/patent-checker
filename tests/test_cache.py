@@ -19,9 +19,11 @@ from patent_checker.cache import (
     CacheEntry,
     content_suffix,
     default_cache,
+    format_timestamp,
     format_ttl,
     is_fresh,
     kind_subdir,
+    normalize_timestamp,
     pub_key,
     search_key,
 )
@@ -1541,6 +1543,84 @@ def test_ttl_is_evaluated_the_same_for_naive_and_aware_sidecars(tmp_path: Path) 
     clock_value = written_at + legal_ttl
     assert cache.get("legal", "EP.AWARE.A1") is None
     assert cache.get("legal", "EP.NAIVE.A1") is None
+
+
+# --- format_timestamp / normalize_timestamp -----------------------------------
+
+
+def test_format_timestamp_renders_utc_offset_aware_seconds_precision() -> None:
+    """format_timestamp always renders UTC, offset-aware, seconds precision."""
+    moment = datetime(2026, 9, 2, 10, 30, 0, 123456, tzinfo=UTC)
+
+    assert format_timestamp(moment) == "2026-09-02T10:30:00+00:00"
+
+
+def test_format_timestamp_reads_a_naive_moment_as_local_time() -> None:
+    """A naive moment is interpreted as local time, like the sidecar writer."""
+    naive = datetime(2026, 9, 2, 10, 30, 0)
+
+    assert datetime.fromisoformat(format_timestamp(naive)) == naive.astimezone(UTC)
+
+
+def test_normalize_timestamp_is_a_no_op_on_an_already_utc_value() -> None:
+    """A value already in the canonical form round-trips unchanged."""
+    assert normalize_timestamp("2026-09-02T10:30:00+00:00") == "2026-09-02T10:30:00+00:00"
+
+
+def test_normalize_timestamp_converts_a_legacy_naive_value_to_utc() -> None:
+    """A naive (pre-v1.0) value is read as local time and rendered as UTC."""
+    naive = "2026-09-02T10:30:00"
+
+    normalized = normalize_timestamp(naive)
+
+    assert normalized.endswith("+00:00")
+    assert datetime.fromisoformat(normalized) == datetime.fromisoformat(naive).astimezone(UTC)
+
+
+def test_normalize_timestamp_rejects_an_unparseable_value() -> None:
+    """A value that is not an ISO 8601 timestamp is refused, not silently passed through."""
+    with pytest.raises(ValueError, match="not a timestamp"):
+        normalize_timestamp("not a timestamp")
+
+
+# --- Cache.store ---------------------------------------------------------
+
+
+def test_store_returns_the_entry_exactly_as_written(tmp_path: Path) -> None:
+    """store() returns content/ident/path/fetched_at matching what it just wrote to disk."""
+    fixed_now = datetime(2026, 9, 2, 10, 30, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: fixed_now)
+
+    hit = cache.store("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+
+    assert hit.content == b"<xml/>"
+    assert hit.ident == "EP1A1"
+    assert hit.path == tmp_path / "cache" / "ops" / "biblio" / "EP.1.A1.xml"
+    assert hit.path.read_bytes() == b"<xml/>"
+    assert datetime.fromisoformat(hit.fetched_at) == fixed_now.astimezone(UTC)
+
+
+def test_store_result_matches_the_sidecar_a_later_get_reads_back(tmp_path: Path) -> None:
+    """The fetched_at store() reports is exactly what a subsequent get() reads."""
+    cache = Cache(tmp_path / "cache", clock=lambda: datetime(2026, 9, 2, 10, 30, 0))
+
+    stored = cache.store("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+    hit = cache.get("biblio", "EP.1.A1")
+
+    assert hit is not None
+    assert hit.fetched_at == stored.fetched_at
+    assert hit.content == stored.content
+    assert hit.path == stored.path
+
+
+def test_put_still_returns_only_the_path(tmp_path: Path) -> None:
+    """put() keeps its documented return type: a bare Path, not a CacheHit."""
+    cache = Cache(tmp_path / "cache")
+
+    path = cache.put("biblio", "EP.1.A1", b"<xml/>", ident="EP1A1")
+
+    assert isinstance(path, Path)
+    assert path == cache.content_path("biblio", "EP.1.A1")
 
 
 # --- select() time handling and shortcuts ------------------------------------

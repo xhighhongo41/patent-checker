@@ -34,6 +34,7 @@ from patent_checker.ops.parse import (
     OpsSearchHit,
     OpsSearchPage,
 )
+from patent_checker.validation import InvalidInput
 from tests._fixtures import fixture_path
 
 # How long a cached legal-status response stays usable. The legal kind always
@@ -42,6 +43,10 @@ LEGAL_TTL = DEFAULT_TTLS["legal"]
 assert LEGAL_TTL is not None
 
 _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
+
+# A fixed fetched_at, used wherever a test needs a deterministic value to
+# compare a full result dict against (real calls use the current time).
+FIXED_FETCHED_AT = "2026-09-02T10:00:00+00:00"
 
 
 def _load_fixture(name: str) -> bytes:
@@ -161,6 +166,7 @@ def _fetched_page(**overrides: Any) -> FetchedPage:
         "html": "<html></html>",
         "path": None,
         "cached": False,
+        "fetched_at": FIXED_FETCHED_AT,
     }
     fields.update(overrides)
     return FetchedPage(**fields)
@@ -212,6 +218,7 @@ def test_search_returns_page_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch
         hits=(OpsSearchHit(pub="US.1.A1", family_id="100"),),
     )
     monkeypatch.setattr(service, "parse_search_xml", lambda xml: page)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(search=b"<xml/>")
 
     result = service.search("ti=drone", client=stub)
@@ -223,6 +230,7 @@ def test_search_returns_page_fields_and_raw_path(monkeypatch: pytest.MonkeyPatch
         "end": 25,
         "hits": [{"pub": "US.1.A1", "family_id": "100"}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
     assert stub.calls == [("search", ("ti=drone",), {"begin": 1, "end": 25})]
 
@@ -332,6 +340,7 @@ def test_legal_returns_docdb_pub_and_events(monkeypatch: pytest.MonkeyPatch) -> 
     """legal keys the result by the DOCDB spelling of the requested publication."""
     events = (OpsLegalEvent(code="A1", desc="desc", gazette_date="20200101", pre_lines=("line",)),)
     monkeypatch.setattr(service, "parse_legal_xml", lambda xml: events)
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(legal=b"<xml/>")
 
     data = _as_json(service.legal("US11468338B2", client=stub))
@@ -342,6 +351,7 @@ def test_legal_returns_docdb_pub_and_events(monkeypatch: pytest.MonkeyPatch) -> 
             {"code": "A1", "desc": "desc", "gazette_date": "20200101", "pre_lines": ["line"]}
         ],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -352,6 +362,7 @@ def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> No
         "parse_family_xml",
         lambda xml: OpsFamily(family_id="100", members=("US.1.A1", "EP.2.A1")),
     )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(family=b"<xml/>")
 
     result = service.family("US.1.A1", client=stub)
@@ -360,6 +371,7 @@ def test_family_returns_members_as_a_list(monkeypatch: pytest.MonkeyPatch) -> No
         "family_id": "100",
         "members": ["US.1.A1", "EP.2.A1"],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -403,12 +415,14 @@ def test_claims_google_patents_route_without_gp_client(monkeypatch: pytest.Monke
     assert data == {
         "source": "gp",
         "pub": "US11468338B2",
+        "pub_docdb": "US.11468338.B2",
         "claims": [{"number": 1, "text": "1. A widget.", "depends_on": []}],
         "claims_fallback_text": "",
         "status_display": "Active",
         "expiration": "2040-01-01",
         "assignee": "Acme",
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -443,6 +457,7 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
         "parse_claims_xml",
         lambda xml: (Claim(number=1, text="1. Claim text.", depends_on=()),),
     )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
     stub = _StubOpsClient(claims=b"<xml/>")
 
     data = _as_json(service.claims("EP1234567A1", client=stub))
@@ -450,8 +465,10 @@ def test_claims_gp_unavailable_falls_back_to_ops_fulltext_for_ep(
     assert data == {
         "source": "ops-fulltext",
         "pub": "EP1234567A1",
+        "pub_docdb": "EP.1234567.A1",
         "claims": [{"number": 1, "text": "1. Claim text.", "depends_on": []}],
         "raw_path": None,
+        "fetched_at": FIXED_FETCHED_AT,
     }
 
 
@@ -469,6 +486,7 @@ def test_claims_gp_unavailable_for_us_never_calls_ops(monkeypatch: pytest.Monkey
     assert result == {
         "unavailable": True,
         "pub": "US20240111636A1",
+        "pub_docdb": "US.2024111636.A1",
         "retry_after_hint": "wait a bit",
     }
     assert stub.calls == []
@@ -484,7 +502,12 @@ def test_claims_gp_unavailable_for_ep_without_client_is_unavailable(
 
     result = service.claims("EP1234567A1")
 
-    assert result == {"unavailable": True, "pub": "EP1234567A1", "retry_after_hint": "wait"}
+    assert result == {
+        "unavailable": True,
+        "pub": "EP1234567A1",
+        "pub_docdb": "EP.1234567.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 def test_claims_ops_fulltext_404_is_also_reported_unavailable(
@@ -500,7 +523,12 @@ def test_claims_ops_fulltext_404_is_also_reported_unavailable(
 
     result = service.claims("WO2020123456A1", client=stub)
 
-    assert result == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert result == {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
 
 
 def test_claims_ops_fulltext_server_error_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,6 +574,58 @@ def test_dedup_wraps_families_with_their_count(monkeypatch: pytest.MonkeyPatch) 
     result = service.dedup([{"pub": "US.1.A1", "family_id": "1"}])
 
     assert result == {"families": families, "count": 1}
+
+
+def test_dedup_known_family_ids_adds_known_flags_and_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing known_family_ids forwards it to dedup_families and adds new/known counts."""
+    families = [
+        {"family_id": "1", "members": ["US.1.A1"], "known": True},
+        {"family_id": "2", "members": ["US.2.A1"], "known": False},
+    ]
+    captured: dict[str, Any] = {}
+
+    def fake_dedup_families(hits: Any, known_family_ids: Any) -> list[dict[str, Any]]:
+        captured["hits"] = hits
+        captured["known_family_ids"] = known_family_ids
+        return families
+
+    monkeypatch.setattr(service, "dedup_families", fake_dedup_families)
+
+    result = service.dedup([{"pub": "US.1.A1", "family_id": "1"}], known_family_ids=["1"])
+
+    assert captured["known_family_ids"] == ["1"]
+    assert result == {
+        "families": families,
+        "count": 2,
+        "new_count": 1,
+        "known_count": 1,
+    }
+
+
+def test_dedup_known_family_ids_rejects_a_non_string_element() -> None:
+    """A non-string element of known_family_ids is refused before dedup_families runs."""
+    with pytest.raises(ValueError, match=r"known_family_ids\[0\]"):
+        service.dedup([{"pub": "US.1.A1", "family_id": "1"}], known_family_ids=[123])
+
+
+def test_dedup_known_family_ids_rejects_a_mapping_element() -> None:
+    """A family id is a string: a record that merely carries a "pub" is not one."""
+    with pytest.raises(InvalidInput, match=r"known_family_ids\[1\]"):
+        service.dedup(
+            [{"pub": "US.1.A1", "family_id": "1"}],
+            known_family_ids=["1", {"pub": "US.1.A1"}],
+        )
+
+
+def test_dedup_known_family_ids_rejects_more_than_the_batch_limit() -> None:
+    """known_family_ids is bounded by the same MAX_BATCH_RECORDS ceiling as hits."""
+    with pytest.raises(ValueError, match="10000"):
+        service.dedup(
+            [{"pub": "US.1.A1", "family_id": "1"}],
+            known_family_ids=["1"] * (service.MAX_BATCH_RECORDS + 1),
+        )
 
 
 def test_verify_returns_verify_batch_result(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,12 +841,19 @@ def test_claims_unavailable_result_is_never_cached(
     stub = _StubOpsClient(claims=not_found)
     cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
 
+    expected = {
+        "unavailable": True,
+        "pub": "WO2020123456A1",
+        "pub_docdb": "WO.2020123456.A1",
+        "retry_after_hint": "wait",
+    }
+
     first = service.claims("WO2020123456A1", client=stub, cache=cache)
-    assert first == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert first == expected
     assert len(stub.calls) == 1
 
     second = service.claims("WO2020123456A1", client=stub, cache=cache)
-    assert second == {"unavailable": True, "pub": "WO2020123456A1", "retry_after_hint": "wait"}
+    assert second == expected
     assert len(stub.calls) == 2
 
 
@@ -800,8 +887,10 @@ def test_claims_gp_route_uses_the_same_cache(
 
     assert "cached" not in first
     assert first["raw_path"] == str(cache.content_path("gp", pub_key("US11468338B2")))
+    assert "fetched_at" in first
     assert second["cached"] is True
     assert second["raw_path"] == first["raw_path"]
+    assert second["fetched_at"] == first["fetched_at"]
     assert len(requests) == 1
 
 
@@ -932,6 +1021,150 @@ def test_refresh_ignores_a_fresh_cache_entry_on_every_route(
     assert "cached" not in third
     assert third["raw_path"] == second["raw_path"]
     assert len(stub.calls) == 2
+
+
+# --- fetched_at (v1.1) -------------------------------------------------------
+
+# The cache kind/key each _CACHED_ROUTES entry above writes to, so a test can
+# reach in and hand-edit the sidecar it produces.
+_CACHED_ROUTE_CACHE_LOOKUP: dict[str, tuple[str, str]] = {
+    "search": ("search", search_key("ti=drone", 1, 25)),
+    "search_biblio": ("searchbib", search_key("ti=drone", 1, 25)),
+    "biblio": ("biblio", pub_key("US.1.A1")),
+    "legal": ("legal", pub_key("US.1.A1")),
+    "family": ("family", pub_key("US.1.A1")),
+    "claims": ("claims", pub_key("EP1234567A1")),
+}
+
+
+def _refreshable_stub() -> _StubOpsClient:
+    """Return a stub answering every method every _CACHED_ROUTES entry may call."""
+    return _StubOpsClient(
+        search=b"<xml/>",
+        search_biblio=b"<xml/>",
+        biblio=b"<xml/>",
+        legal=b"<xml/>",
+        family=b"<xml/>",
+        claims=b"<xml/>",
+    )
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_matches_between_a_fresh_fetch_and_the_cached_hit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
+) -> None:
+    """A cache hit reports the exact fetched_at the write that created it recorded."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    cache = Cache(tmp_path, clock=lambda: datetime(2026, 9, 2, 10, 0, 0))
+    call = _CACHED_ROUTES[route]
+
+    first = call(stub, cache, False)
+    second = call(stub, cache, False)
+
+    assert "fetched_at" in first
+    assert second["cached"] is True
+    assert second["fetched_at"] == first["fetched_at"]
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_without_a_cache_is_utc_offset_aware_and_second_precision(
+    monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """cache=None still reports a well-formed fetched_at (the current-time fallback)."""
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    call = _CACHED_ROUTES[route]
+
+    result = call(stub, None, False)
+
+    parsed = datetime.fromisoformat(result["fetched_at"])
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+    assert parsed.microsecond == 0
+
+
+@pytest.mark.parametrize("route", sorted(_CACHED_ROUTES))
+@pytest.mark.usefixtures("canned_parsers")
+def test_fetched_at_normalizes_a_legacy_naive_sidecar_on_hit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, route: str
+) -> None:
+    """A pre-v1.0 naive-local sidecar is reported as the equivalent aware UTC instant.
+
+    The comparison is by instant, not by string, so it does not depend on
+    the timezone the test happens to run under.
+    """
+    unavailable = GPUnavailable(pub="EP1234567A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+    stub = _refreshable_stub()
+    now = datetime(2026, 9, 2, 10, 0, 0)
+    cache = Cache(tmp_path, clock=lambda: now)
+    kind, key = _CACHED_ROUTE_CACHE_LOOKUP[route]
+    cache.put(kind, key, b"<xml/>", ident="legacy")
+    naive = (now - timedelta(hours=1)).isoformat(timespec="seconds")
+    meta_path = cache.meta_path(kind, key)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["fetched_at"] = naive
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    result = _CACHED_ROUTES[route](stub, cache, False)
+
+    assert result["cached"] is True
+    expected_instant = datetime.fromisoformat(naive).astimezone()
+    assert datetime.fromisoformat(result["fetched_at"]) == expected_instant
+
+
+def test_plan_check_result_entries_have_no_fetched_at() -> None:
+    """plan_check's per-query entries are hit counts, not fetch results, and carry no fetched_at."""
+    xml = _load_fixture("20260827-001753_search_ab40de2f9f.xml")
+    stub = _StubOpsClient(search=xml)
+
+    result = service.plan_check(["ta = computer"], client=stub)
+
+    assert "fetched_at" not in result["results"][0]
+
+
+def test_claims_unavailable_shape_has_no_fetched_at(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "could not be fetched from any source" shape carries no fetched_at."""
+    unavailable = GPUnavailable(pub="US20240111636A1", status_code=404, retry_after_hint="wait")
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: unavailable)
+
+    result = service.claims("US20240111636A1")
+
+    assert "fetched_at" not in result
+
+
+# --- pub_docdb (v1.1) ---------------------------------------------------------
+
+
+def test_claims_gp_pub_docdb_uses_the_pages_own_publication_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gp source's pub_docdb reflects the number the page itself reports."""
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: _fetched_page())
+    monkeypatch.setattr(
+        service, "parse_patent_html", lambda html: _sample_gp_doc(pub_number="EP1234567B1")
+    )
+
+    result = service.claims("EP1234567")
+
+    assert result["pub_docdb"] == "EP.1234567.B1"
+
+
+def test_claims_gp_pub_docdb_falls_back_when_the_pages_number_is_unusable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty or unparseable page pub_number falls back to the requested publication."""
+    monkeypatch.setattr(service, "fetch_patent_html", lambda pub, **kwargs: _fetched_page())
+    monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc(pub_number=""))
+
+    result = service.claims("US11468338B2")
+
+    assert result["pub_docdb"] == "US.11468338.B2"
 
 
 def test_refresh_replaces_the_cached_body(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

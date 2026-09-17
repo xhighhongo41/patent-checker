@@ -29,19 +29,36 @@ The cache also owns the single on-disk copy of every response body: the
 was given (nothing was stored). A fetched body is stored only once it has
 been parsed successfully, so an unusable response is fetched again next
 time instead of being served from disk for as long as its kind lives.
+
+Every fetch-shaped result also carries ``"fetched_at"``: the UTC instant the
+underlying data was captured, so a report can say "as of when" a repeatedly
+explored document was last read. A cache hit reports the timestamp the
+original fetch recorded (normalized to offset-aware UTC even for a sidecar
+written before v1.0), not the moment of the hit; a fresh fetch with no cache
+at all reports the moment the fetch completed. It is omitted from results
+that were not fetched from a source (each ``plan_check`` entry) and from
+claims' "unavailable" shape.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from patent_checker import validation
-from patent_checker.cache import Cache, pub_key, search_key
+from patent_checker.cache import (
+    Cache,
+    CacheHit,
+    format_timestamp,
+    normalize_timestamp,
+    pub_key,
+    search_key,
+)
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable, fetch_patent_html
 from patent_checker.gp.parse import parse_patent_html
@@ -103,6 +120,41 @@ def _raw_path_field(path: Path | None) -> str | None:
     return None if path is None else str(path)
 
 
+def _current_timestamp() -> str:
+    """Return "now" as this layer's canonical ``fetched_at``, for a result with no cache.
+
+    Kept as the single place this layer reads the clock, so a test can
+    substitute a fixed value instead of depending on wall-clock time.
+    """
+    return format_timestamp(datetime.now())
+
+
+def _finalize_fetch(
+    cache_hit: CacheHit | None,
+    cache: Cache | None,
+    kind: str,
+    key: str,
+    body: bytes,
+    ident: str,
+) -> tuple[Path | None, str]:
+    """Return ``(raw_path, fetched_at)`` once *body* is known to parse.
+
+    Called only after the caller's parser has accepted *body*: storing it
+    any earlier would let an unparsable response become the cached answer
+    for as long as *kind*'s TTL lasts. A cache hit's own timestamp is
+    normalized (a sidecar written before v1.0 may carry a naive local one);
+    a fresh fetch that is cached reports exactly what the write recorded,
+    so a later hit on the same entry agrees with it; a fresh fetch with no
+    cache falls back to :func:`_current_timestamp`.
+    """
+    if cache_hit is not None:
+        return cache_hit.path, normalize_timestamp(cache_hit.fetched_at)
+    if cache is not None:
+        stored = cache.store(kind, key, body, ident=ident)
+        return stored.path, stored.fetched_at
+    return None, _current_timestamp()
+
+
 def ops_fulltext_candidate(pub: str) -> bool:
     """Return True if *pub* is from a country whose full text OPS carries.
 
@@ -139,10 +191,12 @@ def search(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        ``{"query", "total", "begin", "end", "hits": [...], "raw_path"}``,
-        plus ``"cached": True`` when the result came from *cache*.
-        ``"raw_path"`` names the single stored copy of the response body,
-        and is ``None`` when no cache was given.
+        ``{"query", "total", "begin", "end", "hits": [...], "raw_path",
+        "fetched_at"}``, plus ``"cached": True`` when the result came from
+        *cache*. ``"raw_path"`` names the single stored copy of the response
+        body, and is ``None`` when no cache was given. ``"fetched_at"`` is
+        the UTC instant the data was captured (a cache hit reports when it
+        was originally fetched, not now).
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -150,16 +204,12 @@ def search(
     client = require_ops(client)
     key = search_key(cql, begin, end)
     cache_hit = cache.get("search", key) if cache is not None and not refresh else None
-    if cache_hit is not None:
-        xml, raw_path = cache_hit.content, cache_hit.path
-    else:
-        xml = client.search(cql, begin=begin, end=end)
-        raw_path = None
+    xml = cache_hit.content if cache_hit is not None else client.search(cql, begin=begin, end=end)
     page = parse_search_xml(xml)
-    if cache_hit is None and cache is not None:
-        # Stored only now: a body the parser rejects must not become the
-        # cached answer for the rest of the entry's lifetime.
-        raw_path = cache.put("search", key, xml, ident=cql)
+    # Stored only now, once the body is known to parse: a body the parser
+    # rejects must not become the cached answer for the rest of the entry's
+    # lifetime.
+    raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "search", key, xml, cql)
     result = {
         "query": page.query,
         "total": page.total_count,
@@ -167,6 +217,7 @@ def search(
         "end": page.end,
         "hits": [dataclasses.asdict(hit) for hit in page.hits],
         "raw_path": _raw_path_field(raw_path),
+        "fetched_at": fetched_at,
     }
     if cache_hit is not None:
         result["cached"] = True
@@ -194,10 +245,12 @@ def search_biblio(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        ``{"total", "begin", "end", "docs": [...], "raw_path"}``, plus
-        ``"cached": True`` when the result came from *cache*. ``"raw_path"``
-        names the single stored copy of the response body, and is ``None``
-        when no cache was given.
+        ``{"total", "begin", "end", "docs": [...], "raw_path",
+        "fetched_at"}``, plus ``"cached": True`` when the result came from
+        *cache*. ``"raw_path"`` names the single stored copy of the response
+        body, and is ``None`` when no cache was given. ``"fetched_at"`` is
+        the UTC instant the data was captured (a cache hit reports when it
+        was originally fetched, not now).
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -205,20 +258,20 @@ def search_biblio(
     client = require_ops(client)
     key = search_key(cql, begin, end)
     cache_hit = cache.get("searchbib", key) if cache is not None and not refresh else None
-    if cache_hit is not None:
-        xml, raw_path = cache_hit.content, cache_hit.path
-    else:
-        xml = client.search_biblio(cql, begin=begin, end=end)
-        raw_path = None
+    xml = (
+        cache_hit.content
+        if cache_hit is not None
+        else client.search_biblio(cql, begin=begin, end=end)
+    )
     page = parse_search_biblio_xml(xml)
-    if cache_hit is None and cache is not None:
-        raw_path = cache.put("searchbib", key, xml, ident=cql)
+    raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "searchbib", key, xml, cql)
     result = {
         "total": page.total_count,
         "begin": page.begin,
         "end": page.end,
         "docs": [dataclasses.asdict(doc) for doc in page.docs],
         "raw_path": _raw_path_field(raw_path),
+        "fetched_at": fetched_at,
     }
     if cache_hit is not None:
         result["cached"] = True
@@ -278,10 +331,12 @@ def biblio(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        The ``OpsBiblio`` fields plus ``"raw_path"``, plus ``"cached": True``
-        when the result came from *cache*. ``"raw_path"`` names the single
-        stored copy of the response body, and is ``None`` when no cache was
-        given.
+        The ``OpsBiblio`` fields plus ``"raw_path"`` and ``"fetched_at"``,
+        plus ``"cached": True`` when the result came from *cache*.
+        ``"raw_path"`` names the single stored copy of the response body,
+        and is ``None`` when no cache was given. ``"fetched_at"`` is the
+        UTC instant the record was captured (a cache hit reports when it
+        was originally fetched, not now).
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -289,15 +344,11 @@ def biblio(
     client = require_ops(client)
     key = pub_key(pub)
     cache_hit = cache.get("biblio", key) if cache is not None and not refresh else None
-    if cache_hit is not None:
-        xml, raw_path = cache_hit.content, cache_hit.path
-    else:
-        xml = client.biblio(pub)
-        raw_path = None
+    xml = cache_hit.content if cache_hit is not None else client.biblio(pub)
     result = dataclasses.asdict(parse_biblio_xml(xml))
-    if cache_hit is None and cache is not None:
-        raw_path = cache.put("biblio", key, xml, ident=pub)
+    raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "biblio", key, xml, pub)
     result["raw_path"] = _raw_path_field(raw_path)
+    result["fetched_at"] = fetched_at
     if cache_hit is not None:
         result["cached"] = True
     return result
@@ -320,11 +371,13 @@ def legal(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        ``{"pub" (DOCDB spelling), "events": [...], "raw_path"}``, plus
-        ``"note": LEGAL_NO_EVENTS_NOTE`` when OPS reported no event at all,
-        plus ``"cached": True`` when the result came from *cache*.
-        ``"raw_path"`` names the single stored copy of the response body, and
-        is ``None`` when no cache was given.
+        ``{"pub" (DOCDB spelling), "events": [...], "raw_path",
+        "fetched_at"}``, plus ``"note": LEGAL_NO_EVENTS_NOTE`` when OPS
+        reported no event at all, plus ``"cached": True`` when the result
+        came from *cache*. ``"raw_path"`` names the single stored copy of
+        the response body, and is ``None`` when no cache was given.
+        ``"fetched_at"`` is the UTC instant the data was captured (a cache
+        hit reports when it was originally fetched, not now).
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -333,18 +386,14 @@ def legal(
     client = require_ops(client)
     key = pub_key(pub)
     cache_hit = cache.get("legal", key) if cache is not None and not refresh else None
-    if cache_hit is not None:
-        xml, raw_path = cache_hit.content, cache_hit.path
-    else:
-        xml = client.legal(pub)
-        raw_path = None
+    xml = cache_hit.content if cache_hit is not None else client.legal(pub)
     events = parse_legal_xml(xml)
-    if cache_hit is None and cache is not None:
-        raw_path = cache.put("legal", key, xml, ident=pub)
+    raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "legal", key, xml, pub)
     result: dict[str, Any] = {
         "pub": key,
         "events": [dataclasses.asdict(event) for event in events],
         "raw_path": _raw_path_field(raw_path),
+        "fetched_at": fetched_at,
     }
     if not events:
         # "Nothing was reported" and "nothing could be fetched" are different
@@ -372,10 +421,12 @@ def family(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        ``{"family_id", "members": [...], "raw_path"}``, plus ``"cached":
-        True`` when the result came from *cache*. ``"raw_path"`` names the
-        single stored copy of the response body, and is ``None`` when no
-        cache was given.
+        ``{"family_id", "members": [...], "raw_path", "fetched_at"}``, plus
+        ``"cached": True`` when the result came from *cache*. ``"raw_path"``
+        names the single stored copy of the response body, and is ``None``
+        when no cache was given. ``"fetched_at"`` is the UTC instant the
+        data was captured (a cache hit reports when it was originally
+        fetched, not now).
 
     Raises:
         ConfigError: If *client* is ``None``.
@@ -383,18 +434,14 @@ def family(
     client = require_ops(client)
     key = pub_key(pub)
     cache_hit = cache.get("family", key) if cache is not None and not refresh else None
-    if cache_hit is not None:
-        xml, raw_path = cache_hit.content, cache_hit.path
-    else:
-        xml = client.family(pub)
-        raw_path = None
+    xml = cache_hit.content if cache_hit is not None else client.family(pub)
     result = parse_family_xml(xml)
-    if cache_hit is None and cache is not None:
-        raw_path = cache.put("family", key, xml, ident=pub)
+    raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "family", key, xml, pub)
     out = {
         "family_id": result.family_id,
         "members": list(result.members),
         "raw_path": _raw_path_field(raw_path),
+        "fetched_at": fetched_at,
     }
     if cache_hit is not None:
         out["cached"] = True
@@ -428,11 +475,18 @@ def claims(
         refresh: Ignore any cached entry and fetch again, replacing it.
 
     Returns:
-        ``{"source": "gp", ...}`` or ``{"source": "ops-fulltext", ...}``,
-        both carrying ``"raw_path"`` (the single stored copy of the body,
-        ``None`` without a cache) and ``"cached": True`` when the result
-        came from *cache*; or ``{"unavailable": True, "pub",
-        "retry_after_hint"}``.
+        ``{"source": "gp", "pub", "pub_docdb", ...}`` or ``{"source":
+        "ops-fulltext", "pub", "pub_docdb", ...}``, both carrying
+        ``"raw_path"`` (the single stored copy of the body, ``None`` without
+        a cache), ``"fetched_at"`` (the UTC instant the data was captured;
+        a cache hit reports when it was originally fetched, not now), and
+        ``"cached": True`` when the result came from *cache*; or
+        ``{"unavailable": True, "pub", "pub_docdb", "retry_after_hint"}``.
+        ``"pub_docdb"`` is the DOCDB spelling of the publication actually
+        read: for the "gp" source, the number the page itself reports
+        (falling back to the requested *pub* when the page carries none, or
+        one that does not parse); for every other shape, the requested
+        *pub*.
 
     Raises:
         httpx.HTTPError: If a fetch fails for any reason other than the
@@ -460,12 +514,14 @@ def claims(
         gp_result = {
             "source": "gp",
             "pub": doc.pub_number,
+            "pub_docdb": _gp_pub_docdb(doc.pub_number, pub),
             "claims": [dataclasses.asdict(claim) for claim in doc.claims],
             "claims_fallback_text": doc.claims_fallback_text,
             "status_display": doc.status_display,
             "expiration": doc.expiration,
             "assignee": doc.assignee,
             "raw_path": _raw_path_field(fetched.path),
+            "fetched_at": fetched.fetched_at,
         }
         if fetched.cached:
             gp_result["cached"] = True
@@ -478,34 +534,54 @@ def claims(
         key = pub_key(pub)
         cache_hit = cache.get("claims", key) if cache is not None and not refresh else None
         if cache_hit is not None:
-            xml, raw_path = cache_hit.content, cache_hit.path
+            xml = cache_hit.content
         else:
             try:
                 xml = client.claims(pub)
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == httpx.codes.NOT_FOUND:
-                    return _claims_unavailable(fetched)
+                    return _claims_unavailable(fetched, pub)
                 raise
-            raw_path = None
         claims_read = [dataclasses.asdict(claim) for claim in parse_claims_xml(xml)]
-        if cache_hit is None and cache is not None:
-            raw_path = cache.put("claims", key, xml, ident=pub)
+        raw_path, fetched_at = _finalize_fetch(cache_hit, cache, "claims", key, xml, pub)
         result = {
             "source": "ops-fulltext",
             "pub": pub,
+            "pub_docdb": pub_key(pub),
             "claims": claims_read,
             "raw_path": _raw_path_field(raw_path),
+            "fetched_at": fetched_at,
         }
         if cache_hit is not None:
             result["cached"] = True
         return result
 
-    return _claims_unavailable(fetched)
+    return _claims_unavailable(fetched, pub)
 
 
-def _claims_unavailable(fetched: GPUnavailable) -> dict[str, Any]:
+def _gp_pub_docdb(pub_number: str, requested_pub: str) -> str:
+    """Return the DOCDB spelling of the publication a Google Patents page reports.
+
+    ``pub_number`` is read straight off the page; when it is empty or not a
+    parseable publication number (an unexpected page layout), the requested
+    publication number is used instead, so the field is never left out.
+    """
+    if pub_number:
+        try:
+            return pub_key(pub_number)
+        except ValueError:
+            pass
+    return pub_key(requested_pub)
+
+
+def _claims_unavailable(fetched: GPUnavailable, pub: str) -> dict[str, Any]:
     """Build the "claims could not be fetched from any source" result."""
-    return {"unavailable": True, "pub": fetched.pub, "retry_after_hint": fetched.retry_after_hint}
+    return {
+        "unavailable": True,
+        "pub": fetched.pub,
+        "pub_docdb": pub_key(pub),
+        "retry_after_hint": fetched.retry_after_hint,
+    }
 
 
 def _drop_cached_page(cache: Cache, pub: str) -> None:
@@ -540,24 +616,57 @@ def normalize(text: str) -> dict[str, Any]:
     }
 
 
-def dedup(hits: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def dedup(
+    hits: Sequence[Mapping[str, Any]],
+    known_family_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
     """Collapse a list of search hits into one record per patent family.
 
     Args:
         hits: Search hits, each carrying at least ``"pub"`` and
             ``"family_id"``.
+        known_family_ids: Family ids already reviewed in an earlier run.
+            When given, each family record in the result also carries
+            ``"known": bool``, and the result gains ``"new_count"``/
+            ``"known_count"``; omitting it (the default) leaves the result
+            exactly as before this parameter existed.
 
     Returns:
-        ``{"families": [...], "count": int}``.
+        ``{"families": [...], "count": int}``, plus ``"new_count": int``
+        and ``"known_count": int`` when *known_family_ids* is given.
 
     Raises:
         ValueError: If *hits* holds more than :data:`MAX_BATCH_RECORDS`
             records, or a record is not a mapping carrying a ``"pub"``
-            string, or the batch is larger than the shared size limits.
+            string, or either batch is larger than the shared size limits;
+            also raised (as an ``InvalidInput``) if *known_family_ids*
+            holds more than :data:`MAX_BATCH_RECORDS` entries or a
+            non-string element.
     """
     validation.validate_batch(hits, label="hits", max_records=MAX_BATCH_RECORDS)
-    families = dedup_families(hits)
-    return {"families": families, "count": len(families)}
+    if known_family_ids is None:
+        families = dedup_families(hits)
+        return {"families": families, "count": len(families)}
+
+    validation.validate_batch(
+        known_family_ids, label="known_family_ids", max_records=MAX_BATCH_RECORDS
+    )
+    # The shared batch check also accepts a record carrying a "pub"; a family
+    # id is only ever a string.
+    for index, family_id in enumerate(known_family_ids):
+        if not isinstance(family_id, str):
+            raise validation.InvalidInput(
+                f"known_family_ids[{index}] must be a family-id string, "
+                f"got {type(family_id).__name__}"
+            )
+    families = dedup_families(hits, known_family_ids)
+    known_count = sum(1 for family in families if family.get("known"))
+    return {
+        "families": families,
+        "count": len(families),
+        "new_count": len(families) - known_count,
+        "known_count": known_count,
+    }
 
 
 def verify(input_pubs: Sequence[Any], output_records: Sequence[Any]) -> dict[str, Any]:
@@ -581,19 +690,27 @@ def verify(input_pubs: Sequence[Any], output_records: Sequence[Any]) -> dict[str
     return verify_batch(input_pubs, output_records)
 
 
-def usage(headers_path: Path | None = None) -> dict[str, Any]:
+def usage(headers_path: Path | None = None, since: str | None = None) -> dict[str, Any]:
     """Summarize the local OPS request-header log.
 
     Args:
         headers_path: Log file to read. The default location used by
             ``OpsClient`` is resolved by ``usage_report`` itself when this is
             ``None``.
+        since: Optional ISO 8601 date or date-time (see
+            :func:`patent_checker.validation.parse_since`); when given, only
+            requests at or after it are summarized.
 
     Returns:
         :func:`patent_checker.utils.usage_report`'s summary.
+
+    Raises:
+        ValueError: If *since* is given and is not a parseable ISO 8601
+            date or date-time (an ``InvalidInput``).
     """
-    # Resolving the default is usage_report's job, so omit the argument
-    # entirely rather than forwarding None.
+    since_kwargs = {} if since is None else {"since": validation.parse_since(since)}
+    # Resolving the default headers_path is usage_report's job, so omit the
+    # argument entirely rather than forwarding None.
     if headers_path is None:
-        return usage_report()
-    return usage_report(headers_path)
+        return usage_report(**since_kwargs)
+    return usage_report(headers_path, **since_kwargs)

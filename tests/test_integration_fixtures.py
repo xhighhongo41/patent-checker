@@ -102,6 +102,7 @@ def test_biblio_reaches_the_service_layer_and_writes_the_cache(cache: Cache) -> 
     assert cache.content_path("biblio", key).is_file()
     assert cache.meta_path("biblio", key).is_file()
     assert result["raw_path"] == str(cache.content_path("biblio", key))
+    assert result["fetched_at"]
 
 
 # --- claims: OPS full text and Google Patents ---------------------------
@@ -123,6 +124,8 @@ def test_claims_ops_fulltext_reaches_the_service_layer_and_writes_the_cache(cach
     key = pub_key("EP.4645156.A1")
     assert cache.content_path("claims", key).is_file()
     assert cache.meta_path("claims", key).is_file()
+    assert result["fetched_at"]
+    assert result["pub_docdb"] == key
 
 
 def test_claims_gp_page_reaches_the_service_layer_and_writes_the_cache(cache: Cache) -> None:
@@ -137,6 +140,8 @@ def test_claims_gp_page_reaches_the_service_layer_and_writes_the_cache(cache: Ca
     key = pub_key("US11468338B2")
     assert cache.content_path("gp", key).is_file()
     assert cache.meta_path("gp", key).is_file()
+    assert result["fetched_at"]
+    assert result["pub_docdb"]
 
 
 # --- legal: a normal response and a GB pair with no events ---------------
@@ -153,6 +158,7 @@ def test_legal_reaches_the_service_layer_and_writes_the_cache(cache: Cache) -> N
     key = pub_key("US.2007016547.A1")
     assert cache.content_path("legal", key).is_file()
     assert cache.meta_path("legal", key).is_file()
+    assert result["fetched_at"]
 
 
 def test_legal_gb_empty_events_is_an_empty_tuple(cache: Cache) -> None:
@@ -166,6 +172,7 @@ def test_legal_gb_empty_events_is_an_empty_tuple(cache: Cache) -> None:
         result = service.legal("GB2553053A", client=client, cache=cache)
 
     assert result["events"] == []
+    assert result["fetched_at"]
 
 
 # --- family --------------------------------------------------------------
@@ -183,6 +190,7 @@ def test_family_reaches_the_service_layer_and_writes_the_cache(cache: Cache) -> 
     key = pub_key("US.11468338.B2")
     assert cache.content_path("family", key).is_file()
     assert cache.meta_path("family", key).is_file()
+    assert result["fetched_at"]
 
 
 # --- search / search_biblio -----------------------------------------------
@@ -201,6 +209,7 @@ def test_search_reaches_the_service_layer_and_writes_the_cache(cache: Cache) -> 
     key = search_key(cql, begin, end)
     assert cache.content_path("search", key).is_file()
     assert cache.meta_path("search", key).is_file()
+    assert result["fetched_at"]
 
 
 def test_search_biblio_reaches_the_service_layer_and_never_yields_a_bare_cpc_separator(
@@ -223,3 +232,4 @@ def test_search_biblio_reaches_the_service_layer_and_never_yields_a_bare_cpc_sep
     key = search_key(cql, begin, end)
     assert cache.content_path("searchbib", key).is_file()
     assert cache.meta_path("searchbib", key).is_file()
+    assert result["fetched_at"]
