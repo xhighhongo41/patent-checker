@@ -30,7 +30,7 @@ Patent Checker **does not decide whether anything infringes a patent**. Its
 reports contain observations, scope statements and open questions, never a
 verdict.
 
-**Status: stable release (v1.0).**
+**Status: stable release (v1.1).**
 
 ## Important notices
 
