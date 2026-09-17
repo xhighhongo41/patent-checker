@@ -86,9 +86,14 @@ for new and changed features. Then:
 
 ### F4. Searching only what is new
 For each carried query, search only the publications that appeared since
-it was last run. The window starts **30 days before** the previous run's
-`searched_through` (publications reach the search index with a delay) and
-ends today:
+it was last run. The window starts **90 days before** the previous run's
+`searched_through` and ends today. The overlap is that wide on purpose:
+publications reach the search index late — measured during validation,
+the most recent six to seven weeks held only about a fifth of the
+documents that period eventually gets, because many offices' English
+abstracts arrive one to two months after publication. What the previous
+run could not yet find is found now, and the overlap costs no reading:
+families seen before are split off mechanically (F5).
 
 ```
 (<the stored cql>) and pd within "<YYYYMMDD> <YYYYMMDD>"
@@ -100,10 +105,12 @@ double quotes; use `within` — not `>=` — for the range. Measure first with
 `ops_search_biblio` as in step 5. New queries run without a date clause
 (`window: "all"`). Record every query's total and window in its `runs`.
 
-If a windowed query is rejected by the search service, split the stored
-query in two and add the window to both; if windows cannot be used at all,
-run the query in full and rely on the known-family split below — this
-costs upstream requests, not reading.
+A windowed query that returns 0 is an ordinary answer (nothing new was
+published and indexed), not a sign that the syntax failed. If a windowed
+query is rejected by the search service, split the stored query in two and
+add the window to both; if windows cannot be used at all, run the query in
+full and rely on the known-family split below — this costs upstream
+requests, not reading.
 
 ### F5. Splitting new from known
 Collapse the hits with `dedup_families(hits=[...], known_family_ids=[...])`,
@@ -224,7 +231,11 @@ of the following run must say what could not be recovered.
    translation table, the adopted and rejected queries and the stage-1
    verdicts. Where verdict files are machine-readable, carry every family
    over; where they are not, carry over only the families the report
-   names.
+   names. Queries the working directory does not list (gap-filling
+   queries added late in a run are the usual case) can often be recovered
+   verbatim from the request log, `.patent-checker/raw/ops/headers.jsonl`,
+   when that run used the CLI: every search request is logged with its
+   query.
 3. Write `ledger.json` and one `runs.jsonl` line of type `imported`, dated
    with the old run (`run_id` from its date and time, `searched_through` =
    its date, `server_version` from the report or `unknown`), and the state

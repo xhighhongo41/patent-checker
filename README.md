@@ -552,7 +552,13 @@ Nothing is deleted without `--yes`.
   registered application, including its weekly fair-use quota. The server
   spaces its requests and honours OPS throttling headers, but it cannot know
   how many other clients share your credentials. Legal-status information
-  comes from OPS and is the authoritative value in reports.
+  comes from OPS and is the authoritative value in reports. That pacing
+  works inside one process: the server is one, but every `patent-checker`
+  command you run from a shell is its own. When you drive the CLI by hand
+  or from a script, put several queries into one `plan-check` call and
+  leave some fifteen seconds between search commands; an error mentioning
+  `403` means OPS throttled the search service, and waiting a quarter of
+  an hour clears it.
 - **Google Patents** is fetched one document page at a time, at a pace and
   volume comparable to a person reading in a browser, and every page is
   cached so it is not fetched twice. The search endpoint is deliberately not

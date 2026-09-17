@@ -370,6 +370,14 @@ the CLI equivalent of that tool-error prefix) or an invalid cache setting
 (`config_error`). Unreadable upstream data is `upstream_data` with exit
 code 3.
 
+**Pace the CLI yourself.** The server spaces its upstream requests; the
+CLI can only do so inside one invocation, and every command is a new
+process. Send several queries in one `plan-check` call rather than one
+call each, leave at least 15 seconds between two search commands, and
+pass all publications to one `watch` call. An `external_api_error`
+mentioning `403` means the search service throttled you: stop, wait a
+quarter of an hour, and continue more slowly.
+
 | MCP tool | CLI subcommand |
 |---|---|
 | `server_status` | (none — check `patent-checker --version` and run any OPS command; exit code 4 means degraded mode) |
