@@ -342,6 +342,32 @@ def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
         return service.family(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
+def _cmd_watch(args: argparse.Namespace) -> dict[str, Any]:
+    """Check watched publications for legal-status and family changes.
+
+    ``--previous`` names a JSON array file of the snapshots an earlier run
+    returned (or ``-`` for stdin); without it every publication is reported
+    as a first snapshot. The snapshots are checked by the service layer,
+    which is where the same rules apply to the MCP server.
+
+    Raises:
+        ValueError: If a publication number, the stored snapshots or
+            ``--since`` is not what the service layer accepts.
+    """
+    previous = None
+    if args.previous is not None:
+        previous = _read_json_array(args.previous, allow_stdin=True)
+    with _ops_client() as client:
+        return service.watch(
+            args.pubs,
+            previous=previous,
+            since=args.since,
+            client=client,
+            cache=_cache(),
+            refresh=args.refresh,
+        )
+
+
 # --- offline helpers -----------------------------------------------------
 
 
@@ -794,6 +820,24 @@ def _build_parser() -> argparse.ArgumentParser:
     family_parser.add_argument("pub", help="Publication number")
     _add_refresh_flag(family_parser)
     family_parser.set_defaults(handler=_cmd_family)
+
+    watch_parser = subparsers.add_parser(
+        "watch", help="Check watched publications for legal-status and family changes"
+    )
+    watch_parser.add_argument("pubs", nargs="+", metavar="PUB", help="Publication number to check")
+    watch_parser.add_argument(
+        "--previous",
+        metavar="SNAPSHOTS_JSON_PATH",
+        default=None,
+        help="JSON array file of the snapshots an earlier run returned, or '-' for stdin",
+    )
+    watch_parser.add_argument(
+        "--since",
+        default=None,
+        help="Also list the legal events at/after this ISO 8601 date or date-time",
+    )
+    _add_refresh_flag(watch_parser)
+    watch_parser.set_defaults(handler=_cmd_watch)
 
     normalize_parser = subparsers.add_parser("normalize", help="Normalize a publication number")
     normalize_parser.add_argument("text", help="Publication number in any supported spelling")

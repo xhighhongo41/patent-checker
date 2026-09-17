@@ -410,6 +410,123 @@ def test_family_success(
     }
 
 
+# --- watch ----------------------------------------------------------------
+
+
+def _watch_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``watch`` reach a canned legal-status and family response."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(
+        cli_main, "OpsClient", lambda: _StubOpsClient(legal=b"<xml/>", family=b"<xml/>")
+    )
+    event = OpsLegalEvent(code="PG25", desc="Lapsed", gazette_date="20240101", pre_lines=())
+    monkeypatch.setattr(service, "parse_legal_xml", lambda xml: (event,))
+    monkeypatch.setattr(
+        service, "parse_family_xml", lambda xml: OpsFamily(family_id="100", members=("US.1.A1",))
+    )
+    monkeypatch.setattr(service, "_current_timestamp", lambda: FIXED_FETCHED_AT)
+
+
+def test_watch_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """watch prints one result per publication, each with the snapshot to store."""
+    _watch_upstream(monkeypatch)
+
+    rc, data = _invoke(["watch", "US.1.A1"], capsys)
+
+    assert rc == 0
+    assert data["first_count"] == 1
+    assert data["changed_count"] == 0
+    assert data["checked_at"] == FIXED_FETCHED_AT
+    entry = data["results"][0]
+    assert entry["pub"] == "US.1.A1"
+    assert entry["first_snapshot"] is True
+    assert entry["snapshot"]["pub"] == "US.1.A1"
+
+
+def test_watch_previous_reads_a_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--previous takes the snapshots of an earlier run from a JSON array file."""
+    _watch_upstream(monkeypatch)
+    _rc, first = _invoke(["watch", "US.1.A1"], capsys)
+    snapshots = tmp_path / "snapshots.json"
+    snapshots.write_text(json.dumps([first["results"][0]["snapshot"]]), encoding="utf-8")
+
+    rc, data = _invoke(["watch", "US.1.A1", "--previous", str(snapshots)], capsys)
+
+    assert rc == 0
+    assert data["results"][0]["first_snapshot"] is False
+    assert data["results"][0]["changed"] is False
+    assert data["unchanged_count"] == 1
+
+
+def test_watch_previous_reads_stdin_when_the_path_is_dash(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--previous - reads the stored snapshots from stdin, like dedup's hits file."""
+    _watch_upstream(monkeypatch)
+    _rc, first = _invoke(["watch", "US.1.A1"], capsys)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps([first["results"][0]["snapshot"]])))
+
+    rc, data = _invoke(["watch", "US.1.A1", "--previous", "-"], capsys)
+
+    assert rc == 0
+    assert data["results"][0]["first_snapshot"] is False
+
+
+def test_watch_since_lists_the_recent_events(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--since reaches the service and narrows what each entry lists."""
+    _watch_upstream(monkeypatch)
+
+    rc, data = _invoke(["watch", "US.1.A1", "--since", "2024-01-01"], capsys)
+
+    assert rc == 0
+    assert data["since"] == "2024-01-01"
+    assert [event["code"] for event in data["results"][0]["legal"]["events_since"]] == ["PG25"]
+
+
+def test_watch_unparseable_publication_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A publication number that cannot be parsed is invalid_input, exit code 2."""
+    _watch_upstream(monkeypatch)
+
+    rc, data, err = _invoke_with_stderr(["watch", "not a pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_previous_that_is_not_an_array_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A --previous file holding something other than a JSON array is refused, exit code 2."""
+    _watch_upstream(monkeypatch)
+    snapshots = tmp_path / "snapshots.json"
+    snapshots.write_text(json.dumps({"pub": "US.1.A1"}), encoding="utf-8")
+
+    rc, data, err = _invoke_with_stderr(["watch", "US.1.A1", "--previous", str(snapshots)], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_without_ops_configured_is_ops_not_configured_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """watch needs OPS: without credentials it reports ops_not_configured, exit code 4."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: False)
+
+    rc, data = _invoke(["watch", "US.1.A1"], capsys)
+
+    assert rc == 4
+    assert data["error"]["type"] == "ops_not_configured"
+
+
 # --- claims (route selection) -------------------------------------------
 
 
@@ -539,6 +656,7 @@ _REFRESHABLE_COMMANDS = [
     ("legal", "US.1.A1", "legal"),
     ("family", "US.1.A1", "family"),
     ("plan-check", "ti=drone", "plan_check"),
+    ("watch", "US.1.A1", "watch"),
 ]
 
 
@@ -1009,6 +1127,7 @@ _SERVICE_ROUTES: tuple[tuple[str, list[str], str], ...] = (
     ("legal", ["legal", "US.1.A1"], "legal"),
     ("family", ["family", "US.1.A1"], "family"),
     ("claims", ["claims", "EP1672502A1"], "claims"),
+    ("watch", ["watch", "US.1.A1"], "watch"),
     ("usage", ["usage"], "usage"),
 )
 
@@ -1769,6 +1888,7 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "claims",
         "legal",
         "family",
+        "watch",
         "normalize",
         "dedup",
         "verify",

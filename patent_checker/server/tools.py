@@ -47,7 +47,7 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 
-from patent_checker import __version__, service, utils, validation
+from patent_checker import __version__, service, utils, validation, watch
 from patent_checker.cache import format_ttl
 from patent_checker.config import ConfigError
 from patent_checker.ops.client import MAX_RANGE_END, MAX_RANGE_SPAN
@@ -66,6 +66,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "get_claims",
     "get_legal",
     "get_family",
+    "watch_check",
     "normalize_pubnum",
     "dedup_families",
     "verify_batch",
@@ -79,6 +80,7 @@ TOOL_NAMES: tuple[str, ...] = (
 MAX_CQL_LENGTH = 4000
 MAX_QUERIES = 50
 MAX_RECORDS = service.MAX_BATCH_RECORDS  # shared with the CLI's dedup/verify validation
+MAX_WATCH_PUBS = watch.MAX_WATCH_PUBS  # shared with the CLI's and the service's watch check
 # Per-element and per-payload ceilings, shared with the CLI through
 # :mod:`patent_checker.validation`.
 MAX_ITEM_CHARS = validation.MAX_ITEM_CHARS
@@ -276,6 +278,32 @@ def _validate_size(items: Sequence[Any], label: str) -> None:
         max_item_chars=MAX_ITEM_CHARS,
         max_payload_chars=MAX_PAYLOAD_CHARS,
     )
+
+
+def _validate_watch_pubs(pubs: Sequence[Any]) -> None:
+    """Check a watch list: bounded, and every element a publication number.
+
+    The service layer checks the same things (so no front end can forget
+    to), but doing it here is what keeps a mistyped publication on the
+    ``invalid_input`` path before any OPS request is made.
+
+    Raises:
+        InvalidInput: If *pubs* is empty, holds more than
+            :data:`MAX_WATCH_PUBS` entries, breaks the shared element/
+            payload size limits, or holds an element that is not a
+            parseable publication number.
+    """
+    validation.validate_batch(
+        pubs,
+        label="pubs",
+        max_records=MAX_WATCH_PUBS,
+        max_item_chars=MAX_ITEM_CHARS,
+        max_payload_chars=MAX_PAYLOAD_CHARS,
+    )
+    if not pubs:
+        raise InvalidInput("pubs must contain at least one publication number")
+    for pub in pubs:
+        _validate_pub(pub)
 
 
 def _validate_hits(hits: Sequence[Any], label: str) -> None:
@@ -481,6 +509,79 @@ def get_family(pub: str, *, ctx: Context) -> dict[str, Any]:
         return service.family(pub, client=state.ops_client, cache=state.cache)
 
 
+def watch_check(
+    pubs: list[str],
+    previous: list[dict[str, Any]] | None = None,
+    since: str | None = None,
+    *,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Check watched publications for legal-status and family changes since an earlier run.
+
+    Fetches the INPADOC legal status and the simple family of every listed
+    publication (through this server's cache, exactly as get_legal and
+    get_family do) and returns a compact "snapshot" of each. Store that
+    snapshot verbatim and pass it back under *previous* on the next run:
+    the result then also says, per publication, whether anything changed,
+    which legal events are new (in full), which are no longer reported, and
+    which family members appeared or vanished. Nothing is interpreted here:
+    an event that is no longer reported is as likely to be a correction of
+    the office's record as a change of rights, and saying which is the
+    caller's job.
+
+    Returns ``{"results": [...], "changed_count", "unchanged_count",
+    "first_count", "error_count", "ignored_previous", "checked_at"}``, plus
+    ``"since"`` when that bound was given. One result per publication, in
+    the order given, either ``{"pub" (DOCDB spelling), "changed",
+    "first_snapshot", "legal": {"fetched_at", "previous_fetched_at",
+    "new_events", "missing_events"}, "family": {"fetched_at",
+    "previous_fetched_at", "new_members", "missing_members",
+    "family_id_changed"}, "snapshot", "cached": {"legal": bool, "family":
+    bool}}`` -- where a ``"cached": true`` half was served from this
+    server's cache instead of a fresh OPS request -- or ``{"pub",
+    "error_type", "error"}`` for a publication that could not be checked,
+    which leaves the others checked and its stored snapshot still valid.
+    ``"first_snapshot": true`` means there was nothing to compare against,
+    so ``"changed"`` is false; ``"unchanged_count"`` counts only the
+    publications that had a stored snapshot and did not change. With
+    *since*, each entry's "legal" also carries ``"events_since"`` (the
+    current events dated on or after it, in full) and ``"undated_events"``
+    (how many events carried no readable gazette date); neither influences
+    ``"changed"``. Needs EPO OPS: unavailable in degraded mode.
+
+    Args:
+        pubs: Publication numbers to check, at most 25 per call, each one
+            given once (any common spelling).
+        previous: The ``snapshot`` entries an earlier run returned, handed
+            back unchanged. Snapshots for publications this call does not
+            ask about are ignored and counted under "ignored_previous".
+        since: Optional ISO 8601 date (``"2026-09-17"``) or date-time; when
+            given, each entry also lists its legal events from that date on.
+    """
+    state = _state(ctx)
+    with _mapped_errors():
+        _validate_watch_pubs(pubs)
+        if previous is not None:
+            # A stored snapshot is larger than the elements the generic limit
+            # was sized for (one event key per legal event), so it has its own.
+            validation.validate_batch(
+                previous,
+                label="previous",
+                max_records=MAX_RECORDS,
+                max_item_chars=watch.MAX_SNAPSHOT_CHARS,
+                max_payload_chars=MAX_PAYLOAD_CHARS,
+            )
+        if since is not None:
+            validation.parse_since(since)
+        return service.watch(
+            pubs,
+            previous=previous,
+            since=since,
+            client=state.ops_client,
+            cache=state.cache,
+        )
+
+
 # --- offline tools -------------------------------------------------------
 
 
@@ -631,6 +732,7 @@ _TOOL_FUNCTIONS = (
     get_claims,
     get_legal,
     get_family,
+    watch_check,
     normalize_pubnum,
     dedup_families,
     verify_batch,

@@ -13,13 +13,14 @@ module reaches the network; every fixture file is loaded through
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
 import httpx
 import pytest
 
-from patent_checker import service
+from patent_checker import service, validation, watch
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.ops import client as ops_client
@@ -65,6 +66,24 @@ def _token_and_by_kind(a_body: bytes, b_body: bytes) -> Callable[[httpx.Request]
         if request.url.path.endswith(".B"):
             return httpx.Response(200, content=b_body)
         return httpx.Response(200, content=a_body)
+
+    return responder
+
+
+def _token_and_by_endpoint(
+    legal_body: bytes, family_body: bytes
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer the OAuth2 handshake, then dispatch on the legal/family endpoint."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/auth/accesstoken"):
+            return httpx.Response(200, json=_TOKEN_JSON)
+        if "/legal/" in path:
+            return httpx.Response(200, content=legal_body)
+        if "/family/" in path:
+            return httpx.Response(200, content=family_body)
+        raise AssertionError(f"unexpected request: {request.url}")
 
     return responder
 
@@ -233,3 +252,71 @@ def test_search_biblio_reaches_the_service_layer_and_never_yields_a_bare_cpc_sep
     assert cache.content_path("searchbib", key).is_file()
     assert cache.meta_path("searchbib", key).is_file()
     assert result["fetched_at"]
+
+
+# --- watch -----------------------------------------------------------------
+
+
+def test_watch_takes_a_snapshot_and_reports_a_repeat_run_as_unchanged(cache: Cache) -> None:
+    """Real legal and family fixtures round-trip through watch: snapshot, then no change.
+
+    The second run is given the first run's snapshot the way a caller
+    stores it (through JSON), so this covers the whole loop the Skill
+    follows: fetch, store, hand back, compare.
+    """
+    legal_xml = fixture_path("ops/20260827-001754_legal_US.11468338.B2.xml").read_bytes()
+    family_xml = fixture_path("ops/20260827-001755_family_US.11468338.B2.xml").read_bytes()
+    transport = httpx.MockTransport(_token_and_by_endpoint(legal_xml, family_xml))
+
+    with OpsClient(transport=transport) as client:
+        first = service.watch(["US.11468338.B2"], client=client, cache=cache)
+        stored = json.loads(json.dumps(first["results"][0]["snapshot"], ensure_ascii=False))
+        second = service.watch(["US.11468338.B2"], previous=[stored], client=client, cache=cache)
+
+    entry = first["results"][0]
+    assert first["first_count"] == 1
+    assert entry["pub"] == "US.11468338.B2"
+    assert entry["snapshot"]["legal"]["event_count"] > 0
+    assert entry["snapshot"]["family"]["members"]
+
+    repeat = second["results"][0]
+    assert repeat["first_snapshot"] is False
+    assert repeat["changed"] is False
+    assert repeat["legal"]["new_events"] == []
+    assert repeat["legal"]["missing_events"] == []
+    assert second["unchanged_count"] == 1
+    # A watch run reads through the normal TTLs, so the repeat run needed no
+    # request at all.
+    assert repeat["cached"] == {"legal": True, "family": True}
+
+
+def test_the_largest_fixture_snapshot_stays_well_inside_the_payload_limits(
+    cache: Cache,
+) -> None:
+    """A full watch list of the biggest snapshot these fixtures can produce still fits.
+
+    The snapshot travels back to the server on every follow-up run, so its
+    size decides whether the whole feature is usable. The worst case
+    available here is the largest legal-status response (an EP publication
+    whose lapse is recorded per contracting state) combined with the
+    largest family; the two bodies do not belong to the same publication,
+    which does not matter for a size measurement.
+    """
+    legal_xml = fixture_path("ops/20260827-100619_legal_EP.1672502.A1.xml").read_bytes()
+    family_xml = fixture_path("ops/20260828-125051_family_GB.2553053.A.xml").read_bytes()
+    transport = httpx.MockTransport(_token_and_by_endpoint(legal_xml, family_xml))
+
+    with OpsClient(transport=transport) as client:
+        result = service.watch(["EP.1672502.A1"], client=client, cache=cache)
+
+    snapshot = result["results"][0]["snapshot"]
+    size = len(json.dumps(snapshot, ensure_ascii=False))
+    assert snapshot["legal"]["event_count"] > 50
+    # One snapshot is one element of the "previous" batch, and a full watch
+    # list of them is one payload; both limits are checked here, because the
+    # element limit is the tighter of the two by far.
+    assert size < watch.MAX_SNAPSHOT_CHARS // 10, (
+        f"one snapshot is {size} characters: a stored snapshot is one element of the "
+        f"'previous' batch, which is limited to {watch.MAX_SNAPSHOT_CHARS} characters"
+    )
+    assert watch.MAX_WATCH_PUBS * size < validation.MAX_PAYLOAD_CHARS // 10

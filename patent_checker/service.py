@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +73,14 @@ from patent_checker.ops.parse import (
 )
 from patent_checker.pubnum import parse_pubnum
 from patent_checker.utils import dedup_families, search_plan_check, usage_report, verify_batch
+from patent_checker.watch import (
+    ERROR_EXTERNAL_API,
+    ERROR_UPSTREAM_DATA,
+    MAX_SNAPSHOT_CHARS,
+    MAX_WATCH_PUBS,
+    diff_snapshots,
+    index_previous,
+)
 
 # Countries for which EPO OPS carries full-text claims, used by the claims
 # fallback route (Google Patents -> OPS full text -> none).
@@ -587,6 +595,196 @@ def _claims_unavailable(fetched: GPUnavailable, pub: str) -> dict[str, Any]:
 def _drop_cached_page(cache: Cache, pub: str) -> None:
     """Remove the cached Google Patents page of *pub*, ignoring what is not there."""
     cache.remove(cache.select(kinds=("gp",), pub=pub))
+
+
+# --- watching publications across runs -----------------------------------
+
+
+def _watch_pub_keys(pubs: Sequence[str]) -> list[str]:
+    """Check a watch list and return the DOCDB spelling of each publication.
+
+    Checked before anything is fetched, so a malformed list costs no OPS
+    request. Two spellings of one publication are refused rather than
+    silently collapsed: the caller stores one snapshot per result, and two
+    results for one document would leave it with two.
+
+    Raises:
+        validation.InvalidInput: If *pubs* is not a list of 1 to
+            :data:`~patent_checker.watch.MAX_WATCH_PUBS` publication-number
+            strings, breaks the shared size limits, holds a number that
+            cannot be parsed, or names one publication twice.
+    """
+    validation.validate_batch(pubs, label="pubs", max_records=MAX_WATCH_PUBS)
+    if not pubs:
+        raise validation.InvalidInput("pubs must contain at least one publication number")
+
+    keys: list[str] = []
+    seen: dict[str, int] = {}
+    for index, pub in enumerate(pubs):
+        if not isinstance(pub, str):
+            raise validation.InvalidInput(
+                f"pubs[{index}] must be a publication-number string, got {type(pub).__name__}"
+            )
+        try:
+            key = pub_key(pub)
+        except ValueError as exc:
+            raise validation.InvalidInput(
+                f"pubs[{index}] is not a publication number: {exc}"
+            ) from exc
+        if key in seen:
+            raise validation.InvalidInput(
+                f"pubs[{index}] repeats {key} (already given as pubs[{seen[key]}]): "
+                "each publication is watched once per call"
+            )
+        seen[key] = index
+        keys.append(key)
+    return keys
+
+
+def _watch_one(
+    pub: str,
+    key: str,
+    previous_snapshot: Mapping[str, Any] | None,
+    since: date | None,
+    *,
+    client: OpsClient,
+    cache: Cache | None,
+    refresh: bool,
+) -> dict[str, Any]:
+    """Fetch and compare one watched publication, or report why it could not be.
+
+    A watch run covers a list, and one publication OPS refuses (or answers
+    with something the parsers cannot read) must not cost the caller the
+    other checks it already paid for; the failure becomes that entry's
+    result, in the same spelling the MCP tool layer would have used.
+    """
+    try:
+        legal_result = legal(pub, client=client, cache=cache, refresh=refresh)
+        family_result = family(pub, client=client, cache=cache, refresh=refresh)
+    except httpx.HTTPError as exc:
+        return {"pub": key, "error_type": ERROR_EXTERNAL_API, "error": str(exc)}
+    except validation.InvalidInput:
+        # The caller's arguments were checked before anything was fetched,
+        # so this would be a bug here, not one publication's upstream
+        # problem: let it out instead of filing it under the publication.
+        raise
+    except KeyError as exc:
+        # KeyError stringifies to the repr of the missing key alone.
+        return {
+            "pub": key,
+            "error_type": ERROR_UPSTREAM_DATA,
+            "error": f"missing key {exc} in the fetched data",
+        }
+    except (TypeError, ValueError) as exc:
+        return {
+            "pub": key,
+            "error_type": ERROR_UPSTREAM_DATA,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    result = diff_snapshots(previous_snapshot, legal_result, family_result, since=since)
+    result["cached"] = {
+        "legal": bool(legal_result.get("cached")),
+        "family": bool(family_result.get("cached")),
+    }
+    return result
+
+
+def watch(
+    pubs: Sequence[str],
+    *,
+    previous: Sequence[Mapping[str, Any]] | None = None,
+    since: str | None = None,
+    client: OpsClient | None,
+    cache: Cache | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Check watched publications for legal-status and family changes.
+
+    Each publication's legal status and family are fetched through the
+    normal cache (no forced re-fetch: a watch run is a read, and the TTLs
+    already say how fresh each kind has to be) and turned into a snapshot.
+    When the snapshot an earlier run produced is handed back under
+    *previous*, the entry also carries what changed against it. Nothing
+    here is interpreted: an event that is no longer reported may well be a
+    correction of the office's record rather than a change of rights.
+
+    No state is kept between calls. The caller stores each entry's
+    ``"snapshot"`` and passes it back next time, which is what keeps this
+    usable from a server that holds none of the caller's project data.
+
+    Args:
+        pubs: Publication numbers to check (1 to
+            :data:`~patent_checker.watch.MAX_WATCH_PUBS`, each given once).
+        previous: Snapshots stored after an earlier run, in any order and
+            possibly covering publications this call does not ask about
+            (those are counted under ``"ignored_previous"``).
+        since: Optional ISO 8601 date or date-time; when given, each entry
+            also lists the current legal events dated on or after it.
+        client: Caller-owned OPS client.
+        cache: Optional file cache, used exactly as ``legal``/``family``
+            use it.
+        refresh: Ignore any cached entry and fetch again, replacing it.
+
+    Returns:
+        ``{"results": [...], "changed_count", "unchanged_count",
+        "first_count", "error_count", "ignored_previous", "checked_at"}``,
+        plus ``"since"`` when that bound was given. One result per entry of
+        *pubs*, in the same order: either
+        :func:`patent_checker.watch.diff_snapshots`' report plus
+        ``"cached": {"legal": bool, "family": bool}``, or ``{"pub",
+        "error_type", "error"}`` for a publication that could not be
+        checked. ``"unchanged_count"`` counts only the entries that had a
+        stored snapshot and did not change.
+
+    Raises:
+        ConfigError: If *client* is ``None``.
+        validation.InvalidInput: If *pubs*, *previous* or *since* breaks a
+            documented limit or shape. Nothing is fetched in that case.
+    """
+    client = require_ops(client)
+    keys = _watch_pub_keys(pubs)
+    if previous is None:
+        stored: dict[str, Mapping[str, Any]] = {}
+    else:
+        validation.validate_batch(
+            previous,
+            label="previous",
+            max_records=MAX_BATCH_RECORDS,
+            max_item_chars=MAX_SNAPSHOT_CHARS,
+        )
+        stored = index_previous(previous)
+    since_date = validation.parse_since(since).date() if since is not None else None
+
+    results = [
+        _watch_one(
+            pub,
+            key,
+            stored.get(key),
+            since_date,
+            client=client,
+            cache=cache,
+            refresh=refresh,
+        )
+        for pub, key in zip(pubs, keys, strict=True)
+    ]
+
+    changed_count = sum(1 for result in results if result.get("changed"))
+    first_count = sum(1 for result in results if result.get("first_snapshot"))
+    error_count = sum(1 for result in results if "error_type" in result)
+    watched = set(keys)
+    report: dict[str, Any] = {
+        "results": results,
+        "changed_count": changed_count,
+        "unchanged_count": len(results) - changed_count - first_count - error_count,
+        "first_count": first_count,
+        "error_count": error_count,
+        "ignored_previous": sum(1 for key in stored if key not in watched),
+        "checked_at": _current_timestamp(),
+    }
+    if since_date is not None:
+        report["since"] = since_date.isoformat()
+    return report
 
 
 # --- offline helpers -----------------------------------------------------
