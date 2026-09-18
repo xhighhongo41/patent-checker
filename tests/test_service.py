@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import pytest
 
-from patent_checker import service, validation, watch
+from patent_checker import pacing, service, validation, watch
 from patent_checker.cache import DEFAULT_TTLS, Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp import fetch as gp_fetch
@@ -653,7 +653,7 @@ def test_verify_returns_verify_batch_result(monkeypatch: pytest.MonkeyPatch) -> 
 def test_usage_without_path_calls_usage_report_with_no_arguments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """usage() lets utils.usage_report resolve the default log path itself."""
+    """usage() lets utils.usage_report resolve the default log path itself, and adds pacing."""
     calls: list[tuple[Any, ...]] = []
     report = {"available": False, "path": "/tmp/headers.jsonl"}
 
@@ -666,7 +666,13 @@ def test_usage_without_path_calls_usage_report_with_no_arguments(
     result = service.usage()
 
     assert calls == [()]
-    assert result is report
+    # Nothing has been reserved or blocked yet in this test's isolated
+    # pacing directory (see the autouse _isolate_pacing_dir fixture), so the
+    # default Pacer's own summary is the literal "nothing written" shape.
+    assert result == {
+        **report,
+        "pacing": {"available": False, "path": str(pacing.Pacer().path), "upstreams": {}},
+    }
 
 
 def test_usage_with_path_passes_it_positionally(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -682,6 +688,69 @@ def test_usage_with_path_passes_it_positionally(monkeypatch: pytest.MonkeyPatch)
     service.usage(Path("/x"))
 
     assert calls == [(Path("/x"),)]
+
+
+def test_usage_pacing_defaults_to_a_fresh_pacer_when_none_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a pacer= argument, usage() still reports pacing (available False, no state file)."""
+    monkeypatch.setattr(
+        service, "usage_report", lambda: {"available": False, "path": "/tmp/headers.jsonl"}
+    )
+
+    result = service.usage()
+
+    assert result["pacing"]["available"] is False
+    assert result["pacing"]["upstreams"] == {}
+
+
+def test_usage_pacing_reports_reservations_and_blocks_from_the_given_pacer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """usage(pacer=...) surfaces what Pacer.reserve/note recorded, through Pacer.summary()."""
+    monkeypatch.setattr(
+        service, "usage_report", lambda: {"available": False, "path": "/tmp/headers.jsonl"}
+    )
+    pacer = pacing.Pacer(tmp_path / "pacing")
+    pacer.reserve("ops", "search", interval=1.0)
+    pacer.note("ops", "search", block_until=time.time() + 60, block_reason="HTTP 403")
+
+    result = service.usage(pacer=pacer)
+
+    upstream = result["pacing"]["upstreams"]["ops"]
+    assert result["pacing"]["available"] is True
+    assert "search" in upstream["last_request_at"]
+    assert upstream["blocked"]["search"]["reason"] == "HTTP 403"
+
+
+def test_usage_never_creates_the_pacing_state_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """usage() only reads the shared pacing state; it must never write to it."""
+    monkeypatch.setattr(
+        service, "usage_report", lambda: {"available": False, "path": "/tmp/headers.jsonl"}
+    )
+    pacer = pacing.Pacer(tmp_path / "pacing")
+
+    service.usage(pacer=pacer)
+
+    assert not pacer.path.exists()
+
+
+def test_usage_never_modifies_an_existing_pacing_state_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """usage() leaves an existing shared pacing state file byte-for-byte unchanged."""
+    monkeypatch.setattr(
+        service, "usage_report", lambda: {"available": False, "path": "/tmp/headers.jsonl"}
+    )
+    pacer = pacing.Pacer(tmp_path / "pacing")
+    pacer.reserve("ops", "search", interval=1.0)
+    before = pacer.path.read_bytes()
+
+    service.usage(pacer=pacer)
+
+    assert pacer.path.read_bytes() == before
 
 
 # --- cache integration -----------------------------------------------------
@@ -867,11 +936,11 @@ def test_claims_gp_route_uses_the_same_cache(
     courtesy interval are replaced), because what is under test is that the
     page is served from the cache the service was given, without a request.
     """
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     monkeypatch.setattr(
         gp_fetch,
         "time",
-        SimpleNamespace(monotonic=time.monotonic, sleep=lambda _seconds: None),
+        SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=lambda _seconds: None),
     )
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
     requests: list[str] = []

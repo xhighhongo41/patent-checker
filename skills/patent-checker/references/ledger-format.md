@@ -49,9 +49,11 @@ clean` keeps it, and `patent-checker clean --include-artifacts` removes it.
 - Identifiers are stable. An `F` or `Q` number is never reused or
   renumbered; a feature that disappeared is marked `retired`, a query no
   longer run is marked `dropped`.
-- Dates are `YYYY-MM-DD`. Timestamps are ISO 8601 with a UTC offset
-  (`2026-03-01T09:30:00+00:00`), copied from tool results where they come
-  from one (`fetched_at`).
+- Dates are `YYYY-MM-DD`, a day alone. Timestamps are a full ISO 8601 date
+  and time, normally with a UTC offset (`2026-03-01T09:30:00+00:00`),
+  copied from tool results where they come from one (`fetched_at`); a date
+  alone is not a timestamp, even though it would parse as that day's
+  midnight.
 - Publication numbers are written in the DOCDB spelling (`CC.number.KK`,
   for example `EP.9999999.B1`). Copy them from tool results — the `pub` of
   `watch_check`, `get_legal` and search hits, the `pub_docdb` of
@@ -144,7 +146,7 @@ what `dedup_families(known_family_ids=...)` is fed with on the next run.
 | Key | Required | Value |
 |---|---|---|
 | `family_id` | yes | Family identifier from the search hits, unique. For a hit that carries none, use its DOCDB publication number |
-| `pubs` | yes | Non-empty array of the publications seen for this family (DOCDB). A number the search service spells in a way the tools cannot parse (some JP and IN numbers) is kept exactly as the hit carried it; the checker only warns about it |
+| `pubs` | yes | Non-empty array of the publications seen for this family (DOCDB). Numbers are kept exactly as the search service spelled them; the rare spelling the tools still cannot read is only warned about |
 | `stage1` | yes | `A`, `B` or `C` |
 | `judged_run` | yes | `run_id` of the run whose judgment this line records |
 | `features` | yes | Array of the feature ids the judgment was made against, or the string `"all"` (the whole feature table as of `judged_run`) |

@@ -121,7 +121,7 @@ mcp_servers:
 
 ## GitHub Copilot coding agent
 
-coding agent は GitHub.com 上で動くため、TLS 付きで公開したサーバーにしか到達できません([deploy-lan.md](deploy-lan.md) を参照)。リポジトリの Copilot 設定で MCP 構成を追加し、トークンは `COPILOT_MCP_` 接頭辞の Copilot 環境シークレットとして保存します。
+coding agent は GitHub.com 上で動くため、TLS 付きで公開したサーバーにしか到達できません([deploy-lan_ja.md](deploy-lan_ja.md) を参照)。リポジトリの Copilot 設定で MCP 構成を追加し、トークンは `COPILOT_MCP_` 接頭辞の Copilot 環境シークレットとして保存します。
 
 ```json
 {"mcpServers": {"patent-checker": {"type": "http", "url": "https://patents.example.com/mcp",

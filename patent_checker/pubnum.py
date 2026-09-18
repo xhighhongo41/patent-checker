@@ -27,10 +27,16 @@ the year is before 2026, so a Google Patents spelling round-trips through
 years. From 2026 onward, docdb/epodoc and Google Patents already agree on
 11 digits, so no shrinking happens.
 
-JP-specific quirks (era-based numbering etc.) are out of scope for v0.1:
-whatever OPS returns is carried around as-is, and inputs this module cannot
-parse raise ``ValueError`` so the caller can record the case (implementation
-plan section 4.2).
+The number part is not always digits. OPS reports publication numbers whose
+number part carries letters, and since v1.2 they parse and round-trip like
+any other: JP era-based numbers (``JP.H1051684.A``, ``JP.S58196141.A``; S =
+Showa, H = Heisei), Indian application numbers with an office code inside
+(``IN.985DE2013.A``), and series prefixes such as ``TW.I707812.B``,
+``HU.P0304100.A2`` and Google Patents' ``BRPI0410768B1``. Nothing is
+converted (no era-to-Gregorian arithmetic): the letters are part of the
+number and travel with it, so only the three spellings have to agree. Inputs
+this module cannot parse raise ``ValueError`` so the caller can record the
+case (implementation plan section 4.2).
 """
 
 from __future__ import annotations
@@ -38,24 +44,51 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-# Longest digit run accepted in a publication number. Real numbers use at
-# most 11 digits (4-digit year + 7-digit serial); the ceiling leaves one
-# spare digit and keeps an over-long input from reaching the file system,
-# where the docdb spelling becomes a cache path (ENAMETOOLONG).
+# Longest number part accepted in a publication number, counted in
+# characters (letters included, see the module docstring). Real numbers use
+# at most 11 characters (e.g. a 4-digit year + 7-digit serial); the ceiling
+# leaves one spare character and keeps an over-long input from reaching the
+# file system, where the docdb spelling becomes a cache path (ENAMETOOLONG).
 MAX_NUMBER_DIGITS: int = 12
 
-# Matches: 2-letter country + optional 1-char separator + digit run +
+# Offices whose numbers may start with letters in a spelling that carries no
+# separators (``JPH0218652A``, ``BRPI0410768B1``). Only these are listed,
+# because without a separator a leading letter is indistinguishable from a
+# third letter of the country code: allowing it everywhere would make
+# ``USA11468338B2`` parse as country US, number A11468338. The list holds the
+# offices seen in real OPS data and is extended when a new one shows up; a
+# separated spelling (``US.A1234567.B2``) is accepted for any office.
+LEADING_LETTER_COUNTRIES: frozenset[str] = frozenset({"JP", "TW", "HU", "BR"})
+
+# Matches: 2-letter country + optional 1-char separator + number part +
 # optional (1-char separator + kind letter + optional 1 digit).
 # Separator may be "", ".", "-" or a single space, independently at each
 # position; the pattern is applied to an already upper-cased, stripped string.
-# The digit run may contain a single "/" (e.g. the USPTO citation style
-# "2007/0016547"); it is stripped out before further normalization. Each side
-# of the slash is bounded by MAX_NUMBER_DIGITS; their sum is checked in
-# parse_pubnum.
+#
+# The number part is one of two branches:
+#
+# - a digit run that may contain a single "/" (the USPTO citation style
+#   "2007/0016547"); the slash is stripped out before further normalization.
+#   Each side of the slash is bounded by MAX_NUMBER_DIGITS; their sum is
+#   checked in parse_pubnum.
+# - 0-2 leading letters, a digit run, and optionally an inner letter block of
+#   1-4 letters followed by at least 4 more digits, so the number part always
+#   ends with a digit. The 4-digit minimum after the inner letters is what
+#   keeps "US11468338B22" out: "B22" cannot be read as an inner block, and a
+#   kind code takes at most one digit.
+#
+# Whether the leading letters are allowed also depends on the separator and
+# the office, which the pattern cannot express; parse_pubnum checks it
+# against LEADING_LETTER_COUNTRIES. The digit-run branch comes first so a
+# digit-only number is matched by the simpler, unchanged rule.
 _PUBNUM_RE = re.compile(
-    rf"^([A-Z]{{2}})[.\- ]?"
-    rf"(\d{{1,{MAX_NUMBER_DIGITS}}}(?:/\d{{1,{MAX_NUMBER_DIGITS}}})?)"
-    rf"(?:[.\- ]?([A-Z]\d?))?$"
+    rf"^(?P<country>[A-Z]{{2}})(?P<separator>[.\- ]?)"
+    rf"(?P<number>"
+    rf"\d{{1,{MAX_NUMBER_DIGITS}}}(?:/\d{{1,{MAX_NUMBER_DIGITS}}})?"
+    rf"|(?P<leading>[A-Z]{{1,2}})?\d{{1,{MAX_NUMBER_DIGITS}}}"
+    rf"(?:[A-Z]{{1,4}}\d{{4,{MAX_NUMBER_DIGITS}}})?"
+    rf")"
+    rf"(?:[.\- ]?(?P<kind>[A-Z]\d?))?$"
 )
 
 # DOCDB spells US A-kind publications with 10 digits through 2025 and 11
@@ -69,7 +102,8 @@ class PubNumber:
 
     Attributes:
         country: Two-letter country/office code, upper case (e.g. ``US``).
-        number: Digit string as given, leading zeros preserved.
+        number: Number part as given, leading zeros preserved. Usually
+            digits, but it may carry letters (``H1051684``, ``985DE2013``).
         kind: Kind code such as ``A1`` or ``B2``; empty string when absent.
     """
 
@@ -99,9 +133,16 @@ class PubNumber:
         US granted patents, non-US offices, and 10-digit numbers that are
         not year-prefixed) are passed through as-is. Publications from 2026
         onward already arrive as 11 digits (see ``parse_pubnum``), so they
-        never reach this padding step.
+        never reach this padding step. A number part carrying letters is
+        never padded either: the year/serial reading only applies to a
+        digit-only number.
         """
-        if self.country == "US" and len(self.number) == 10 and self.number[:2] in ("19", "20"):
+        if (
+            self.country == "US"
+            and len(self.number) == 10
+            and self.number.isdigit()
+            and self.number[:2] in ("19", "20")
+        ):
             padded_number = f"{self.number[:4]}0{self.number[4:]}"
             return f"{self.country}{padded_number}{self.kind}"
         return self.epodoc()
@@ -111,11 +152,16 @@ def parse_pubnum(text: str) -> PubNumber:
     """Parse a publication number given in any of the three spellings.
 
     Input is case-insensitive and tolerates surrounding whitespace and a
-    single ``.``, ``-`` or space between the parts.
+    single ``.``, ``-`` or space between the parts. The number part may carry
+    letters (``JP.H1051684.A``, ``IN.985DE2013.A``); without separators a
+    number starting with letters is only accepted for the offices in
+    :data:`LEADING_LETTER_COUNTRIES`, because otherwise the letter cannot be
+    told apart from a third letter of the country code.
 
     Raises:
         ValueError: If ``text`` is not a recognizable publication number,
-            including a digit run longer than :data:`MAX_NUMBER_DIGITS`.
+            including a number part longer than :data:`MAX_NUMBER_DIGITS`
+            characters.
         TypeError: If ``text`` is not a string.
     """
     if not isinstance(text, str):
@@ -126,22 +172,32 @@ def parse_pubnum(text: str) -> PubNumber:
     if match is None:
         raise ValueError(f"cannot parse publication number: {text!r}")
 
-    country, number, kind = match.groups()
-    number = number.replace("/", "")
-    kind = kind or ""
+    country = match["country"]
+    number = match["number"].replace("/", "")
+    kind = match["kind"] or ""
 
-    # The slash form is bounded per side by the pattern, so the sum is the
-    # only remaining way past the ceiling.
+    if match["leading"] and not match["separator"] and country not in LEADING_LETTER_COUNTRIES:
+        raise ValueError(
+            f"cannot parse publication number: {text!r} "
+            f"(a number starting with letters needs a separator, "
+            f"as in {country}.{match['number']}.{kind or 'A'})"
+        )
+
+    # The slash form and the letter-bearing form are bounded per run by the
+    # pattern, so a sum of runs is the only remaining way past the ceiling.
     if len(number) > MAX_NUMBER_DIGITS:
         raise ValueError(
-            f"publication number has {len(number)} digits, "
+            f"publication number has {len(number)} characters, "
             f"at most {MAX_NUMBER_DIGITS} are accepted: {text!r}"
         )
 
+    # Reading the number as a year plus a serial only makes sense for a
+    # digit-only number part.
     if (
         country == "US"
         and kind.startswith("A")
         and len(number) == 11
+        and number.isdigit()
         and number[:2] in ("19", "20")
         and number[4] == "0"
         and int(number[:4]) < US_APPLICATION_ELEVEN_DIGITS_FROM_YEAR

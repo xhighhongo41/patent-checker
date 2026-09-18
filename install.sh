@@ -16,7 +16,7 @@
 # Environment variables:
 #   PATENT_CHECKER_SPEC   Spec passed to "uv tool install" (default:
 #                         patent-checker). Examples:
-#                           git+https://github.com/xhighhongo41/patent-checker@v0.5.0
+#                           git+https://github.com/xhighhongo41/patent-checker@v<tag>
 #                           .
 
 set -eu

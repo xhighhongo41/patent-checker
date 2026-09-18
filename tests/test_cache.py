@@ -1214,6 +1214,43 @@ def test_stats_counts_bytes_expired_and_broken_per_kind(tmp_path: Path) -> None:
     assert stats["totals"]["bytes"] == len(b"<old/>") + len(b"<fresh/>")
 
 
+def test_stats_reports_no_kind_code_entries_and_their_expiry(tmp_path: Path) -> None:
+    """A never-expiring kind stored without a kind code follows the family TTL.
+
+    ``stats`` singles that out under ``no_kind_code``/``no_kind_code_expired``,
+    which the plain ``entries``/``expired`` counters do not (:func:`effective_ttl`).
+    """
+    clock_value = datetime(2026, 1, 1, 12, 0, 0)
+    cache = Cache(tmp_path / "cache", clock=lambda: clock_value)
+    cache.put("claims", KIND_CODE_LESS_KEY, b"<claims/>", ident="EP1234567")
+    cache.put("claims", KIND_CODED_KEY, b"<claims/>", ident="EP1234567A1")
+
+    # Older than the family TTL (30 days), which is what a kind-less claims
+    # key follows instead of "claims" own never-expiring policy.
+    clock_value = datetime(2026, 1, 1, 12, 0, 0) + timedelta(days=31)
+
+    stats = cache.stats()
+
+    claims_stats = stats["kinds"]["claims"]
+    assert claims_stats["entries"] == 2
+    assert claims_stats["no_kind_code"] == 1
+    assert claims_stats["no_kind_code_expired"] == 1
+    # The kinded entry never expires and is not counted among the kind-less
+    # ones, so only the kind-less one contributes to "expired" too.
+    assert claims_stats["expired"] == 1
+
+
+def test_stats_no_kind_code_counters_are_zero_for_a_search_kind(tmp_path: Path) -> None:
+    """A search-keyed kind has no concept of a kind code and always reports 0."""
+    cache = Cache(tmp_path / "cache")
+    cache.put("search", search_key("ti=drone", 1, 25), b"<hits/>", ident="ti=drone")
+
+    stats = cache.stats()
+
+    assert stats["kinds"]["search"]["no_kind_code"] == 0
+    assert stats["kinds"]["search"]["no_kind_code_expired"] == 0
+
+
 # --- Cache.select --------------------------------------------------------
 
 

@@ -30,7 +30,7 @@ Patent Checker **does not decide whether anything infringes a patent**. Its
 reports contain observations, scope statements and open questions, never a
 verdict.
 
-**Status: stable release (v1.1).**
+**Status: stable release (v1.2).**
 
 ## Important notices
 
@@ -41,7 +41,7 @@ acknowledge them once, and records that you did.
   you knew of specific patents on specific dates. In some jurisdictions,
   notably the United States, knowledge of a patent can support a claim of
   willful infringement and increased damages. Dated records of how you
-  responded can also work in your favour. Patent Checker lets you choose
+  responded can also work in your favor. Patent Checker lets you choose
   where its records live and whether they are tracked in version control:
   make that choice deliberately.
 - **Search results are incomplete.** No patent search is exhaustive.
@@ -66,9 +66,9 @@ start until it has been acknowledged.
 ```
 your agent ──(Skill: judgment)──► patent-checker MCP server ──► EPO OPS
    │                                   │  deterministic fetch,      Google Patents
-   │  reads your code, writes           │  normalisation, cache
+   │  reads your code, writes           │  normalization, cache
    ▼  the report                        ▼
-.patent-checker/reports/…        per-user document cache
+.patent-checker/reports/…        shared document cache
 ```
 
 1. The Skill reads your codebase, lists the technical features that could be
@@ -152,7 +152,7 @@ starts in **degraded mode** and says so at start-up and in `server_status`.
 
 - Still works: fetching the claims of a document from Google Patents when
   your agent already knows its publication number, publication-number
-  normalisation, the offline helpers (deduplication, batch verification).
+  normalization, the offline helpers (deduplication, batch verification).
 - Unavailable: patent searches, bibliographic records, legal status and
   patent families. The Skill switches to its degraded procedure, in which
   your agent finds candidate publication numbers through its own web
@@ -203,8 +203,10 @@ $token = python -c "import secrets; print(secrets.token_urlsafe(32))"
 The image is published as `ghcr.io/xhighhongo41/patent-checker` and
 `docker.io/xhighhongo41/patent-checker` with tags `X.Y.Z`, `X.Y` and
 `latest`. The container binds `0.0.0.0` internally, but Compose publishes
-the port on **your machine's loopback only** (`127.0.0.1:8642`); the server
-accepts the `localhost` and `127.0.0.1` Host headers and nothing else.
+the port on **your machine's loopback only** (`127.0.0.1:8642`). The Host
+headers the server accepts are the loopback names `localhost`, `127.0.0.1`
+and `::1`, which its HTTP layer always allows, plus any name you add with
+`PATENT_CHECKER_SERVER_ALLOWED_HOSTS` — nothing else.
 Fetched documents, search results and the request log live in the named
 volume `patent-checker-data`. The container runs as an unprivileged user
 on a read-only filesystem with all Linux capabilities dropped; if your
@@ -265,9 +267,9 @@ agent is in [docs/mcp-clients.md](docs/mcp-clients.md).
 
 ## Install the Skill and connect your agent
 
-One command installs the command-line tool, shows the user notice, copies
-the Skill into the places your agents read, and registers the MCP server
-with them:
+The bootstrap script installs the command-line tool; `patent-checker
+install` does the rest — it shows the user notice, copies the Skill into
+the places your agents read, and registers the MCP server with them:
 
 ```sh
 curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.sh | sh
@@ -277,9 +279,15 @@ curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/in
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.ps1 | iex"
 ```
 
-Prefer to read the script first? Fetch it with `| more` instead of `| sh`, or
-skip it entirely: the script only installs uv and the tool, and then tells
-you to run the installer yourself.
+How far each script goes differs. The shell script continues into
+`patent-checker install` when it is run from a terminal (after downloading
+it, say); piped into `sh` as above its standard input is the pipe rather
+than a terminal, so it installs uv and the tool and then prints the
+`patent-checker install` command for you to run next. The PowerShell script
+continues into `patent-checker install` in both cases.
+
+Prefer to read the script first? Fetch it with `| more` instead of `| sh`,
+or skip it entirely — the two steps it takes are:
 
 ```sh
 uv tool install patent-checker
@@ -320,7 +328,9 @@ Useful options: `--list-agents` (what would be installed where),
 `--dry-run` (do everything except write), `--agent claude-code --agent cursor`
 (instead of auto-detection; `--agent all` for every supported agent),
 `--scope project` (install into the current project instead of your home
-directory), `--lang ja` (Japanese notice), `--no-skill` / `--no-mcp`.
+directory), `--lang ja` (Japanese notice), `--agree` (agree to the notice
+without being asked — required when there is no terminal to ask at),
+`--no-skill` / `--no-mcp`.
 Re-running the installer is safe: it refreshes the Skill copies and updates
 the server entry in place, and it never overwrites the backup (`.bak`) it
 made of your original configuration file on the first run. The one
@@ -394,7 +404,10 @@ The Skill first checks the consent record, asks (once per project) whether
 steps above and writes the report to
 `.patent-checker/reports/report-<target>-<YYYYMMDD-HHMM>.md`. Reports are
 never overwritten; a later run of the same project produces a new, dated
-file. Keep the server running for the whole session.
+file. `<target>` is the name of what is being checked — your repository's
+name unless you and your agent agree on another one — and each target keeps
+its own ledger under `.patent-checker/ledger/<target>/`. Keep the server
+running for the whole session.
 
 **Scale and cost.** One exploration of a medium-sized project involves
 reading your code, one or more search rounds, and a staged screening of a
@@ -458,8 +471,19 @@ comments. The CLI's `--host` and `--port` options override
 | `PATENT_CHECKER_SERVER_RPS`, `PATENT_CHECKER_SERVER_BURST` | `5`, `10` | Limit on incoming MCP requests (a guard against runaway agent loops; upstream pacing is separate). |
 | `PATENT_CHECKER_DATA_DIR` | per-user data directory (server), `./.patent-checker` (CLI) | Search cache, request log and, when set, the shared document cache (`<dir>/cache`). The server keeps its data with the user that runs it; the CLI keeps it with the project it is run from. The container image sets it to `/data`. |
 | `PATENT_CHECKER_CACHE_DIR` | `<per-user data dir>/cache` | Shared document cache (bibliography, claims, legal status, families, Google Patents pages), reused across projects by the CLI and the server alike. |
-| `PATENT_CHECKER_CACHE_TTL` | `biblio=90d,claims=0,legal=7d,family=30d,gp=0,search=1d,searchbib=1d` | Per-kind expiry overrides: `<n>d`, `<n>h`, or `0` meaning **never expires** (not "do not cache"). |
+| `PATENT_CHECKER_CACHE_TTL` | `biblio=90d,claims=0,legal=7d,family=30d,gp=0,search=1d,searchbib=1d` | Per-kind expiry overrides: `<n>d`, `<n>h`, or `0` meaning **never expires** (not "do not cache"). Also read by the CLI. |
+| `PATENT_CHECKER_PACING_DIR` | `<per-user data dir>/pacing` | Directory of the shared upstream pacing state (last request times, cool-downs, throttling blocks) that all patent-checker processes of one user share. The container image sets it to `/data/pacing`. Also read by the CLI. |
 | `PATENT_CHECKER_LOG_LEVEL` | `info` | `debug`, `info`, `warning` or `error`. All server logs go to standard error. |
+
+Three variables that are not ours are honored as well. On Linux and macOS
+the per-user data directory follows `XDG_DATA_HOME`
+(`$XDG_DATA_HOME/patent-checker`, or `~/.local/share/patent-checker` when it
+is unset) and the per-user consent record follows `XDG_CONFIG_HOME`
+(`$XDG_CONFIG_HOME/patent-checker/consent.json`, or
+`~/.config/patent-checker/consent.json`); on Windows the per-user data
+directory is `%LOCALAPPDATA%\patent-checker` (falling back to
+`~\AppData\Local\patent-checker`). `patent-checker install --lang` takes
+its default from `LC_ALL` or `LANG`.
 
 `.env` is read by every `patent-checker` command from the directory it runs
 in or a parent of it, never from your home directory or the filesystem
@@ -485,7 +509,7 @@ container's data, delete its volume (`docker compose down -v`).
 
 ## Cache and clean-up
 
-Fetched patent documents are kept once, in the per-user shared cache, with
+Fetched patent documents are kept once, in the shared document cache, with
 a per-kind expiry; search results and the request log stay with whoever ran
 them (the server's data directory, or the project's `.patent-checker/`
 when the CLI is used from the project).
@@ -499,12 +523,15 @@ when the CLI is used from the project).
   log, leftovers of older layouts) and, with `--yes`, deletes them. Reports,
   your agent's exploration notes, the ledger and the consent record are kept
   unless you add `--include-artifacts` or `--include-consent`; `--shared`
-  extends the clean-up to the shared cache and the server's data directory.
-- `patent-checker ledger status` summarises the ledgers of the project (runs,
+  extends the clean-up to the shared document cache and the server's data
+  directory.
+- `patent-checker ledger status` summarizes the ledgers of the project (runs,
   monitored patents, checks that are due) and `patent-checker ledger check`
-  verifies one; both only read. The ledger is written by your agent, lives
-  with the reports, and is covered by the same choice of tracking it in
-  git or not: it is a dated record of what you knew, just as a report is.
+  verifies every target's ledger against the ledger format; `--target <name>`
+  restricts either command to one target. Both only read. The ledger is
+  written by your agent, lives with the reports, and is covered by the same
+  choice of tracking it in git or not: it is a dated record of what you knew,
+  just as a report is.
 - A publication number without its kind code (`EP1234567`) means "whatever
   is current", so claims fetched that way expire like a family instead of
   being kept for good; with the kind code (`EP1234567B1`) they never expire.
@@ -512,6 +539,39 @@ when the CLI is used from the project).
   cache and all.
 
 Nothing is deleted without `--yes`.
+
+### Command reference
+
+Everything your agent does through an MCP tool can also be done from a
+shell, one command per tool:
+
+| MCP tool | CLI command | What it is for |
+|---|---|---|
+| `server_status` | — (`patent-checker --version`, plus any OPS command to see whether it is configured) | version, mode and cache locations of the server |
+| `ops_search` | `patent-checker search "<cql>"` | a CQL search of published data |
+| `ops_search_biblio` | `patent-checker search-biblio "<cql>"` | the same search, with the bibliographic record of every hit |
+| `search_plan_check` | `patent-checker plan-check "<q1>" "<q2>" …` | hit counts of several queries before searching |
+| `get_biblio` | `patent-checker biblio <pub>` | bibliographic record of one publication |
+| `get_claims` | `patent-checker claims <pub>` | claim text of one publication |
+| `get_legal` | `patent-checker legal <pub>` | INPADOC legal-status events |
+| `get_family` | `patent-checker family <pub>` | the simple patent family |
+| `watch_check` | `patent-checker watch <pub> …` | re-check monitored publications against the stored snapshots |
+| `normalize_pubnum` | `patent-checker normalize <text>` | publication numbers in DOCDB spelling (offline) |
+| `dedup_families` | `patent-checker dedup <hits.json>` | collapse search hits into families (offline) |
+| `verify_batch` | `patent-checker verify --input <pubs.json> --output <records.json>` | find omissions in a delegated batch (offline) |
+| `usage_report` | `patent-checker usage` | summary of the local request log |
+| — | `patent-checker ledger status` / `ledger check`, both with `[--target <name>]` | read the project's ledgers, or verify them against the ledger format |
+| — | `patent-checker cache status` / `cache clear` | what is cached, and deleting part of it |
+| — | `patent-checker clean` | remove this project's traces |
+| — | `patent-checker consent status` / `consent show` / `consent record` | the user notice and its consent record |
+| — | `patent-checker install` | place the Skill and register the server with your agents |
+| — | `patent-checker serve` | run the MCP server |
+
+The fetching commands (`search`, `search-biblio`, `plan-check`, `biblio`,
+`claims`, `legal`, `family`, `watch`) accept `--refresh`, which bypasses the
+cache for that one call. The six commands without an MCP counterpart are
+that way by design: the server never reads or deletes the files of your
+project.
 
 ## Security model
 
@@ -530,10 +590,10 @@ Nothing is deleted without `--yes`.
   the ledger are handled by your agent, on your machine. Authenticated clients can see where the server
   keeps its data (`server_status`); nothing else about the host is exposed.
 - Incoming requests are rate-limited, and upstream requests are paced,
-  serialised one at a time and cached so that a runaway agent cannot
+  serialized one at a time and cached so that a runaway agent cannot
   hammer the data sources.
 - `GET /health` is unauthenticated for container health checks and returns
-  only a status and the version.
+  only a status, the version and the transport.
 - Credentials are read from the environment or from files, are never
   logged, and never appear in the startup banner or in error messages.
 - The container runs as an unprivileged user on a read-only filesystem with
@@ -546,7 +606,7 @@ Nothing is deleted without `--yes`.
   `PATENT_CHECKER_SERVER_ALLOWED_HOSTS`, and treat the token as the only
   thing between the network and your OPS quota.
 - The Skill treats everything the server returns, patent text included, as
-  data to analyse, not as instructions to follow.
+  data to analyze, not as instructions to follow.
 - Releases are built and published by CI from a version tag; dependencies
   and the container image are scanned for known vulnerabilities on every
   change. To report a security problem, see [SECURITY.md](SECURITY.md).
@@ -555,15 +615,19 @@ Nothing is deleted without `--yes`.
 
 - **EPO Open Patent Services** is used under the terms attached to your
   registered application, including its weekly fair-use quota. The server
-  spaces its requests and honours OPS throttling headers, but it cannot know
+  spaces its requests and honors OPS throttling headers, but it cannot know
   how many other clients share your credentials. Legal-status information
-  comes from OPS and is the authoritative value in reports. That pacing
-  works inside one process: the server is one, but every `patent-checker`
-  command you run from a shell is its own. When you drive the CLI by hand
-  or from a script, put several queries into one `plan-check` call and
-  leave some fifteen seconds between search commands; an error mentioning
-  `403` means OPS throttled the search service, and waiting a quarter of
-  an hour clears it.
+  comes from OPS and is the authoritative value in reports. The pacing is
+  shared by every patent-checker process of one user through a small state
+  file (`PATENT_CHECKER_PACING_DIR`), so `patent-checker` commands run one
+  after another from a shell keep the same spacing as the server does, and
+  a cool-down or a tightened interval one process saw holds for the next.
+  When OPS refuses a service outright (HTTP 403, its throttling header at
+  `black`), the service is treated as blocked for fifteen minutes: further
+  calls to it fail at once with an `external_api_error` naming the time to
+  retry, instead of making the block longer, and `patent-checker usage`
+  shows the blocked services under `pacing`. Putting several queries into
+  one `plan-check` call still saves requests.
 - **Google Patents** is fetched one document page at a time, at a pace and
   volume comparable to a person reading in a browser, and every page is
   cached so it is not fetched twice. The search endpoint is deliberately not
@@ -579,7 +643,10 @@ Nothing is deleted without `--yes`.
 - **US publication numbers changed length in 2026.** EPO's DOCDB
   representation of US pre-grant publications is 10 digits up to 2025
   (`US2007016547A1`) and 11 digits from 2026 (`US20260024003A1`). Google
-  Patents spells all years with 11 digits. The tools normalise both spellings;
+  Patents spells all years with 11 digits. The tools normalize both spellings,
+  and also accept numbers whose number part carries letters, as OPS spells
+  some Japanese, Indian, Taiwanese, Hungarian and Brazilian publications
+  (`JP.H0218652.A` or `JPH0218652A`);
   when you type a number by hand, either form is accepted.
 - A document whose legal status comes back with no events at all is
   reported as such (`events: []` with a note), which is not the same as
@@ -626,6 +693,23 @@ have.
 
 ## Changelog
 
+- **v1.2** (2026-09): pacing that holds across processes. The minimum
+  interval per OPS service, cool-downs and tightened intervals now live in a
+  small per-user state file guarded by a file lock, so CLI commands run one
+  after another are spaced like the server's calls; a service OPS refuses
+  (HTTP 403, throttling state `black`) is blocked locally for fifteen
+  minutes and further calls fail at once with the time to retry
+  (`PATENT_CHECKER_PACING_DIR`, `patent-checker usage` reports the state).
+  Publication numbers with letters in the number part (`JP.H0218652.A`,
+  `IN.985DE2013.A`, `TW.I707812.B`) parse and round-trip, so the documents
+  OPS lists under such numbers can be fetched and watched. CLI argument
+  errors are told apart from unreadable upstream data; `ledger status` lists
+  every target `ledger check` sees; `cache status` shows the entries stored
+  under a number without kind code and their expiry; request-log
+  timestamps carry the UTC offset. Documentation brought in line with the
+  code (bootstrap behaviour when piped, `/health`, accepted Host headers,
+  the operator notice's list of what the server receives, a command
+  reference).
 - **v1.1** (2026-09): built for repeated runs. A per-project ledger carries
   an exploration from one run to the next; follow-up runs search only newly
   published patents and screen only new families; the new `watch_check` tool
@@ -647,15 +731,16 @@ have.
   parser fixes (concurrent writes, CPC symbols, empty legal status,
   non-UTF-8 pages), upstream calls retried once on 401/429/503 and never
   blocking unrelated tools, every command reads `.env`, plain error
-  messages instead of tracebacks, Python 3.13, security scanning in CI,
-  listing in the MCP Registry, reorganised documentation.
+  messages instead of tracebacks, Python 3.12 or newer with 3.13 tested as
+  well, security scanning in CI,
+  listing in the MCP Registry, reorganized documentation.
 - **v0.5** (2026-09-06): first public release. Docker image (GHCR, Docker
   Hub) and Compose deployment with file-based secrets, `patent-checker
   install` for eight agents, bootstrap scripts, PyPI package, `/health`,
   log level setting.
 - **v0.4** (2026-09-05): per-user shared document cache with per-kind expiry
   and self-repair, `cache status` / `cache clear` / `clean`, publication
-  number normalisation for the 2026 change in US numbers.
+  number normalization for the 2026 change in US numbers.
 - **v0.3** (2026-09-04): MCP server (FastMCP 4, Streamable HTTP, bearer
   token, Host/Origin validation, outbound allowlist, rate limits), operator
   notice, first file cache.

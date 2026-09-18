@@ -27,14 +27,14 @@ from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
 import patent_checker
-from patent_checker import cache, config, service, utils, validation
+from patent_checker import cache, config, pacing, service, utils, validation
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
 from patent_checker.net import AllowlistTransport, HostNotAllowedError
-from patent_checker.ops.client import MIN_INTERVAL_SECONDS, OpsClient
+from patent_checker.ops.client import MIN_INTERVAL_SECONDS, OpsClient, OpsServiceBlocked
 from patent_checker.ops.parse import (
     OpsBiblio,
     OpsFamily,
@@ -773,6 +773,17 @@ def test_usage_report_invalid_since_is_invalid_input(
     assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
+def test_usage_report_carries_the_shared_pacing_state(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """usage_report's result also reports the shared pacing state, for an agent to check first."""
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(mcp, "usage_report")
+
+    assert data["pacing"] == {"available": False, "path": str(pacing.Pacer().path), "upstreams": {}}
+
+
 def test_server_status_reports_the_running_configuration(
     settings: ServerSettings, make_state: Any, tmp_path: Path
 ) -> None:
@@ -1034,6 +1045,21 @@ def test_transport_failures_are_reported_as_external_api_errors(
     assert "connection refused" in message
 
 
+def test_ops_service_blocked_is_reported_as_an_external_api_error(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """OpsServiceBlocked from the OPS call becomes external_api_error, naming the retry time."""
+    stub = _StubOpsClient(search=OpsServiceBlocked("search", time.time() + 60))
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "ops_search", {"cql": "ti=drone"})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_EXTERNAL_API}:")
+    assert "retry after" in message
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -1182,7 +1208,7 @@ def test_offline_and_google_patents_tools_still_work_without_ops(
     """Degraded mode: the non-OPS tools keep working and status says so."""
     # The Google Patents pacing global is process-wide; reset it so this test
     # never sleeps for the courtesy interval left over from another test.
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     mcp = build_server(settings, state=make_state(ops_client=None))
 
     claims = _call(mcp, "get_claims", {"pub": "US11468338B2"})
@@ -1444,7 +1470,7 @@ def test_concurrent_claims_calls_serialize_the_google_patents_request(
     and the request, so this drives the real fetch function and watches the
     Google Patents transport instead of the tool.
     """
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     # The courtesy interval would serialize the two requests on its own; with
     # it out of the way, only the lock can keep them apart.
     monkeypatch.setattr(gp_fetch, "MIN_INTERVAL_SECONDS", 0.0)

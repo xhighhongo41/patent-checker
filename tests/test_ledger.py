@@ -447,6 +447,13 @@ _ERROR_CASES = [
         id="manifest-created-at",
     ),
     pytest.param(
+        _edit_manifest(lambda record: record.update({"created_at": "2026-03-01"})),
+        "manifest",
+        "ledger.json",
+        None,
+        id="manifest-created-at-date-only",
+    ),
+    pytest.param(
         _edit("runs.jsonl", 0, lambda record: record.pop("type")),
         "required-key",
         "runs.jsonl",
@@ -572,6 +579,13 @@ _ERROR_CASES = [
         "watch.jsonl",
         1,
         id="timestamp-as-of",
+    ),
+    pytest.param(
+        _edit("runs.jsonl", 0, lambda record: record.update({"started_at": "2026-03-01"})),
+        "timestamp",
+        "runs.jsonl",
+        1,
+        id="timestamp-started-at-date-only",
     ),
     pytest.param(
         _edit("features.jsonl", 0, lambda record: record.update({"since_run": "20250101-0000"})),
@@ -784,10 +798,10 @@ _WARNING_CASES = [
         id="run-order",
     ),
     pytest.param(
-        # OPS reports some numbers the package cannot parse (an era-based JP
-        # number, an Indian application number). Copied from a search hit
-        # into a screened family they are nothing the agent could fix.
-        _edit("families.jsonl", 0, lambda record: record["pubs"].append("JP.H1051684.A")),
+        # A number the package cannot parse (here: an inner letter block
+        # followed by too few digits for any office). Copied from a search
+        # hit into a screened family it is nothing the agent could fix.
+        _edit("families.jsonl", 0, lambda record: record["pubs"].append("IN.985DE201.A")),
         "pub-unparsed",
         "families.jsonl",
         1,
@@ -1107,6 +1121,45 @@ def test_status_on_a_target_that_has_no_ledger(tmp_path: Path) -> None:
     assert result["ledgers"] == []
     assert result["targets"] == [_TARGET]
     assert result["legacy"] == {"reports": [], "explorations": []}
+
+
+def test_status_lists_a_target_directory_that_has_no_manifest_yet(tmp_path: Path) -> None:
+    """A bare target directory is reported, flagged, rather than hidden.
+
+    ``check`` already walks every directory under ``ledger/``, manifest or
+    not (:func:`patent_checker.ledger.reading.checkable_targets`); ``status``
+    must agree on the same set, so the two never disagree about which
+    targets an agent is exploring.
+    """
+    base = _build_ledger(tmp_path)
+    (base / "ledger" / "bare-app").mkdir()
+
+    result = status(base, today=_TODAY)
+
+    assert result["exists"] is True
+    assert result["targets"] == ["bare-app", _TARGET]
+    entries_by_target = {entry["target"]: entry for entry in result["ledgers"]}
+    assert set(entries_by_target) == {"bare-app", _TARGET}
+    bare = entries_by_target["bare-app"]
+    assert bare["format"] is None
+    assert any("ledger.json" in problem for problem in bare["problems"])
+    # The complete ledger next to it is read normally, unaffected.
+    assert entries_by_target[_TARGET]["format"] == 1
+    assert entries_by_target[_TARGET]["problems"] == []
+
+
+def test_check_already_reports_a_target_directory_with_no_manifest(tmp_path: Path) -> None:
+    """``check`` is unchanged by this: it already reads every directory, manifest or not."""
+    base = _build_ledger(tmp_path)
+    (base / "ledger" / "bare-app").mkdir()
+
+    result = check(base)
+
+    assert result["ok"] is False
+    reports_by_target = {report["target"]: report for report in result["targets"]}
+    assert set(reports_by_target) == {"bare-app", _TARGET}
+    assert reports_by_target[_TARGET]["ok"] is True
+    assert reports_by_target["bare-app"]["ok"] is False
 
 
 def test_status_survives_a_broken_line(tmp_path: Path) -> None:

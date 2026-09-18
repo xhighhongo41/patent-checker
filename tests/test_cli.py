@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,13 +28,14 @@ import pytest
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 import patent_checker.server.tools as server_tools
-from patent_checker import consent, installer, service
+from patent_checker import consent, installer, pacing, service
 from patent_checker.cache import Cache, default_cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
+from patent_checker.ops.client import OpsServiceBlocked
 from patent_checker.ops.parse import (
     OpsBiblio,
     OpsFamily,
@@ -352,6 +354,44 @@ def test_biblio_success(
     assert data["raw_path"] is None
 
 
+def _fail_if_constructed() -> _StubOpsClient:
+    """Raise loudly: used to prove a client was never built for a rejected argument."""
+    raise AssertionError("the OPS client must not be constructed for an invalid publication")
+
+
+def test_biblio_unparseable_pub_is_invalid_input_and_builds_no_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unparseable publication number is rejected before any client is built."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", _fail_if_constructed)
+
+    rc, data, err = _invoke_with_stderr(["biblio", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_biblio_bare_value_error_from_the_service_layer_is_upstream_data(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ValueError raised below the service layer, after the pub check passed, is upstream_data."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(biblio=b"<xml/>"))
+
+    def _raise(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError("cannot parse OPS biblio body")
+
+    monkeypatch.setattr(service, "biblio", _raise)
+
+    rc, data = _invoke(["biblio", "US.1.A1"], capsys)
+
+    assert rc == 3
+    assert data["error"]["type"] == "upstream_data"
+    assert "upstream data could not be read" in data["error"]["message"]
+
+
 def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """legal prints one asdict entry per event, keyed under events, plus raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
@@ -497,6 +537,21 @@ def test_watch_unparseable_publication_is_invalid_input(
 
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_one_bad_element_among_good_ones_names_it_and_builds_no_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A single unparseable pub among otherwise valid ones is named by position."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", _fail_if_constructed)
+
+    rc, data, err = _invoke_with_stderr(["watch", "US.1.A1", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "pubs[1]" in data["error"]["message"]
     assert "Traceback" not in err
 
 
@@ -982,14 +1037,56 @@ def test_verify_accepts_output_records_carrying_a_pub_key(
 
 
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """usage prints utils.usage_report()'s result verbatim."""
+    """usage prints utils.usage_report()'s result plus the shared pacing state."""
     fake = {"available": False, "path": "/tmp/headers.jsonl"}
     monkeypatch.setattr(service, "usage_report", lambda: fake)
 
     rc, data = _invoke(["usage"], capsys)
 
     assert rc == 0
-    assert data == fake
+    assert data == {
+        **fake,
+        "pacing": {"available": False, "path": str(pacing.Pacer().path), "upstreams": {}},
+    }
+
+
+def test_usage_reports_a_blocked_service_in_the_pacing_state(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """usage's "pacing" surfaces a block recorded through Pacer.note, for an agent to check first.
+
+    The autouse ``_isolate_pacing_dir`` fixture already points the default
+    shared-state directory at this test's own ``tmp_path``, so the plain
+    default :class:`~patent_checker.pacing.Pacer` used here is the same one
+    the CLI's ``usage`` command will read.
+    """
+    monkeypatch.setattr(service, "usage_report", lambda: {"available": False, "path": "/tmp/x"})
+    pacer = pacing.Pacer()
+    pacer.note("ops", "search", block_until=time.time() + 60, block_reason="HTTP 403")
+
+    rc, data = _invoke(["usage"], capsys)
+
+    assert rc == 0
+    assert data["pacing"]["available"] is True
+    assert data["pacing"]["upstreams"]["ops"]["blocked"]["search"]["reason"] == "HTTP 403"
+
+
+def test_ops_service_blocked_is_reported_as_external_api_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OpsServiceBlocked from the OPS call is reported as external_api_error, exit code 3."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(
+        cli_main,
+        "OpsClient",
+        lambda: _StubOpsClient(search=OpsServiceBlocked("search", time.time() + 60)),
+    )
+
+    rc, data = _invoke(["search", "ti=drone"], capsys)
+
+    assert rc == 3
+    assert data["error"]["type"] == "external_api_error"
+    assert "retry after" in data["error"]["message"]
 
 
 def test_usage_since_is_forwarded_to_the_service(
@@ -1675,10 +1772,14 @@ def test_cache_clear_negative_older_than_is_invalid_input(
 
 
 def test_cache_clear_unknown_kind_is_invalid_input(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An unknown --kind is rejected (via Cache.select's ValueError) as invalid_input."""
-    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+    """An unknown --kind is rejected by argparse's choices, before the handler ever runs."""
+
+    def _fail() -> Cache:
+        raise AssertionError("the handler must not run for an unknown --kind")
+
+    monkeypatch.setattr(cli_main, "_cache", _fail)
 
     rc, data = _invoke(["cache", "clear", "--kind", "bogus"], capsys)
 

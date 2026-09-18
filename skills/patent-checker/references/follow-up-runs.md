@@ -261,6 +261,20 @@ of the following run must say what could not be recovered.
    compared in full and which only by date.
 5. Run `patent-checker ledger check`, then continue with the follow-up run.
 
+## When OPS blocks a service
+
+OPS refuses a service it has driven to `black` with HTTP 403 and keeps
+refusing it for a quarter of an hour or more. The server and the CLI record
+such a refusal in the shared pacing state and decline that service until the
+recorded time; the tool error names the service and the time to retry, and
+`usage_report` lists blocked services under `pacing.upstreams.ops.blocked`.
+While `search` is blocked, retrieval (bibliographic records, claims), legal
+status and family calls still work, so continue with screening or the
+monitoring list and come back to the searches afterwards. Write the pause
+into the run's notes in the ledger (`runs.jsonl`, `notes`) when it changes
+what the run covered, and into "Scope and limitations" when a search was
+not re-run because of it.
+
 ## Older servers
 
 `watch_check`, `known_family_ids`, `fetched_at` and `pub_docdb` need a

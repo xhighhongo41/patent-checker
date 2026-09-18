@@ -18,7 +18,14 @@ per-minute limits the header reports. One client serializes its own upstream
 calls: the interval wait, the request and the bookkeeping happen under a
 single lock, so concurrent callers (the MCP server serves tool calls from a
 thread pool) are spaced correctly while nothing outside that one HTTP round
-trip is blocked. Rate control across *processes* is out of scope.
+trip is blocked.
+
+Since v1.2 that pacing is also shared *between* processes through
+:mod:`patent_checker.pacing`: the in-process decision becomes the floor of a
+slot reserved in a per-user state file, cool-downs, tightened intervals and
+blocked services are written there, and the file lock is held only for the
+reservation -- never while waiting and never around a request. When the
+shared state cannot be used, pacing degrades to this process only.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from datetime import datetime
 
 import httpx
 
+from patent_checker import pacing
 from patent_checker.config import data_dir, ops_credentials
 from patent_checker.net import allowlist_transport
 from patent_checker.pubnum import PubNumber, parse_pubnum
@@ -60,6 +68,15 @@ MIN_INTERVAL_SECONDS = {
 # usable Retry-After header.
 COOL_DOWN_SECONDS = 60.0
 
+# How long a service stays blocked after OPS refused it outright. Measured
+# in v1.1: CLI searches started from separate processes 1-4 s apart drove the
+# search service from yellow through red to "black:0" and HTTP 403, and it
+# took about 17 minutes before a search was served again. OPS never says
+# when it will lift such a block, so the only recovery is waiting; a quarter
+# of an hour is that measurement rounded down, since the deadline is only
+# the point at which one request is spent finding out.
+BLOCK_SECONDS = 15 * 60.0
+
 # Statuses retried once after a delay: OPS answers 429 when a quota is spent
 # and 503 while the system is saturated, both of which pass.
 RETRY_STATUSES = frozenset({httpx.codes.TOO_MANY_REQUESTS, httpx.codes.SERVICE_UNAVAILABLE})
@@ -80,6 +97,32 @@ _LEGAL_EVENT_MARKER = b"<ops:legal"
 
 _THROTTLING_STATE_RE = re.compile(r"(\w+)=(\w+):(\d+)")
 _THROTTLING_SYSTEM_RE = re.compile(r"^\s*([A-Za-z_]+)\s*\(([^)]*)\)")
+
+
+class OpsServiceBlocked(RuntimeError):
+    """Raised instead of calling a service OPS is currently refusing.
+
+    OPS answers HTTP 403 for a service it has driven to ``black:0`` (see
+    :data:`BLOCK_SECONDS`) and keeps doing so for many minutes. Sending more
+    requests during that time only prolongs it, so the block is recorded in
+    the shared pacing state and every process refuses the service locally
+    until the deadline has passed.
+
+    Attributes:
+        service: The OPS throttling service that is blocked.
+        until: Wall-clock epoch time the block is assumed to last until.
+    """
+
+    def __init__(self, service: str, until: float) -> None:
+        """Record which service is blocked and until when."""
+        super().__init__(service, until)
+        self.service = service
+        self.until = until
+
+    def __str__(self) -> str:
+        """Return the message, naming the service and the local retry time."""
+        retry_after = pacing.spell_epoch(self.until)
+        return f"OPS blocked the {self.service} service; retry after {retry_after}"
 
 
 def parse_throttling_header(value: str) -> tuple[str, dict[str, tuple[str, int]]]:
@@ -165,9 +208,27 @@ class OpsClient:
 
     The bodies themselves are not stored here; only the request log under
     ``<data_dir>/raw/ops/headers.jsonl`` is written.
+
+    Requests are paced against both this client's own history and the shared
+    state of the user's other processes (see :meth:`_wait_for_service`), and
+    what a response says about throttling is written back to that shared
+    state (see :meth:`_note_throttling` and :meth:`_note_block`).
+
+    A service OPS refuses outright -- HTTP 403, or ``black`` reported for the
+    service just used -- is treated as blocked for :data:`BLOCK_SECONDS`, and
+    every later call to it raises :class:`OpsServiceBlocked` without sending
+    anything. Recovery is time-based only: OPS never announces when it will
+    serve that service again, and the only way to find out is to spend a
+    request on it, which is exactly what prolonged the block when it was
+    measured. So the deadline simply passes and the next call tries again.
     """
 
-    def __init__(self, transport: httpx.BaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        transport: httpx.BaseTransport | None = None,
+        *,
+        pacer: pacing.Pacer | None = None,
+    ) -> None:
         """Build a client, defaulting to an allowlisted transport.
 
         Args:
@@ -176,6 +237,9 @@ class OpsClient:
                 allowlist_transport`) is built, so the guard also holds on
                 the CLI path; a supplied transport is used unchanged (the
                 MCP server wraps its own).
+            pacer: Access to the pacing state shared with the user's other
+                processes. With ``None`` a :class:`patent_checker.pacing.
+                Pacer` on the configured directory is used.
         """
         self._client = httpx.Client(
             timeout=30.0,
@@ -191,6 +255,7 @@ class OpsClient:
         self._cool_down_until: float = 0.0
         # Intervals tightened from X-Throttling-Control; empty means "static".
         self._effective_interval: dict[str, float] = {}
+        self._pacer = pacer if pacer is not None else pacing.Pacer()
         self._data_dir = data_dir("ops")
 
     def close(self) -> None:
@@ -239,7 +304,16 @@ class OpsClient:
         return self._effective_interval.get(service, MIN_INTERVAL_SECONDS.get(service, 1.0))
 
     def _wait_for_service(self, service: str) -> None:
-        """Honor per-service minimum intervals and any active cool-down.
+        """Wait for this process' turn *and* for the turn of the shared state.
+
+        The in-process bookkeeping (this client's own cool-down and last
+        request per service, measured on the monotonic clock) yields the
+        earliest time this client may send. That becomes the wall-clock
+        *floor* of a slot reserved in the shared pacing state, which knows
+        what the user's other processes have already sent, so the two
+        combine as "the later of the two" and the shared state can only ever
+        delay a request. Only the reservation takes the file lock; the wait
+        itself happens with no lock held.
 
         ``self._lock`` must be held by the caller: the wait and the request
         that follows it form one unit.
@@ -249,8 +323,11 @@ class OpsClient:
         last = self._last_request_at.get(service)
         if last is not None:
             wait = max(wait, self._interval_for(service) - (now - last))
-        if wait > 0:
-            time.sleep(wait)
+        floor = time.time() + max(0.0, wait)
+        slot = self._pacer.reserve("ops", service, self._interval_for(service), floor=floor)
+        delay = slot - time.time()
+        if delay > 0:
+            time.sleep(delay)
         self._last_request_at[service] = time.monotonic()
 
     def _note_throttling(self, service: str, throttling: str) -> None:
@@ -262,23 +339,38 @@ class OpsClient:
         than the static one; the static intervals are restored as soon as the
         system is reported idle or busy again. Any other (unknown) system
         state leaves the tightened intervals in place, which is the safe side.
+
+        Whatever changes is mirrored into the shared pacing state, so the
+        user's other processes react to a report only one of them saw. The
+        clearing of tightened intervals is written even when this client had
+        none itself: the tightening may have been recorded by a process that
+        has since exited, and nothing else would ever take it back.
         """
         system, services = parse_throttling_header(throttling)
         if not services:
             return
 
         state = services.get(service)
+        cool_down_until: float | None = None
         if state is not None and state[0] != "green":
             self._cool_down_until = time.monotonic() + COOL_DOWN_SECONDS
+            cool_down_until = time.time() + COOL_DOWN_SECONDS
 
+        intervals: dict[str, float] | None = None
         if system == "overloaded":
             for name, (_colour, limit) in services.items():
                 if limit <= 0:
                     continue
                 static = MIN_INTERVAL_SECONDS.get(name, 1.0)
                 self._effective_interval[name] = max(static, 60.0 / limit)
+            intervals = dict(self._effective_interval)
         elif system in ("idle", "busy"):
             self._effective_interval.clear()
+            intervals = {}
+
+        # Nothing to record means nothing to lock the shared state for.
+        if cool_down_until is not None or intervals is not None:
+            self._pacer.note("ops", service, cool_down_until=cool_down_until, intervals=intervals)
 
     def _log_headers(self, kind: str, url: str, resp: httpx.Response) -> None:
         """Append one JSON line describing the response headers.
@@ -288,7 +380,9 @@ class OpsClient:
         as a warning and the response is still handed to the caller.
         """
         record = {
-            "at": datetime.now().isoformat(timespec="seconds"),
+            # Local time *with* its UTC offset: a log is read on machines
+            # (and in containers) whose timezone is not the writer's.
+            "at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "kind": kind,
             "url": url,
             "status": resp.status_code,
@@ -340,7 +434,16 @@ class OpsClient:
         return resp.content
 
     def _send_get(self, url: str, path: str, *, service: str, kind: str) -> httpx.Response:
-        """Send one authenticated GET, spaced and logged. ``self._lock`` must be held."""
+        """Send one authenticated GET, spaced and logged. ``self._lock`` must be held.
+
+        Raises:
+            OpsServiceBlocked: If *service* is blocked (by this process or
+                another one). Checked before anything is sent, so a token
+                request is not spent on a service that cannot answer.
+        """
+        blocked_until = self._pacer.blocked_until("ops", service)
+        if blocked_until is not None:
+            raise OpsServiceBlocked(service, blocked_until)
         # The token is acquired first so its own pacing does not eat into the
         # interval measured for this service.
         token = self._fresh_token()
@@ -348,7 +451,40 @@ class OpsClient:
         resp = self._client.get(url, headers={"Authorization": f"Bearer {token}"})
         self._log_headers(kind, path, resp)
         self._note_throttling(service, resp.headers.get("X-Throttling-Control", ""))
+        self._note_block(service, resp)
         return resp
+
+    def _note_block(self, service: str, resp: httpx.Response) -> None:
+        """Record a block when OPS refused *service* outright.
+
+        Two signals count, both about the service that was just used: HTTP
+        403, and a ``black`` colour for that service in
+        ``X-Throttling-Control``. A colour reported for any *other* service
+        is ignored: after the v1.1 block was lifted, legal and family
+        responses still carried ``search=black:0`` and ``search=green:15``
+        alternately, so those colours are not trustworthy.
+
+        The response itself is not swallowed; the caller still sees the 403.
+        It is the *next* request that is refused locally, for
+        :data:`BLOCK_SECONDS`.
+        """
+        _system, services = parse_throttling_header(resp.headers.get("X-Throttling-Control", ""))
+        state = services.get(service)
+        forbidden = resp.status_code == httpx.codes.FORBIDDEN
+        if not forbidden and (state is None or state[0] != "black"):
+            return
+
+        now = time.time()
+        reason = f"HTTP {resp.status_code}"
+        if state is not None:
+            reason += f" with {service}={state[0]}:{state[1]}"
+        reason += f" at {pacing.spell_epoch(now)}"
+        self._pacer.note(
+            "ops",
+            service,
+            block_until=now + BLOCK_SECONDS,
+            block_reason=reason,
+        )
 
     # -- endpoints ---------------------------------------------------------
 

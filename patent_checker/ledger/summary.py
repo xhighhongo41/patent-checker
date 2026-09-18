@@ -31,12 +31,12 @@ from patent_checker.ledger.layout import (
 from patent_checker.ledger.reading import (
     JsonLines,
     as_date,
+    checkable_targets,
     has_value,
     load_jsonl,
     read_text,
     shown,
     sorted_names,
-    summarizable_targets,
 )
 
 
@@ -53,6 +53,10 @@ def status(
     many monitored publications are open and due. Nothing here fails on a
     damaged ledger -- what can be counted is counted and what could not be
     read is described in ``problems``; :func:`check` is the strict reading.
+    A target directory with no manifest yet is listed too, rather than
+    omitted, so that this function and :func:`check` agree on which targets
+    exist; its ``"format"`` is ``None`` and ``"problems"`` names the missing
+    manifest, same as any other file this summary could not read.
 
     Args:
         data_base: The ``.patent-checker`` directory to read. Resolved from
@@ -74,7 +78,7 @@ def status(
     """
     base = config.data_base() if data_base is None else data_base
     root = base / LEDGER_DIRNAME
-    names = summarizable_targets(root)
+    names = checkable_targets(root)
     wanted = names if target is None else [name for name in names if name == target]
     day = date.today() if today is None else today
     return {

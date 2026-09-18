@@ -17,7 +17,7 @@ the previous run goes into "Changes since the previous exploration".
 # [Target name] — Prior-art exploration report
 
 - Date: [YYYY-MM-DD]
-- Run: [baseline / follow-up] — run [n] of this target, id [run_id]
+- Run: [baseline / follow-up / imported] — run [n] of this target, id [run_id]
 - Previous report: [file name and date, or "none — first exploration"]
 - Performed by: [tool name + version, mode (standard / degraded)]
 - Target: [repository / version / commit / license / size]
@@ -33,7 +33,7 @@ the previous run goes into "Changes since the previous exploration".
 > This document is not an opinion by a patent attorney or lawyer and states
 > no legal conclusion. It is a record of procedure — which queries were
 > run, and what they returned — not an assurance of non-infringement. The
-> "reads-on / lacks / unclear" entries in the element tables are
+> "reads-on direction / lacks / unclear" entries in the element tables are
 > observations about claim wording, not conclusions about infringement.
 > The scope of this exploration is limited as stated in §3; what exists
 > outside that scope is unknown. Consult a patent attorney for any decision

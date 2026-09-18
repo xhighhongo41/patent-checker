@@ -50,7 +50,7 @@ from fastmcp.exceptions import ToolError
 from patent_checker import __version__, service, utils, validation, watch
 from patent_checker.cache import format_ttl
 from patent_checker.config import ConfigError
-from patent_checker.ops.client import MAX_RANGE_END, MAX_RANGE_SPAN
+from patent_checker.ops.client import MAX_RANGE_END, MAX_RANGE_SPAN, OpsServiceBlocked
 from patent_checker.pubnum import parse_pubnum
 from patent_checker.validation import InvalidInput
 
@@ -126,9 +126,12 @@ def _mapped_errors() -> Iterator[None]:
       an element OPS did not send, a number that is not one, a stored page
       that is not UTF-8 any more. Retrying with different arguments would not
       fix them, so they are reported as :data:`ERROR_UPSTREAM_DATA`.
-    - :class:`~patent_checker.config.ConfigError` (OPS is not configured) and
-      :class:`httpx.HTTPError` (the call itself failed) keep their own
-      prefixes.
+    - :class:`~patent_checker.config.ConfigError` (OPS is not configured),
+      :class:`httpx.HTTPError` (the call itself failed) and
+      :class:`~patent_checker.ops.client.OpsServiceBlocked` (OPS is
+      currently blocking this service, locally refused before any request)
+      keep their own prefixes; the last two share :data:`ERROR_EXTERNAL_API`,
+      since retrying now would not help either way.
 
     A ``ToolError`` raised further in is passed through unchanged, and any
     other exception propagates so FastMCP can mask it.
@@ -141,6 +144,8 @@ def _mapped_errors() -> Iterator[None]:
         raise ToolError(f"{ERROR_INVALID_INPUT}: {exc}") from exc
     except ConfigError as exc:
         raise ToolError(f"{ERROR_OPS_NOT_CONFIGURED}: {exc}") from exc
+    except OpsServiceBlocked as exc:
+        raise ToolError(f"{ERROR_EXTERNAL_API}: {exc}") from exc
     except httpx.HTTPError as exc:
         raise ToolError(f"{ERROR_EXTERNAL_API}: {exc}") from exc
     except KeyError as exc:
@@ -673,6 +678,17 @@ def usage_report(since: str | None = None, *, ctx: Context) -> dict[str, Any]:
     "by_kind", "by_status", "non_green_events", "system_states", "first_at",
     "last_at", "today", "skipped_lines"}``, plus ``"since"`` (the local bound
     the comparison used) and ``"undated_lines"`` when *since* is given.
+
+    The result also carries ``"pacing"``: the state shared across every
+    ``patent-checker`` process of the current user, not only this session --
+    ``{"available", "path", "upstreams": {"ops": {...}, "gp": {...}}}``,
+    each upstream reporting ``"last_request_at"`` (per service), any
+    ``"cool_down_until"``, any ``"intervals"`` an upstream asked to be
+    tightened to, and ``"blocked"`` (per service: ``"until"`` and
+    ``"reason"``) for a service currently refused. Check
+    ``pacing.upstreams.ops.blocked`` before starting a batch of searches:
+    a service listed there is being refused locally until its ``"until"``
+    time, and sending more requests to it now would only prolong the block.
 
     Args:
         since: Optional ISO 8601 date (``"2026-09-17"``) or date-time; when
