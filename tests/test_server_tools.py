@@ -27,14 +27,14 @@ from fastmcp.exceptions import ToolError
 from mcp import MCPError
 
 import patent_checker
-from patent_checker import cache, config, service, utils, validation
+from patent_checker import cache, config, pacing, service, utils, validation
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.gp.fetch import FetchedPage
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
 from patent_checker.net import AllowlistTransport, HostNotAllowedError
-from patent_checker.ops.client import MIN_INTERVAL_SECONDS, OpsClient
+from patent_checker.ops.client import MIN_INTERVAL_SECONDS, OpsClient, OpsServiceBlocked
 from patent_checker.ops.parse import (
     OpsBiblio,
     OpsFamily,
@@ -773,6 +773,17 @@ def test_usage_report_invalid_since_is_invalid_input(
     assert str(exc_info.value).startswith(f"{tools.ERROR_INVALID_INPUT}:")
 
 
+def test_usage_report_carries_the_shared_pacing_state(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """usage_report's result also reports the shared pacing state, for an agent to check first."""
+    mcp = build_server(settings, state=make_state())
+
+    data = _call(mcp, "usage_report")
+
+    assert data["pacing"] == {"available": False, "path": str(pacing.Pacer().path), "upstreams": {}}
+
+
 def test_server_status_reports_the_running_configuration(
     settings: ServerSettings, make_state: Any, tmp_path: Path
 ) -> None:
@@ -1032,6 +1043,21 @@ def test_transport_failures_are_reported_as_external_api_errors(
     message = str(exc_info.value)
     assert message.startswith(f"{tools.ERROR_EXTERNAL_API}:")
     assert "connection refused" in message
+
+
+def test_ops_service_blocked_is_reported_as_an_external_api_error(
+    settings: ServerSettings, make_state: Any
+) -> None:
+    """OpsServiceBlocked from the OPS call becomes external_api_error, naming the retry time."""
+    stub = _StubOpsClient(search=OpsServiceBlocked("search", time.time() + 60))
+    mcp = build_server(settings, state=make_state(ops_client=stub))
+
+    with pytest.raises(ToolError) as exc_info:
+        _call(mcp, "ops_search", {"cql": "ti=drone"})
+
+    message = str(exc_info.value)
+    assert message.startswith(f"{tools.ERROR_EXTERNAL_API}:")
+    assert "retry after" in message
 
 
 @pytest.mark.parametrize(

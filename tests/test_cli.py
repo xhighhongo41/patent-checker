@@ -14,6 +14,7 @@ import io
 import json
 import os
 import sys
+import time
 from collections.abc import Iterator
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,13 +28,14 @@ import pytest
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 import patent_checker.server.tools as server_tools
-from patent_checker import consent, installer, service
+from patent_checker import consent, installer, pacing, service
 from patent_checker.cache import Cache, default_cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable
 from patent_checker.gp.parse import GPatentDoc
 from patent_checker.models import Claim
+from patent_checker.ops.client import OpsServiceBlocked
 from patent_checker.ops.parse import (
     OpsBiblio,
     OpsFamily,
@@ -982,14 +984,56 @@ def test_verify_accepts_output_records_carrying_a_pub_key(
 
 
 def test_usage_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
-    """usage prints utils.usage_report()'s result verbatim."""
+    """usage prints utils.usage_report()'s result plus the shared pacing state."""
     fake = {"available": False, "path": "/tmp/headers.jsonl"}
     monkeypatch.setattr(service, "usage_report", lambda: fake)
 
     rc, data = _invoke(["usage"], capsys)
 
     assert rc == 0
-    assert data == fake
+    assert data == {
+        **fake,
+        "pacing": {"available": False, "path": str(pacing.Pacer().path), "upstreams": {}},
+    }
+
+
+def test_usage_reports_a_blocked_service_in_the_pacing_state(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """usage's "pacing" surfaces a block recorded through Pacer.note, for an agent to check first.
+
+    The autouse ``_isolate_pacing_dir`` fixture already points the default
+    shared-state directory at this test's own ``tmp_path``, so the plain
+    default :class:`~patent_checker.pacing.Pacer` used here is the same one
+    the CLI's ``usage`` command will read.
+    """
+    monkeypatch.setattr(service, "usage_report", lambda: {"available": False, "path": "/tmp/x"})
+    pacer = pacing.Pacer()
+    pacer.note("ops", "search", block_until=time.time() + 60, block_reason="HTTP 403")
+
+    rc, data = _invoke(["usage"], capsys)
+
+    assert rc == 0
+    assert data["pacing"]["available"] is True
+    assert data["pacing"]["upstreams"]["ops"]["blocked"]["search"]["reason"] == "HTTP 403"
+
+
+def test_ops_service_blocked_is_reported_as_external_api_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """OpsServiceBlocked from the OPS call is reported as external_api_error, exit code 3."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(
+        cli_main,
+        "OpsClient",
+        lambda: _StubOpsClient(search=OpsServiceBlocked("search", time.time() + 60)),
+    )
+
+    rc, data = _invoke(["search", "ti=drone"], capsys)
+
+    assert rc == 3
+    assert data["error"]["type"] == "external_api_error"
+    assert "retry after" in data["error"]["message"]
 
 
 def test_usage_since_is_forwarded_to_the_service(

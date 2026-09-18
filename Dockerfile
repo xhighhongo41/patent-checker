@@ -81,11 +81,15 @@ RUN useradd --uid 1000 --user-group --create-home app \
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
 
+# PATENT_CHECKER_PACING_DIR is pinned under /data because the root
+# filesystem is read-only (see compose.yaml); /data is the one writable
+# volume, so that is where the shared pacing state has to live too.
 ENV PATH="/app/.venv/bin:$PATH" \
     PATENT_CHECKER_DATA_DIR=/data \
     PATENT_CHECKER_SERVER_HOST=0.0.0.0 \
     PATENT_CHECKER_SERVER_ALLOWED_HOSTS=localhost,127.0.0.1 \
-    PATENT_CHECKER_LOG_LEVEL=info
+    PATENT_CHECKER_LOG_LEVEL=info \
+    PATENT_CHECKER_PACING_DIR=/data/pacing
 
 USER app
 WORKDIR /data

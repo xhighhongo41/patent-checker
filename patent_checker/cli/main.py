@@ -18,7 +18,9 @@ code encodes the same distinction:
 - ``2``: invalid input (a ``ValueError``, including a malformed argument
   argparse itself rejects) or a file that could not be read or written
   (an ``OSError``, error type ``io_error``, message naming the path).
-- ``3``: an external API call failed (``httpx.HTTPError``).
+- ``3``: an external API call failed (``httpx.HTTPError``), or OPS is
+  locally refused because it is currently blocked
+  (:class:`~patent_checker.ops.client.OpsServiceBlocked`).
 - ``4``: configuration is missing or invalid (``patent_checker.config.
   ConfigError``): EPO OPS credentials for an OPS-backed command (error type
   ``ops_not_configured``), or any other invalid configuration -- MCP server
@@ -57,7 +59,7 @@ import httpx
 from patent_checker import __version__, cleanup, config, consent, installer, ledger, service
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
-from patent_checker.ops.client import OpsClient
+from patent_checker.ops.client import OpsClient, OpsServiceBlocked
 from patent_checker.validation import validate_batch
 
 
@@ -1119,6 +1121,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         _print_json(_error_result(error_type, str(exc)))
         return 4
+    except OpsServiceBlocked as exc:
+        # OPS is refusing this service locally (a shared block another
+        # process recorded, or one this call itself just triggered): the
+        # same envelope and exit code as any other failed external call,
+        # its message already names the service and the retry time.
+        _print_json(_error_result("external_api_error", str(exc)))
+        return 3
     except httpx.HTTPError as exc:
         _print_json(_error_result("external_api_error", str(exc)))
         return 3

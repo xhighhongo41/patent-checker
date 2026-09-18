@@ -227,7 +227,21 @@ if [ "$CONSENT_EXIT" -ne 4 ]; then
 fi
 echo "PASS: an unacknowledged operator notice stops the server with exit code 4"
 
-# --- 10. the hardening in compose.yaml is in effect --------------------------
+# --- 10. the shared pacing state lives on the writable volume ---------------
+
+# `usage` needs no OPS credentials and is not `serve`, so it starts without
+# the operator-consent gate; run it once inside the container to check that
+# PATENT_CHECKER_PACING_DIR=/data/pacing (set in the Dockerfile) resolves to
+# a path under the one writable volume, on the read-only root filesystem.
+USAGE_OUT=$(compose run --rm -T patent-checker usage) \
+    || fail "patent-checker usage did not run inside the container"
+case "$USAGE_OUT" in
+    *'"pacing"'*'"path"'*'"/data/pacing/state.json"'*) ;;
+    *) fail "usage did not report the pacing state under /data/pacing: $USAGE_OUT" ;;
+esac
+echo "PASS: usage reports the shared pacing state under /data/pacing"
+
+# --- 11. the hardening in compose.yaml is in effect --------------------------
 
 CID=$(compose ps --quiet patent-checker)
 [ -n "$CID" ] || fail "could not find the running patent-checker container"
@@ -240,7 +254,7 @@ case "$INSPECT" in
 esac
 echo "PASS: root filesystem read-only, capabilities dropped, no-new-privileges set"
 
-# --- 11. the LAN/TLS example is a valid compose file ------------------------
+# --- 12. the LAN/TLS example is a valid compose file ------------------------
 
 LAN="$TMP/lan"
 mkdir -p "$LAN/secrets"

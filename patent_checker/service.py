@@ -50,7 +50,7 @@ from typing import Any
 
 import httpx
 
-from patent_checker import validation
+from patent_checker import pacing, validation
 from patent_checker.cache import (
     Cache,
     CacheHit,
@@ -888,8 +888,13 @@ def verify(input_pubs: Sequence[Any], output_records: Sequence[Any]) -> dict[str
     return verify_batch(input_pubs, output_records)
 
 
-def usage(headers_path: Path | None = None, since: str | None = None) -> dict[str, Any]:
-    """Summarize the local OPS request-header log.
+def usage(
+    headers_path: Path | None = None,
+    since: str | None = None,
+    *,
+    pacer: pacing.Pacer | None = None,
+) -> dict[str, Any]:
+    """Summarize the local OPS request-header log and the shared pacing state.
 
     Args:
         headers_path: Log file to read. The default location used by
@@ -898,9 +903,19 @@ def usage(headers_path: Path | None = None, since: str | None = None) -> dict[st
         since: Optional ISO 8601 date or date-time (see
             :func:`patent_checker.validation.parse_since`); when given, only
             requests at or after it are summarized.
+        pacer: The pacer whose :meth:`~patent_checker.pacing.Pacer.summary`
+            becomes ``"pacing"``; ``None`` (the default) uses a fresh
+            :class:`~patent_checker.pacing.Pacer` bound to the default
+            shared-state directory. Exists so a test can bind one to a
+            temporary directory instead.
 
     Returns:
-        :func:`patent_checker.utils.usage_report`'s summary.
+        :func:`patent_checker.utils.usage_report`'s summary, plus
+        ``"pacing"``: the shared pacing state across every
+        ``patent-checker`` process of the current user -- the last request
+        time per service, any cool-down, any interval an upstream asked to
+        be tightened to, and any service an upstream has blocked, with the
+        time to retry. Reading it never writes to that state.
 
     Raises:
         ValueError: If *since* is given and is not a parseable ISO 8601
@@ -910,5 +925,8 @@ def usage(headers_path: Path | None = None, since: str | None = None) -> dict[st
     # Resolving the default headers_path is usage_report's job, so omit the
     # argument entirely rather than forwarding None.
     if headers_path is None:
-        return usage_report(**since_kwargs)
-    return usage_report(headers_path, **since_kwargs)
+        report = usage_report(**since_kwargs)
+    else:
+        report = usage_report(headers_path, **since_kwargs)
+    effective_pacer = pacing.Pacer() if pacer is None else pacer
+    return {**report, "pacing": effective_pacer.summary()}
