@@ -15,12 +15,22 @@ code encodes the same distinction:
 
 - ``0``: success (this includes ``claims`` reporting a document as
   unavailable -- "could not be fetched" is itself a valid, non-error result).
-- ``2``: invalid input (a ``ValueError``, including a malformed argument
-  argparse itself rejects) or a file that could not be read or written
-  (an ``OSError``, error type ``io_error``, message naming the path).
-- ``3``: an external API call failed (``httpx.HTTPError``), or OPS is
+- ``2``: invalid input -- a malformed argument, whether argparse itself
+  rejects it, this module's own pre-service checks reject it (a
+  publication number ``biblio``/``claims``/``legal``/``family``/``watch``/
+  ``normalize`` cannot parse, an oversized or misshapen batch payload), or
+  a ``ValueError`` reaches here from anywhere else without having passed
+  such a check -- or a file that could not be read or written (an
+  ``OSError``, error type ``io_error``, message naming the path).
+- ``3``: an external API call failed (``httpx.HTTPError``), OPS is
   locally refused because it is currently blocked
-  (:class:`~patent_checker.ops.client.OpsServiceBlocked`).
+  (:class:`~patent_checker.ops.client.OpsServiceBlocked`), or error type
+  ``upstream_data``: what was fetched could not be read (a ``KeyError``,
+  ``TypeError`` or ``UnicodeDecodeError`` from a corrupt cache entry or
+  unexpected upstream markup), including a ``ValueError`` raised by the
+  service layer for one of the six commands above once its own
+  publication-number check has already passed -- that case, unlike a
+  malformed argument, cannot be fixed by retrying with different input.
 - ``4``: configuration is missing or invalid (``patent_checker.config.
   ConfigError``): EPO OPS credentials for an OPS-backed command (error type
   ``ops_not_configured``), or any other invalid configuration -- MCP server
@@ -47,9 +57,11 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shutil
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -57,10 +69,52 @@ from typing import Any
 import httpx
 
 from patent_checker import __version__, cleanup, config, consent, installer, ledger, service
+from patent_checker.cache import KINDS as CACHE_KINDS
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
 from patent_checker.ops.client import OpsClient, OpsServiceBlocked
-from patent_checker.validation import validate_batch
+from patent_checker.pubnum import parse_pubnum
+from patent_checker.validation import InvalidInput, validate_batch
+
+# C0 controls and DEL, rejected in a publication-number argument for the same
+# reason :mod:`patent_checker.server.tools` rejects them in an MCP argument.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+class _UpstreamValueError(Exception):
+    """A plain ``ValueError`` that escaped the service layer after this command's own check passed.
+
+    Deliberately *not* a ``ValueError`` itself: wrapping it in a distinct
+    type is what lets :func:`main` route it to the ``upstream_data`` error
+    type (exit code 3) through a dedicated ``except`` clause, without
+    touching the plain ``except ValueError`` clause every other subcommand
+    still relies on for its own, unrelated argument checks (``consent
+    record``'s language, ``cache clear``'s ``--older-than``, and so on).
+    """
+
+
+@contextmanager
+def _reclassify_service_value_errors() -> Iterator[None]:
+    """Turn a bare ``ValueError`` raised while calling the service layer into upstream_data.
+
+    Used by the handlers of the publication-number subcommands (``biblio``,
+    ``claims``, ``legal``, ``family``, ``watch``, ``normalize``) once their
+    own argument has already been checked by :func:`_check_pub`: from this
+    point on, a ``ValueError`` means the service layer could not make sense
+    of what it read (a malformed OPS/Google Patents response, in practice),
+    not that the caller's argument was wrong.
+
+    :class:`~patent_checker.validation.InvalidInput` is left untouched and
+    still reaches :func:`main`'s ``except ValueError`` clause: it already
+    names its own kind of caller mistake (an oversized ``--previous`` batch,
+    an unparseable ``--since``) and must stay ``invalid_input``.
+    """
+    try:
+        yield
+    except InvalidInput:
+        raise
+    except ValueError as exc:
+        raise _UpstreamValueError(str(exc)) from exc
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -259,6 +313,34 @@ def _check_output_records(records: Sequence[Any], label: str) -> None:
             raise ValueError(f'{label}[{index}] has no "pub" key')
 
 
+def _check_pub(pub: Any, label: str = "pub") -> None:
+    """Check that *pub* is a publication number this toolkit can parse.
+
+    Applied by every subcommand that takes a publication number, before any
+    client or cache is built, so a malformed argument is refused the same
+    way on the CLI as it already is on the MCP server (see
+    :func:`patent_checker.server.tools._validate_pub`).
+
+    Raises:
+        ValueError: If *pub* is not a string, is empty (or blank), contains
+            a control character, or cannot be parsed.
+    """
+    if not isinstance(pub, str):
+        raise ValueError(f"{label} must be a string, got {type(pub).__name__}")
+    if not pub.strip():
+        raise ValueError(f"{label} must not be empty")
+    match = _CONTROL_CHARACTERS.search(pub)
+    if match is not None:
+        raise ValueError(f"{label} contains a control character at position {match.start()}")
+    try:
+        parse_pubnum(pub)
+    except ValueError as exc:
+        # parse_pubnum's own message already names the value; the label is
+        # prefixed too, so a bad element among several (watch's pubs[1], for
+        # instance) can be told apart from the others by position.
+        raise ValueError(f"{label}: {exc}") from exc
+
+
 def _read_query_file(path: str) -> list[str]:
     """Return the CQL queries in *path*, one per non-empty, non-comment line."""
     lines = Path(path).read_text(encoding="utf-8").splitlines()
@@ -314,7 +396,8 @@ def _cmd_plan_check(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_biblio(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch bibliographic data for one publication."""
-    with _ops_client() as client:
+    _check_pub(args.pub)
+    with _ops_client() as client, _reclassify_service_value_errors():
         return service.biblio(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
@@ -324,23 +407,27 @@ def _cmd_claims(args: argparse.Namespace) -> dict[str, Any]:
     See the module docstring's exit-code note: an unavailable document is a
     normal (exit 0) result, not an error.
     """
+    _check_pub(args.pub)
     # An OPS client is only built when the fallback route could actually be
     # taken; the Google Patents route needs no credentials.
     if service.ops_fulltext_candidate(args.pub) and ops_configured():
-        with OpsClient() as client:
+        with OpsClient() as client, _reclassify_service_value_errors():
             return service.claims(args.pub, client=client, cache=_cache(), refresh=args.refresh)
-    return service.claims(args.pub, cache=_cache(), refresh=args.refresh)
+    with _reclassify_service_value_errors():
+        return service.claims(args.pub, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_legal(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch INPADOC legal-status events for one publication."""
-    with _ops_client() as client:
+    _check_pub(args.pub)
+    with _ops_client() as client, _reclassify_service_value_errors():
         return service.legal(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
 def _cmd_family(args: argparse.Namespace) -> dict[str, Any]:
     """Fetch the simple patent family of one publication."""
-    with _ops_client() as client:
+    _check_pub(args.pub)
+    with _ops_client() as client, _reclassify_service_value_errors():
         return service.family(args.pub, client=client, cache=_cache(), refresh=args.refresh)
 
 
@@ -353,13 +440,16 @@ def _cmd_watch(args: argparse.Namespace) -> dict[str, Any]:
     which is where the same rules apply to the MCP server.
 
     Raises:
-        ValueError: If a publication number, the stored snapshots or
-            ``--since`` is not what the service layer accepts.
+        ValueError: If a publication number (named by its position, e.g.
+            ``pubs[1]``), the stored snapshots or ``--since`` is not what
+            this command or the service layer accepts.
     """
+    for index, pub in enumerate(args.pubs):
+        _check_pub(pub, label=f"pubs[{index}]")
     previous = None
     if args.previous is not None:
         previous = _read_json_array(args.previous, allow_stdin=True)
-    with _ops_client() as client:
+    with _ops_client() as client, _reclassify_service_value_errors():
         return service.watch(
             args.pubs,
             previous=previous,
@@ -375,7 +465,9 @@ def _cmd_watch(args: argparse.Namespace) -> dict[str, Any]:
 
 def _cmd_normalize(args: argparse.Namespace) -> dict[str, Any]:
     """Parse a publication number and return every spelling used across sources."""
-    return service.normalize(args.text)
+    _check_pub(args.text, label="text")
+    with _reclassify_service_value_errors():
+        return service.normalize(args.text)
 
 
 def _cmd_dedup(args: argparse.Namespace) -> dict[str, Any]:
@@ -567,10 +659,10 @@ def _cmd_cache_clear(args: argparse.Namespace) -> dict[str, Any]:
     selected entries are listed so a caller can review them first.
 
     Raises:
-        ValueError: If ``--older-than`` is negative, an unknown ``--kind``
-            is given, or ``--pub`` is not a parseable publication number
-            (all propagated from :meth:`Cache.select`, except the
-            ``--older-than`` sign check done here).
+        ValueError: If ``--older-than`` is negative, or ``--pub`` is not a
+            parseable publication number (propagated from
+            :meth:`Cache.select`). An unknown ``--kind`` never reaches this
+            handler: it is rejected by argparse's own ``choices``.
     """
     if args.older_than is not None and args.older_than < 0:
         raise ValueError(f"--older-than must not be negative, got {args.older_than}")
@@ -1005,7 +1097,11 @@ def _add_cache_parser(subparsers: argparse._SubParsersAction) -> None:
         "clear", help="Delete cache entries matching filters (dry run unless --yes)"
     )
     clear_parser.add_argument(
-        "--kind", action="append", default=None, help="Restrict to this cache kind (repeatable)"
+        "--kind",
+        action="append",
+        choices=CACHE_KINDS,
+        default=None,
+        help="Restrict to this cache kind (repeatable)",
     )
     clear_parser.add_argument(
         "--older-than",
@@ -1102,11 +1198,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         _print_json(_error_result("invalid_input", str(exc)))
         return 2
-    except (KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (_UpstreamValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
         # The document was fetched but could not be read (unexpected markup,
-        # a corrupt cache entry): not the caller's input, not a service
-        # outage either, so it gets its own type and the external-failure
-        # exit code, never a traceback.
+        # a corrupt cache entry, or -- once a publication-number argument
+        # has already passed this command's own check -- a plain ValueError
+        # raised by the service layer itself): not the caller's input, not a
+        # service outage either, so it gets its own type and the
+        # external-failure exit code, never a traceback.
         _print_json(_error_result("upstream_data", f"upstream data could not be read: {exc}"))
         return 3
     except ConfigError as exc:

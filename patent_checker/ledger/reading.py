@@ -22,7 +22,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from patent_checker.ledger.layout import DATE_RE, MANIFEST_FILENAME, SHOWN_LENGTH
+from patent_checker.ledger.layout import DATE_RE, SHOWN_LENGTH
 from patent_checker.pubnum import PubNumber, parse_pubnum
 
 
@@ -132,13 +132,14 @@ def sorted_names(directory: Path, predicate: Callable[[Path], bool]) -> list[str
     return [child.name for child in children if predicate(child)]
 
 
-def summarizable_targets(root: Path) -> list[str]:
-    """Return the target names :func:`status` reports: a directory with a manifest."""
-    return sorted_names(root, lambda child: (child / MANIFEST_FILENAME).is_file())
-
-
 def checkable_targets(root: Path) -> list[str]:
-    """Return the target names :func:`check` reads: every directory under ``ledger/``."""
+    """Return the target names :func:`check` and :func:`status` both read.
+
+    Every directory under ``ledger/`` counts, whether or not it holds a
+    manifest yet: a target that has not written ``ledger.json`` is still
+    something to report on (as a problem), not something to hide from the
+    caller.
+    """
     return sorted_names(root, lambda child: child.is_dir())
 
 

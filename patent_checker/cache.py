@@ -769,7 +769,20 @@ class Cache:
         return found
 
     def stats(self) -> dict[str, Any]:
-        """Return counts and byte totals of every kind, ready to serialize as JSON."""
+        """Return counts and byte totals of every kind, ready to serialize as JSON.
+
+        Each publication-keyed kind also reports ``no_kind_code`` and
+        ``no_kind_code_expired``: how many of its entries are stored under a
+        key that names no kind code (``EP.1234567`` rather than
+        ``EP.1234567.B1``) and how many of those are expired. For a
+        never-expiring kind (``claims``, ``gp``) such an entry actually
+        expires with the ``family`` TTL instead of living forever
+        (:func:`effective_ttl`), which the plain ``expired``/``entries``
+        counts above do not single out; both new counts read
+        :attr:`CacheEntry.expired`, which already applies that rule, so it
+        is not repeated here. Search-keyed kinds have no kind code to speak
+        of and always report ``0`` for both.
+        """
         kinds_stats: dict[str, Any] = {}
         totals = {"entries": 0, "bytes": 0, "expired": 0, "broken": 0}
         for kind in KINDS:
@@ -780,6 +793,11 @@ class Cache:
             n_bytes = sum(entry.size for entry in kind_entries)
             n_expired = sum(1 for entry in kind_entries if entry.expired)
             n_broken = sum(1 for entry in kind_entries if entry.broken)
+            no_kind_code_entries = (
+                [entry for entry in kind_entries if not key_has_kind_code(entry.key)]
+                if kind in PUB_KINDS
+                else []
+            )
             kinds_stats[kind] = {
                 "root": "local" if kind in LOCAL_KINDS else "shared",
                 "dir": str(self.root_for(kind) / kind_subdir(kind)),
@@ -789,6 +807,8 @@ class Cache:
                 "broken": n_broken,
                 "oldest": min(fetched_ats) if fetched_ats else None,
                 "newest": max(fetched_ats) if fetched_ats else None,
+                "no_kind_code": len(no_kind_code_entries),
+                "no_kind_code_expired": sum(1 for entry in no_kind_code_entries if entry.expired),
             }
             totals["entries"] += len(kind_entries)
             totals["bytes"] += n_bytes

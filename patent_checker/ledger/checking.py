@@ -18,6 +18,7 @@ from typing import Any
 from patent_checker import config
 from patent_checker.ledger.findings import FileFindings, Findings, Ledger, target_report
 from patent_checker.ledger.layout import (
+    DATE_RE,
     FAMILIES_FILENAME,
     FEATURES_FILENAME,
     LEDGER_DIRNAME,
@@ -229,13 +230,18 @@ def _check_manifest_values(ff: FileFindings, record: Mapping[str, Any], name: st
                 f'"target" is {shown(value)} but the directory is named {shown(name)}; '
                 "the two must agree",
             )
-    if require(ff, None, record, "created_at") and as_timestamp(record["created_at"]) is None:
-        ff.error(
-            None,
-            "manifest",
-            f'"created_at" is {shown(record["created_at"])}; expected an ISO 8601 '
-            "timestamp such as 2026-03-01T09:30:00+00:00",
-        )
+    if require(ff, None, record, "created_at"):
+        created_at = record["created_at"]
+        # A date-only value is a date, not a timestamp (the same rule as
+        # values.check_timestamp applies to the record files).
+        date_only = isinstance(created_at, str) and DATE_RE.match(created_at) is not None
+        if date_only or as_timestamp(created_at) is None:
+            ff.error(
+                None,
+                "manifest",
+                f'"created_at" is {shown(created_at)}; expected an ISO 8601 '
+                "date-time such as 2026-03-01T09:30:00+00:00",
+            )
 
 
 def _check_translation(directory: Path, findings: Findings) -> None:

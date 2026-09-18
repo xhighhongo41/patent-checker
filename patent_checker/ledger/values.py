@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from patent_checker.ledger.findings import FileFindings, Ledger
-from patent_checker.ledger.layout import FEATURES_FILENAME, RUNS_FILENAME
+from patent_checker.ledger.layout import DATE_RE, FEATURES_FILENAME, RUNS_FILENAME
 from patent_checker.ledger.reading import as_date, as_pubnum, as_timestamp, shown
 
 
@@ -78,12 +78,21 @@ def check_date(ff: FileFindings, line: int, value: Any, label: str) -> None:
 
 
 def check_timestamp(ff: FileFindings, line: int, value: Any, label: str) -> None:
-    """Report a value that should be a timestamp and is not."""
-    if as_timestamp(value) is None:
+    """Report a value that should be a full date-time and is not.
+
+    ``datetime.fromisoformat`` (what :func:`as_timestamp` uses) reads a
+    date-only string such as ``"2026-03-01"`` as that day's midnight, but
+    the ledger format reserves the date-only spelling for date fields
+    (:func:`check_date`); a timestamp field must carry a time part too, so a
+    date-only value is rejected here even though ``as_timestamp`` alone
+    would accept it.
+    """
+    is_date_only = isinstance(value, str) and DATE_RE.match(value) is not None
+    if is_date_only or as_timestamp(value) is None:
         ff.error(
             line,
             "timestamp",
-            f"{label} is {shown(value)}; expected an ISO 8601 timestamp such as "
+            f"{label} is {shown(value)}; expected an ISO 8601 date-time such as "
             "2026-03-01T09:30:00+00:00",
         )
 

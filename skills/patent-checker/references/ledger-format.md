@@ -49,9 +49,11 @@ clean` keeps it, and `patent-checker clean --include-artifacts` removes it.
 - Identifiers are stable. An `F` or `Q` number is never reused or
   renumbered; a feature that disappeared is marked `retired`, a query no
   longer run is marked `dropped`.
-- Dates are `YYYY-MM-DD`. Timestamps are ISO 8601 with a UTC offset
-  (`2026-03-01T09:30:00+00:00`), copied from tool results where they come
-  from one (`fetched_at`).
+- Dates are `YYYY-MM-DD`, a day alone. Timestamps are a full ISO 8601 date
+  and time, normally with a UTC offset (`2026-03-01T09:30:00+00:00`),
+  copied from tool results where they come from one (`fetched_at`); a date
+  alone is not a timestamp, even though it would parse as that day's
+  midnight.
 - Publication numbers are written in the DOCDB spelling (`CC.number.KK`,
   for example `EP.9999999.B1`). Copy them from tool results — the `pub` of
   `watch_check`, `get_legal` and search hits, the `pub_docdb` of

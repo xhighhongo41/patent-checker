@@ -354,6 +354,44 @@ def test_biblio_success(
     assert data["raw_path"] is None
 
 
+def _fail_if_constructed() -> _StubOpsClient:
+    """Raise loudly: used to prove a client was never built for a rejected argument."""
+    raise AssertionError("the OPS client must not be constructed for an invalid publication")
+
+
+def test_biblio_unparseable_pub_is_invalid_input_and_builds_no_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unparseable publication number is rejected before any client is built."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", _fail_if_constructed)
+
+    rc, data, err = _invoke_with_stderr(["biblio", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_biblio_bare_value_error_from_the_service_layer_is_upstream_data(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ValueError raised below the service layer, after the pub check passed, is upstream_data."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", lambda: _StubOpsClient(biblio=b"<xml/>"))
+
+    def _raise(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise ValueError("cannot parse OPS biblio body")
+
+    monkeypatch.setattr(service, "biblio", _raise)
+
+    rc, data = _invoke(["biblio", "US.1.A1"], capsys)
+
+    assert rc == 3
+    assert data["error"]["type"] == "upstream_data"
+    assert "upstream data could not be read" in data["error"]["message"]
+
+
 def test_legal_success(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     """legal prints one asdict entry per event, keyed under events, plus raw_path."""
     monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
@@ -499,6 +537,21 @@ def test_watch_unparseable_publication_is_invalid_input(
 
     assert rc == 2
     assert data["error"]["type"] == "invalid_input"
+    assert "Traceback" not in err
+
+
+def test_watch_one_bad_element_among_good_ones_names_it_and_builds_no_client(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A single unparseable pub among otherwise valid ones is named by position."""
+    monkeypatch.setattr(cli_main, "ops_configured", lambda: True)
+    monkeypatch.setattr(cli_main, "OpsClient", _fail_if_constructed)
+
+    rc, data, err = _invoke_with_stderr(["watch", "US.1.A1", "not-a-pub"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "pubs[1]" in data["error"]["message"]
     assert "Traceback" not in err
 
 
@@ -1719,10 +1772,14 @@ def test_cache_clear_negative_older_than_is_invalid_input(
 
 
 def test_cache_clear_unknown_kind_is_invalid_input(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An unknown --kind is rejected (via Cache.select's ValueError) as invalid_input."""
-    monkeypatch.setattr(cli_main, "_cache", lambda: Cache(tmp_path / "cache"))
+    """An unknown --kind is rejected by argparse's choices, before the handler ever runs."""
+
+    def _fail() -> Cache:
+        raise AssertionError("the handler must not run for an unknown --kind")
+
+    monkeypatch.setattr(cli_main, "_cache", _fail)
 
     rc, data = _invoke(["cache", "clear", "--kind", "bogus"], capsys)
 
