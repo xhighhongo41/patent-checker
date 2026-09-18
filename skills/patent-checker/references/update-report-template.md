@@ -13,7 +13,7 @@ and never overwrite an earlier file.
 # [Target name] — Monitoring update
 
 - Date: [YYYY-MM-DD]
-- Run: monitoring — run [n] of this target, id [run_id]
+- Run: monitoring (`watch` in the ledger) — run [n] of this target, id [run_id]
 - Full report this update belongs to: [file name and date]
 - Performed by: [tool name + version, mode]
 - Target: [repository / version / commit — unchanged since the full report]

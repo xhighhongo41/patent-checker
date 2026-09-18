@@ -28,14 +28,15 @@ unless you deliberately share it, and put TLS in front of it if you do.
 
 ## 3. What the server receives and stores
 
-The server receives only search expressions (CQL) and publication numbers,
-and returns patent data derived from public sources. It does not receive,
-and therefore cannot store, the source code, documents, or project
-descriptions of the people who use it. It keeps raw API responses, a request
-log (timestamps, request kinds, URLs, status codes and throttling headers),
-and a cache of retrieved patent data in its data directory. Search
-expressions appear in that log and cache; treat the data directory as
-sensitive to that extent.
+The server receives only public patent data: search expressions (CQL),
+publication and family numbers, dates, and status snapshots the server
+itself returned earlier. It returns patent data derived from public sources.
+It does not receive, and therefore cannot store, the source code, documents,
+or project descriptions of the people who use it. It keeps raw API
+responses, a request log (timestamps, request kinds, URLs, status codes and
+throttling headers), and a cache of retrieved patent data in its data
+directory. Search expressions appear in that log and cache; treat the data
+directory as sensitive to that extent.
 
 ## 4. The consent of the people who use the server
 

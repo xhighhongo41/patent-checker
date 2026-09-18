@@ -16,7 +16,7 @@ Patent Checker は、あなた自身のソフトウェアプロジェクトに�
 
 Patent Checker は**何かが特許を侵害するかどうかを判定しません**。レポートに含まれるのは所見、調査範囲の記述、未解決の問いであり、結論ではありません。
 
-**状態: 安定版(v1.1)。**
+**状態: 安定版(v1.2)。**
 
 ## 重要なお知らせ
 
@@ -35,7 +35,7 @@ your agent ──(Skill: 判断)──► patent-checker MCP サーバー ──
    │                              │  決定論的な取得、             Google Patents
    │  コードを読み、               │  正規化、キャッシュ
    ▼  レポートを書く               ▼
-.patent-checker/reports/…    利用者単位の文書キャッシュ
+.patent-checker/reports/…    共有文書キャッシュ
 ```
 
 1. Skill がコードベースを読み、請求されうる技術的特徴を列挙し、特許の語彙に翻訳して検索式を組み立てます。
@@ -120,7 +120,7 @@ $token = python -c "import secrets; print(secrets.token_urlsafe(32))"
 [IO.File]::WriteAllText("$PWD\secrets\server_token.txt", $token)
 ```
 
-イメージは `ghcr.io/xhighhongo41/patent-checker` と `docker.io/xhighhongo41/patent-checker` に、タグ `X.Y.Z`、`X.Y`、`latest` で公開されています。コンテナ内部では `0.0.0.0` にバインドしますが、Compose はポートを**あなたのマシンのループバックにだけ**公開します(`127.0.0.1:8642`)。サーバーが受け付ける Host ヘッダは `localhost` と `127.0.0.1` だけです。取得した文書、検索結果、リクエストログは名前付きボリューム `patent-checker-data` にあります。コンテナは非特権ユーザーとして、読み取り専用のファイルシステムで、Linux のケーパビリティをすべて落として動きます。お使いの Docker エンジンがこれらの設定を受け付けない場合、`compose.yaml` の `# Hardening` 以下の 4 行は、サーバーの動作を変えずに削除できます。
+イメージは `ghcr.io/xhighhongo41/patent-checker` と `docker.io/xhighhongo41/patent-checker` に、タグ `X.Y.Z`、`X.Y`、`latest` で公開されています。コンテナ内部では `0.0.0.0` にバインドしますが、Compose はポートを**あなたのマシンのループバックにだけ**公開します(`127.0.0.1:8642`)。サーバーが受け付ける Host ヘッダは、HTTP 層が常に許可するループバックの名前(`localhost`、`127.0.0.1`、`::1`)と、`PATENT_CHECKER_SERVER_ALLOWED_HOSTS` で追加した名前だけです。取得した文書、検索結果、リクエストログは名前付きボリューム `patent-checker-data` にあります。コンテナは非特権ユーザーとして、読み取り専用のファイルシステムで、Linux のケーパビリティをすべて落として動きます。お使いの Docker エンジンがこれらの設定を受け付けない場合、`compose.yaml` の `# Hardening` 以下の 4 行は、サーバーの動作を変えずに削除できます。
 
 シークレットファイルは起動時に一度だけ読まれます。空の OPS ファイルは「未設定」(縮退モード)を意味します。Linux の Docker Engine を UID 1000 でないアカウントで動かしている場合は、[`secrets/README.md`](secrets/README.md) のファイル所有権の注記を参照してください。
 
@@ -156,7 +156,7 @@ PATENT_CHECKER_OPERATOR_CONSENT=1.0
 
 ## Skill のインストールとエージェントの接続
 
-1 つのコマンドで、コマンドラインツールをインストールし、利用者向け通知を表示し、エージェントが読む場所に Skill をコピーし、MCP サーバーを登録します。
+ブートストラップスクリプトが行うのはコマンドラインツールのインストールで、残りは `patent-checker install` が行います。利用者向け通知を表示し、エージェントが読む場所に Skill をコピーし、MCP サーバーを登録します。
 
 ```sh
 curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.sh | sh
@@ -166,7 +166,9 @@ curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/in
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.ps1 | iex"
 ```
 
-先にスクリプトを読みたい場合は `| sh` の代わりに `| more` で取得するか、スクリプトを使わずに済ませることもできます。スクリプトがするのは uv とツールのインストールだけで、その後インストーラを自分で実行するよう案内します。
+2 つのスクリプトは進むところまでが違います。シェルスクリプトは端末から実行された場合(たとえばダウンロードして実行した場合)、そのまま `patent-checker install` に進みます。上のように `sh` にパイプすると標準入力は端末ではなくパイプになるため、uv とツールのインストールまでを行い、次に実行する `patent-checker install` コマンドを表示します。PowerShell スクリプトはどちらの場合も `patent-checker install` に進みます。
+
+先にスクリプトを読みたい場合は `| sh` の代わりに `| more` で取得するか、スクリプトを使わず次の 2 ステップを自分で実行することもできます。
 
 ```sh
 uv tool install patent-checker
@@ -191,7 +193,7 @@ patent-checker install
 | Codex CLI | `codex mcp add` / 追記 | `~/.codex/config.toml` |
 | OpenHands、Hermes Agent | 貼り付け用スニペット | `config.toml`、`~/.hermes/config.yaml` |
 
-便利なオプション: `--list-agents`(何がどこにインストールされるか)、`--dry-run`(書き込み以外をすべて行う)、`--agent claude-code --agent cursor`(自動検出の代わりに指定。`--agent all` で対応する全エージェント)、`--scope project`(ホームディレクトリではなく現在のプロジェクトにインストール)、`--lang ja`(日本語の通知)、`--no-skill` / `--no-mcp`。インストーラの再実行は安全です。Skill のコピーを更新し、サーバーの項目をその場で更新し、初回に作った元の設定ファイルのバックアップ(`.bak`)は決して上書きしません。唯一の例外は Codex CLI で、既存の項目はそのまま残ります。変更するには `~/.codex/config.toml` を編集してください。
+便利なオプション: `--list-agents`(何がどこにインストールされるか)、`--dry-run`(書き込み以外をすべて行う)、`--agent claude-code --agent cursor`(自動検出の代わりに指定。`--agent all` で対応する全エージェント)、`--scope project`(ホームディレクトリではなく現在のプロジェクトにインストール)、`--lang ja`(日本語の通知)、`--agree`(尋ねずに通知に同意する。尋ねる端末が無いときは必須)、`--no-skill` / `--no-mcp`。インストーラの再実行は安全です。Skill のコピーを更新し、サーバーの項目をその場で更新し、初回に作った元の設定ファイルのバックアップ(`.bak`)は決して上書きしません。唯一の例外は Codex CLI で、既存の項目はそのまま残ります。変更するには `~/.codex/config.toml` を編集してください。
 
 ### ベアラートークンを露出させずに渡す
 
@@ -229,7 +231,7 @@ Skill を `.agents/skills/patent-checker/` としてリポジトリにコミッ�
 
 > patent-checker スキルを使って、このプロジェクトに関連する先行特許を探索して。
 
-Skill はまず同意記録を確認し、(プロジェクトごとに一度)`.patent-checker/` を `.gitignore` に追加するかを尋ね、上の手順を進めて、レポートを `.patent-checker/reports/report-<target>-<YYYYMMDD-HHMM>.md` に書きます。レポートは上書きされません。同じプロジェクトで後日実行すると、新しい日付入りファイルができます。セッションの間はサーバーを動かしたままにしてください。
+Skill はまず同意記録を確認し、(プロジェクトごとに一度)`.patent-checker/` を `.gitignore` に追加するかを尋ね、上の手順を進めて、レポートを `.patent-checker/reports/report-<target>-<YYYYMMDD-HHMM>.md` に書きます。レポートは上書きされません。同じプロジェクトで後日実行すると、新しい日付入りファイルができます。`<target>` は確認する対象の名前で、既定はリポジトリ名です(エージェントと相談して別の名前にすることもできます)。対象ごとに `.patent-checker/ledger/<target>/` に台帳が置かれます。セッションの間はサーバーを動かしたままにしてください。
 
 **規模とコスト。** 中規模プロジェクトの探索 1 回は、コードの読み取り、1 回以上の検索ラウンド、数十件の候補文書の段階的なふるい分けを伴います。エージェントのトラフィックとして 100 万トークン程度(開発中に Claude Code と中規模プロジェクトで計測)を消費すると見込んでください。大半はふるい分けで、エージェントが委譲に対応していれば Skill は最初の段階を小さなモデルに委ねます。1 回の実行は網羅的ではありません。繰り返しの実行、別の検索語彙、専門家による調査は、それぞれ 1 回の実行では見つからないものを見つけます。
 
@@ -260,8 +262,11 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 | `PATENT_CHECKER_SERVER_RPS`、`PATENT_CHECKER_SERVER_BURST` | `5`、`10` | 受け付ける MCP リクエストの上限(暴走したエージェントのループへの備え。上流の間隔制御は別)。 |
 | `PATENT_CHECKER_DATA_DIR` | 利用者単位のデータディレクトリ(サーバー)、`./.patent-checker`(CLI) | 検索キャッシュ、リクエストログ、設定時は共有文書キャッシュ(`<dir>/cache`)。サーバーはそれを動かす利用者のもとに、CLI は実行したプロジェクトのもとにデータを置きます。コンテナイメージは `/data` に設定しています。 |
 | `PATENT_CHECKER_CACHE_DIR` | `<利用者単位データディレクトリ>/cache` | 共有文書キャッシュ(書誌、請求項、権利状態、ファミリー、Google Patents のページ)。プロジェクトをまたいで CLI とサーバーが共通に再利用します。 |
-| `PATENT_CHECKER_CACHE_TTL` | `biblio=90d,claims=0,legal=7d,family=30d,gp=0,search=1d,searchbib=1d` | 種類ごとの有効期限の上書き。`<n>d`、`<n>h`、または `0` = **無期限**(「キャッシュしない」ではありません)。 |
+| `PATENT_CHECKER_CACHE_TTL` | `biblio=90d,claims=0,legal=7d,family=30d,gp=0,search=1d,searchbib=1d` | 種類ごとの有効期限の上書き。`<n>d`、`<n>h`、または `0` = **無期限**(「キャッシュしない」ではありません)。CLI も読みます。 |
+| `PATENT_CHECKER_PACING_DIR` | `<利用者単位データディレクトリ>/pacing` | 上流への間隔制御の共有状態(最後のリクエスト時刻、クールダウン、スロットリングによる待ち)を置くディレクトリ。1 人の利用者のすべての patent-checker プロセスが共有します。コンテナイメージは `/data/pacing` に設定しています。CLI も読みます。 |
 | `PATENT_CHECKER_LOG_LEVEL` | `info` | `debug`、`info`、`warning`、`error`。サーバーのログはすべて標準エラーに出ます。 |
+
+patent-checker 自身のものではない変数も 3 つ尊重します。Linux と macOS では、利用者単位のデータディレクトリは `XDG_DATA_HOME` に従い(`$XDG_DATA_HOME/patent-checker`、未設定なら `~/.local/share/patent-checker`)、利用者単位の同意記録は `XDG_CONFIG_HOME` に従います(`$XDG_CONFIG_HOME/patent-checker/consent.json`、未設定なら `~/.config/patent-checker/consent.json`)。Windows では利用者単位のデータディレクトリは `%LOCALAPPDATA%\patent-checker`(未設定なら `~\AppData\Local\patent-checker`)です。`patent-checker install --lang` の既定値は `LC_ALL` または `LANG` から決まります。
 
 `.env` はすべての `patent-checker` コマンドが、実行ディレクトリかその親から読みます。ホームディレクトリとファイルシステムのルートからは読みません。Compose では認証情報は `secrets/` のファイルから来て、`compose.yaml` と同じ場所の `.env` が `PATENT_CHECKER_OPERATOR_CONSENT`(任意で `PATENT_CHECKER_IMAGE`、`PATENT_CHECKER_PORT`、`PATENT_CHECKER_LOG_LEVEL`)を提供します。他の変数は `compose.yaml` の `environment:` に追加できます。
 
@@ -274,16 +279,44 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 
 ## キャッシュと後始末
 
-取得した特許文書は利用者単位の共有キャッシュに 1 つだけ、種類ごとの有効期限付きで保持されます。検索結果とリクエストログは実行した側に残ります(サーバーのデータディレクトリ、または CLI をプロジェクトから使った場合はそのプロジェクトの `.patent-checker/`)。
+取得した特許文書は共有文書キャッシュに 1 つだけ、種類ごとの有効期限付きで保持されます。検索結果とリクエストログは実行した側に残ります(サーバーのデータディレクトリ、または CLI をプロジェクトから使った場合はそのプロジェクトの `.patent-checker/`)。
 
 - `patent-checker cache status` は、何がどこにキャッシュされ、どれだけが期限切れか壊れているかを表示します。
 - `patent-checker cache clear [--kind KIND] [--older-than DAYS] [--pub …] [--expired] [--broken]` は削除対象を一覧し、`--yes` を付けると削除します。`KIND` は `biblio`、`claims`、`legal`、`family`、`gp`、`search`、`searchbib` のいずれかです。
-- `patent-checker clean` はプロジェクトの痕跡(検索キャッシュ、リクエストログ、古い配置の残骸)を一覧し、`--yes` で削除します。レポート、エージェントの探索メモ、台帳、同意記録は `--include-artifacts` や `--include-consent` を付けない限り残されます。`--shared` は共有キャッシュとサーバーのデータディレクトリまで後始末の範囲を広げます。
-- `patent-checker ledger status` はプロジェクトの台帳の概要(実行、監視している特許、期限の来た確認)を表示し、`patent-checker ledger check` は台帳を検査します。どちらも読むだけです。台帳はエージェントが書き、レポートと同じ場所に置かれ、git で追跡するかどうかの選択もレポートと共通です。台帳もレポートと同じく、あなたが何を知っていたかの日付入りの記録です。
+- `patent-checker clean` はプロジェクトの痕跡(検索キャッシュ、リクエストログ、古い配置の残骸)を一覧し、`--yes` で削除します。レポート、エージェントの探索メモ、台帳、同意記録は `--include-artifacts` や `--include-consent` を付けない限り残されます。`--shared` は共有文書キャッシュとサーバーのデータディレクトリまで後始末の範囲を広げます。
+- `patent-checker ledger status` はプロジェクトの台帳の概要(実行、監視している特許、期限の来た確認)を表示し、`patent-checker ledger check` はすべての対象の台帳を台帳フォーマットに照らして検査します。`--target <名前>` を付けるとどちらのコマンドも 1 つの対象だけに絞られます。どちらも読むだけです。台帳はエージェントが書き、レポートと同じ場所に置かれ、git で追跡するかどうかの選択もレポートと共通です。台帳もレポートと同じく、あなたが何を知っていたかの日付入りの記録です。
 - 種別コードの無い公報番号(`EP1234567`)は「その時点の最新のもの」を指すので、その形で取得した請求項はずっと保持されるのではなく、ファミリーと同じ期限で失効します。種別コード付き(`EP1234567B1`)なら失効しません。
 - Compose では `docker compose down -v` がサーバーのボリュームを、キャッシュごと削除します。
 
 `--yes` なしでは何も削除されません。
+
+### コマンド一覧
+
+エージェントが MCP ツールで行うことは、シェルからも 1 ツール 1 コマンドで行えます。
+
+| MCP ツール | CLI コマンド | 用途 |
+|---|---|---|
+| `server_status` | —(`patent-checker --version` と、設定の有無を見るための OPS 系コマンド) | サーバーの版、動作モード、キャッシュの場所 |
+| `ops_search` | `patent-checker search "<cql>"` | 公開データの CQL 検索 |
+| `ops_search_biblio` | `patent-checker search-biblio "<cql>"` | 同じ検索を、各ヒットの書誌付きで |
+| `search_plan_check` | `patent-checker plan-check "<q1>" "<q2>" …` | 検索前に複数の検索式のヒット件数を見る |
+| `get_biblio` | `patent-checker biblio <pub>` | 1 件の公報の書誌 |
+| `get_claims` | `patent-checker claims <pub>` | 1 件の公報の請求項本文 |
+| `get_legal` | `patent-checker legal <pub>` | INPADOC の権利状態イベント |
+| `get_family` | `patent-checker family <pub>` | シンプルパテントファミリー |
+| `watch_check` | `patent-checker watch <pub> …` | 監視している公報を保存済みの現況記録と比べ直す |
+| `normalize_pubnum` | `patent-checker normalize <text>` | 公報番号を DOCDB 表記に(オフライン) |
+| `dedup_families` | `patent-checker dedup <hits.json>` | 検索ヒットをファミリーにまとめる(オフライン) |
+| `verify_batch` | `patent-checker verify --input <pubs.json> --output <records.json>` | 委譲したバッチの取りこぼしを見つける(オフライン) |
+| `usage_report` | `patent-checker usage` | ローカルのリクエストログの集計 |
+| — | `patent-checker ledger status` / `ledger check`(どちらも `[--target <名前>]`) | プロジェクトの台帳を読む、または台帳フォーマットに照らして検査する |
+| — | `patent-checker cache status` / `cache clear` | 何がキャッシュされているか、その削除 |
+| — | `patent-checker clean` | このプロジェクトの痕跡を消す |
+| — | `patent-checker consent status` / `consent show` / `consent record` | 利用者向け通知とその同意記録 |
+| — | `patent-checker install` | Skill の配置とエージェントへのサーバー登録 |
+| — | `patent-checker serve` | MCP サーバーの起動 |
+
+取得系のコマンド(`search`、`search-biblio`、`plan-check`、`biblio`、`claims`、`legal`、`family`、`watch`)は `--refresh` を受け付け、その 1 回だけキャッシュを使いません。MCP に対応するツールが無い 6 つのコマンドは意図的にそうなっています。サーバーはプロジェクトのファイルを読むことも消すこともありません。
 
 ## セキュリティモデル
 
@@ -291,7 +324,7 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 - 接続先は `ops.epo.org` と `patents.google.com` だけで、サーバーでもコマンドラインツールでも同じです。書き込みは自身のデータディレクトリの下だけです。コード実行ツールはありません。
 - 受け取るのは公開特許データだけです(検索式、公報番号、ファミリー番号、日付、サーバー自身が以前返した状態の現況記録)。大きすぎるリクエストは拒否します。あなたのコード、文書、台帳は、あなたのマシン上のエージェントが扱います。認証済みのクライアントはサーバーがデータを置く場所を見ることができます(`server_status`)が、ホストについてそれ以外は露出しません。
 - 受け付けるリクエストにはレート制限があり、上流へのリクエストは間隔を空け、1 つずつ直列に実行し、キャッシュするので、暴走したエージェントがデータソースを叩き続けることはありません。
-- `GET /health` はコンテナのヘルスチェック用に認証不要で、状態と版だけを返します。
+- `GET /health` はコンテナのヘルスチェック用に認証不要で、状態、版、トランスポートだけを返します。
 - 認証情報は環境変数かファイルから読まれ、ログに出ず、起動バナーやエラーメッセージにも現れません。
 - コンテナは非特権ユーザーとして、読み取り専用のファイルシステムで、ケーパビリティをすべて落として動きます。書けるのは `/data` だけです。
 - `--transport stdio` には認証がありません。サーバーがあなたの権限で動くことを承知のうえ、単一のローカルクライアントにだけ使ってください。
@@ -301,13 +334,13 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 
 ## データソースとフェアユース
 
-- **EPO Open Patent Services** は、登録したアプリケーションに付随する規約(週あたりのフェアユース割り当てを含む)のもとで使われます。サーバーはリクエストの間隔を空け、OPS のスロットリングヘッダに従いますが、同じ認証情報を他に何クライアントが共有しているかは知りようがありません。権利状態の情報は OPS から取得し、レポートではそれが権威ある値です。この間隔の調整は 1 つのプロセスの中で働きます。サーバーは 1 プロセスですが、シェルから実行する `patent-checker` コマンドは 1 回ごとに別プロセスです。CLI を手やスクリプトで動かすときは、複数の検索式を 1 回の `plan-check` にまとめ、検索コマンドの間を 15 秒ほど空けてください。`403` を含むエラーは OPS が検索サービスを絞ったことを意味し、15 分ほど待てば解消します。
+- **EPO Open Patent Services** は、登録したアプリケーションに付随する規約(週あたりのフェアユース割り当てを含む)のもとで使われます。サーバーはリクエストの間隔を空け、OPS のスロットリングヘッダに従いますが、同じ認証情報を他に何クライアントが共有しているかは知りようがありません。権利状態の情報は OPS から取得し、レポートではそれが権威ある値です。この間隔の調整は、同じ利用者のすべての patent-checker プロセスが小さな状態ファイル(`PATENT_CHECKER_PACING_DIR`)を通じて共有します。シェルから続けて実行する `patent-checker` コマンドもサーバーと同じ間隔を守り、あるプロセスが受けたクールダウンや間隔の引き締めは次のプロセスにも効きます。OPS がサービスを完全に拒否した(HTTP 403、スロットリングヘッダが `black`)ときは、そのサービスを 15 分間「遮断中」として扱い、以後の呼び出しは遮断を長引かせる代わりに再試行できる時刻を添えた `external_api_error` で即座に失敗します。遮断中のサービスは `patent-checker usage` の `pacing` に表示されます。複数の検索式を 1 回の `plan-check` にまとめることは引き続きリクエスト数の節約になります。
 - **Google Patents** は文書ページを 1 つずつ、人がブラウザで読むのと同程度のペースと量で取得し、すべてのページをキャッシュして二度取得しません。検索エンドポイントは意図的に使いません。Google の `robots.txt` があるパスを許可していることは、利用規約が大量収集を許可していることと同じではないからです。
 - 特許文書は出願人が著作権を持ちます。レポートは扱う請求項の箇所だけを出典付きで引用し、全文を再配布することはありません。キャッシュはあなたのマシンに留まり、レポートの一部にはなりません。
 
 ## 補足
 
-- **米国の公開番号は 2026 年に桁数が変わりました。** EPO の DOCDB 表記では、米国の出願公開は 2025 年まで 10 桁(`US2007016547A1`)、2026 年から 11 桁(`US20260024003A1`)です。Google Patents は全年代を 11 桁で綴ります。ツールは両方の綴りを正規化するので、手で番号を入力するときはどちらの形でも受け付けられます。
+- **米国の公開番号は 2026 年に桁数が変わりました。** EPO の DOCDB 表記では、米国の出願公開は 2025 年まで 10 桁(`US2007016547A1`)、2026 年から 11 桁(`US20260024003A1`)です。Google Patents は全年代を 11 桁で綴ります。ツールは両方の綴りを正規化するので、手で番号を入力するときはどちらの形でも受け付けられます。OPS が日本・インド・台湾・ハンガリー・ブラジルの一部の公報に付ける、番号部に英字を含む番号(`JP.H0218652.A` または `JPH0218652A`)も受け付けます。
 - 権利状態がイベント 0 件で返ってきた文書はそのように報告されます(`events: []` と注記)。「見つからない」とは別物です。
 - 通知が変わると、Skill は再び同意を求め、サーバーは新たな承認を求めます。それまでは何も二度尋ねられません。
 
@@ -332,8 +365,9 @@ patent-checker serve
 
 ## 変更履歴
 
+- **v1.2**(2026-09): プロセスをまたいで効く間隔制御。OPS のサービスごとの最小間隔・クールダウン・引き締めた間隔を、ファイルロックで守った利用者単位の小さな状態ファイルに置き、続けて実行する CLI コマンドもサーバーの呼び出しと同じ間隔になります。OPS が拒否したサービス(HTTP 403、スロットリング状態 `black`)は 15 分間ローカルで遮断し、以後の呼び出しは再試行できる時刻を添えて即座に失敗します(`PATENT_CHECKER_PACING_DIR`、`patent-checker usage` が状態を表示)。番号部に英字を含む公報番号(`JP.H0218652.A`、`IN.985DE2013.A`、`TW.I707812.B`)を解釈・往復できるようになり、OPS がそのような番号で挙げる文書を取得・監視できます。CLI の引数エラーと読めない上流データを区別、`ledger status` は `ledger check` と同じ対象を一覧、`cache status` は種別コード無しの番号で保存したエントリとその失効を表示、要求ログの時刻に UTC オフセット。文書をコードの実態に合わせました(パイプ経由のブートストラップの挙動、`/health`、受け付ける Host ヘッダー、運用者告知のサーバーが受け取る情報、コマンド一覧)。
 - **v1.1**(2026-09): 繰り返し実行のための版。プロジェクトごとの台帳が探索を次の実行へ引き継ぎます。追跡探索は新しく公開された特許だけを検索し、新しいファミリーだけをふるいにかけます。新しい `watch_check` ツールが、監視している特許の権利状態とファミリーを前回の実行と比較します。レポートは「前回の探索からの変更点」から始まり、状態の確認だけを行う短い監視更新レポートもあります。すべての結果に取得時刻(`fetched_at`)が付き、請求項の結果は実際に読んだ公報(`pub_docdb`)を示し、種別コード無しで取得した請求項はずっとキャッシュに残ることがなくなり、`dedup_families` は既知のファミリーに印を付け、`usage_report` は開始時刻を受け取ります。新しいコマンド `patent-checker watch` と `patent-checker ledger status|check`。コンテナイメージはビルド時にディストリビューションのセキュリティ更新を適用します。
-- **v1.0**(2026-09): 安定版。ベアラートークンの定数時間比較、`.env` をホームディレクトリとファイルシステムのルートから読まない、リクエストのサイズ上限、コンテナのハードニング(読み取り専用、ケーパビリティなし)、Caddy による LAN/TLS の構成例、インストーラの改善(`--token-env` はトークンの値を要求しない、設定ファイルは所有者のみ読める、バックアップを上書きしない、失敗時は非ゼロ終了、Codex CLI の登録)、キャッシュとパーサーの修正(並行書き込み、CPC 記号、空の権利状態、非 UTF-8 ページ)、上流呼び出しの 401/429/503 での 1 回の再試行と無関係なツールを待たせない改善、すべてのコマンドが `.env` を読む、トレースバックの代わりに分かりやすいエラーメッセージ、Python 3.13、CI でのセキュリティスキャン、MCP Registry への掲載、文書の再構成。
+- **v1.0**(2026-09): 安定版。ベアラートークンの定数時間比較、`.env` をホームディレクトリとファイルシステムのルートから読まない、リクエストのサイズ上限、コンテナのハードニング(読み取り専用、ケーパビリティなし)、Caddy による LAN/TLS の構成例、インストーラの改善(`--token-env` はトークンの値を要求しない、設定ファイルは所有者のみ読める、バックアップを上書きしない、失敗時は非ゼロ終了、Codex CLI の登録)、キャッシュとパーサーの修正(並行書き込み、CPC 記号、空の権利状態、非 UTF-8 ページ)、上流呼び出しの 401/429/503 での 1 回の再試行と無関係なツールを待たせない改善、すべてのコマンドが `.env` を読む、トレースバックの代わりに分かりやすいエラーメッセージ、Python 3.12 以上が必要(3.13 でも試験)、CI でのセキュリティスキャン、MCP Registry への掲載、文書の再構成。
 - **v0.5**(2026-09-06): 最初の一般公開。Docker イメージ(GHCR、Docker Hub)とファイルベースの secrets による Compose デプロイ、8 エージェント向けの `patent-checker install`、ブートストラップスクリプト、PyPI パッケージ、`/health`、ログレベル設定。
 - **v0.4**(2026-09-05): 種類ごとの有効期限と自己修復を備えた利用者単位の共有文書キャッシュ、`cache status` / `cache clear` / `clean`、2026 年の米国番号変更に対応した公報番号の正規化。
 - **v0.3**(2026-09-04): MCP サーバー(FastMCP 4、Streamable HTTP、ベアラートークン、Host/Origin 検証、外向き許可リスト、レート制限)、運用者向け告知、最初のファイルキャッシュ。

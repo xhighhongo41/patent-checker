@@ -15,8 +15,9 @@ MCP tools took over the data access without changing the procedure.
 A target is explored more than once: as an idea, while it is built, right
 before it is published, and before each later release. The first run is a
 **baseline** run. Every later run is a **follow-up** run or a **monitoring**
-run that builds on the **ledger** the earlier runs left behind; read
-`references/follow-up-runs.md` before starting one.
+run (recorded as `watch` in the ledger) that builds on the **ledger** the
+earlier runs left behind; read `references/follow-up-runs.md` before
+starting one.
 
 ## Preconditions and constraints (non-negotiable)
 
@@ -120,10 +121,10 @@ today" means.
 Call `server_status` (no arguments). It returns `version`,
 `ops_configured`, `transport`, `data_dir`, `cache_dir` (shared document
 cache), `search_cache_dir`, `cache_ttl` (expiry per kind), `cache_entries`
-(entries per kind) and `operator_notice_version`. Record `version` in the exploration artifacts.
-If `ops_configured` is `false`, the server runs without OPS credentials:
-skip to the degraded mode of step 11 (only `get_claims` and the offline
-helpers work). If the call itself fails because no `patent-checker` MCP
+(entries per kind), `operator_notice_version` and `log_level`. Record
+`version` in the exploration artifacts. If `ops_configured` is `false`, the
+server runs without OPS credentials: skip to the degraded mode of step 11
+(only `get_claims` and the offline helpers work). If the call itself fails because no `patent-checker` MCP
 server is registered, see "CLI fallback". If the server does not offer
 `watch_check`, it is older than this Skill: ask the operator to update it
 ("Older servers" in `references/follow-up-runs.md`).
@@ -222,7 +223,7 @@ symbol alone hits too much.
   monitoring list.
 - Delegate element comparison of independent claims against the
   implementation-fact yardstick you supply. Verdicts are three-valued
-  (read fully / boundary / lacks) with the decisive element named.
+  (close-read / boundary / lacks) with the decisive element named.
 - Follow-up: claims already read are not read again unless the feature
   they map to changed, the claims changed (a granted or amended
   publication), or the earlier reading was wrong.
@@ -347,6 +348,7 @@ snapshots.
 | `ops_search` / `ops_search_biblio` returns `"total": 0` | Nothing matched (OPS reports this as a 404 fault; the server normalizes it). Not an error |
 | Tool error `invalid_input: ...` on a search | Range end > 2000, span > 100, malformed publication number, or an over-long query; fix the argument and call again |
 | Tool error `external_api_error: ...` | Upstream OPS / Google Patents failure or throttling; wait, retry once, then record the gap in "Scope and limitations" |
+| Tool error `external_api_error: OPS blocked the <service> service; retry after <time>` | OPS refused that service (HTTP 403 / throttling `black`) and every process now declines it until the time given. Do not retry before then: use the other services meanwhile (a blocked `search` leaves `retrieval` and `inpadoc` usable), and check `usage_report` — its `pacing.upstreams.ops.blocked` lists blocked services with the time to retry |
 | Tool error `upstream_data: ...` | The document was fetched but could not be parsed (unexpected markup, corrupt cache entry); retrying with the same or a changed argument will not help. Record the gap; a persistent case is cleared by the operator with `patent-checker cache clear --pub <pub>` |
 | `get_claims` returns `"unavailable": true` | Indexing lag (about two months after publication). EP/WO fall back to OPS automatically; others go to the monitoring list and are retried in every later run |
 | `get_claims` (GP) returns `claims_fallback_text` instead of numbered claims | Page without claim-number markup (older CN/KR/WO). Read the flat text; numbering must be recovered manually |
@@ -370,13 +372,16 @@ the CLI equivalent of that tool-error prefix) or an invalid cache setting
 (`config_error`). Unreadable upstream data is `upstream_data` with exit
 code 3.
 
-**Pace the CLI yourself.** The server spaces its upstream requests; the
-CLI can only do so inside one invocation, and every command is a new
-process. Send several queries in one `plan-check` call rather than one
-call each, leave at least 15 seconds between two search commands, and
-pass all publications to one `watch` call. An `external_api_error`
-mentioning `403` means the search service throttled you: stop, wait a
-quarter of an hour, and continue more slowly.
+**The CLI paces itself across invocations.** Every command is a new
+process, but the spacing, cool-downs and blocks are shared through a
+per-user state file, so consecutive commands wait for each other the way
+the server's calls do. Still send several queries in one `plan-check`
+call and all publications in one `watch` call: fewer requests is what
+saves quota. An `external_api_error` that says `OPS blocked the search
+service; retry after <time>` means the service is refused for everyone
+until that time: do not retry earlier, continue with what does not need
+that service, and read `patent-checker usage` (`pacing`) before starting
+searches after a pause.
 
 | MCP tool | CLI subcommand |
 |---|---|

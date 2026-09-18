@@ -144,7 +144,7 @@ what `dedup_families(known_family_ids=...)` is fed with on the next run.
 | Key | Required | Value |
 |---|---|---|
 | `family_id` | yes | Family identifier from the search hits, unique. For a hit that carries none, use its DOCDB publication number |
-| `pubs` | yes | Non-empty array of the publications seen for this family (DOCDB). A number the search service spells in a way the tools cannot parse (some JP and IN numbers) is kept exactly as the hit carried it; the checker only warns about it |
+| `pubs` | yes | Non-empty array of the publications seen for this family (DOCDB). Numbers are kept exactly as the search service spelled them; the rare spelling the tools still cannot read is only warned about |
 | `stage1` | yes | `A`, `B` or `C` |
 | `judged_run` | yes | `run_id` of the run whose judgment this line records |
 | `features` | yes | Array of the feature ids the judgment was made against, or the string `"all"` (the whole feature table as of `judged_run`) |
