@@ -784,10 +784,10 @@ _WARNING_CASES = [
         id="run-order",
     ),
     pytest.param(
-        # OPS reports some numbers the package cannot parse (an era-based JP
-        # number, an Indian application number). Copied from a search hit
-        # into a screened family they are nothing the agent could fix.
-        _edit("families.jsonl", 0, lambda record: record["pubs"].append("JP.H1051684.A")),
+        # A number the package cannot parse (here: an inner letter block
+        # followed by too few digits for any office). Copied from a search
+        # hit into a screened family it is nothing the agent could fix.
+        _edit("families.jsonl", 0, lambda record: record["pubs"].append("IN.985DE201.A")),
         "pub-unparsed",
         "families.jsonl",
         1,

@@ -24,8 +24,10 @@ from patent_checker import service, validation, watch
 from patent_checker.cache import Cache, pub_key, search_key
 from patent_checker.gp import fetch as gp_fetch
 from patent_checker.ops import client as ops_client
+from patent_checker.ops import parse as ops_parse
 from patent_checker.ops.client import OpsClient
-from tests._fixtures import fixture_path
+from patent_checker.pubnum import parse_pubnum
+from tests._fixtures import FIXTURES_ROOT, fixture_path
 
 _TOKEN_JSON = {"access_token": "test-token", "token_type": "Bearer", "expires_in": "1199"}
 
@@ -320,3 +322,36 @@ def test_the_largest_fixture_snapshot_stays_well_inside_the_payload_limits(
         f"'previous' batch, which is limited to {watch.MAX_SNAPSHOT_CHARS} characters"
     )
     assert watch.MAX_WATCH_PUBS * size < validation.MAX_PAYLOAD_CHARS // 10
+
+
+# --- publication numbers across every saved search page ---------------------
+
+
+def test_every_saved_search_hit_publication_number_parses() -> None:
+    """Every DOCDB number these search pages report parses and round-trips.
+
+    OPS answers searches with letter-bearing numbers (JP era-based ``H``/``S``
+    numbers, TW ``I`` numbers, a HU ``P`` number). Before v1.2 the parser
+    rejected 22 of the spellings saved here, so those documents could not be
+    fetched, cached or watched although they showed up as hits. The docdb
+    spelling OPS sends is also the spelling ``docdb()`` must reproduce: the
+    number normalization ``parse_pubnum`` performs (the pre-2026 US A-kind
+    shrink) only applies to spellings OPS never sends.
+    """
+    search_paths = sorted((FIXTURES_ROOT / "ops").glob("*_search_*.xml"))
+    searchbib_paths = sorted((FIXTURES_ROOT / "ops").glob("*_searchbib_*.xml"))
+    if not search_paths or not searchbib_paths:
+        # Go through the shared helper so this sweep obeys the session's
+        # "fixtures are required" switch instead of silently checking nothing.
+        fixture_path("ops/20260827-001753_search_ab40de2f9f.xml")
+    pubs: list[tuple[str, str]] = []
+    for path in search_paths:
+        page = ops_parse.parse_search_xml(path.read_bytes())
+        pubs.extend((path.name, hit.pub) for hit in page.hits)
+    for path in searchbib_paths:
+        biblio_page = ops_parse.parse_search_biblio_xml(path.read_bytes())
+        pubs.extend((path.name, doc.pub) for doc in biblio_page.docs)
+
+    assert pubs
+    for name, pub in pubs:
+        assert parse_pubnum(pub).docdb() == pub, f"{name}: {pub}"

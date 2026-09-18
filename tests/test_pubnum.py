@@ -6,7 +6,12 @@ import dataclasses
 
 import pytest
 
-from patent_checker.pubnum import MAX_NUMBER_DIGITS, PubNumber, parse_pubnum
+from patent_checker.pubnum import (
+    LEADING_LETTER_COUNTRIES,
+    MAX_NUMBER_DIGITS,
+    PubNumber,
+    parse_pubnum,
+)
 
 # (input text, expected country, expected number, expected kind)
 VALID_CASES = [
@@ -293,3 +298,121 @@ def test_parse_pubnum_accepts_the_longest_allowed_digit_run() -> None:
     result = parse_pubnum(text)
     assert result.number == "1" * MAX_NUMBER_DIGITS
     assert result.kind == "A"
+
+
+# --- Letter-bearing number parts (v1.2) -------------------------------------
+
+# (input text, country, number, kind, docdb spelling, epodoc/google spelling)
+# OPS reports publication numbers whose number part carries letters: JP
+# era-based numbers (S = Showa, H = Heisei), an office code inside an IN
+# application number, and the TW/HU/BR series prefixes. No era conversion
+# happens here; only the spellings round-trip.
+LETTER_NUMBER_CASES = [
+    ("JP.H1051684.A", "JP", "H1051684", "A", "JP.H1051684.A", "JPH1051684A"),
+    ("JP.H11184933.A", "JP", "H11184933", "A", "JP.H11184933.A", "JPH11184933A"),
+    ("JP.S58196141.A", "JP", "S58196141", "A", "JP.S58196141.A", "JPS58196141A"),
+    ("JPH0218652A", "JP", "H0218652", "A", "JP.H0218652.A", "JPH0218652A"),
+    ("JPH0317142B2", "JP", "H0317142", "B2", "JP.H0317142.B2", "JPH0317142B2"),
+    ("JPS59160899A", "JP", "S59160899", "A", "JP.S59160899.A", "JPS59160899A"),
+    ("IN.985DE2013.A", "IN", "985DE2013", "A", "IN.985DE2013.A", "IN985DE2013A"),
+    ("IN985DE2013A", "IN", "985DE2013", "A", "IN.985DE2013.A", "IN985DE2013A"),
+    ("TW.I707812.B", "TW", "I707812", "B", "TW.I707812.B", "TWI707812B"),
+    ("TWI707812B", "TW", "I707812", "B", "TW.I707812.B", "TWI707812B"),
+    ("HU.P0304100.A2", "HU", "P0304100", "A2", "HU.P0304100.A2", "HUP0304100A2"),
+    ("BRPI0410768B1", "BR", "PI0410768", "B1", "BR.PI0410768.B1", "BRPI0410768B1"),
+    # Separators make the leading letter block unambiguous, so they are
+    # accepted with any spelling of the separators.
+    ("JP-H0218652-A", "JP", "H0218652", "A", "JP.H0218652.A", "JPH0218652A"),
+    ("JP H0218652 A", "JP", "H0218652", "A", "JP.H0218652.A", "JPH0218652A"),
+    ("jph0218652a", "JP", "H0218652", "A", "JP.H0218652.A", "JPH0218652A"),
+]
+
+
+@pytest.mark.parametrize(
+    ("text", "country", "number", "kind", "docdb", "epodoc"),
+    LETTER_NUMBER_CASES,
+    ids=[case[0] for case in LETTER_NUMBER_CASES],
+)
+def test_parse_pubnum_accepts_letter_bearing_number_part(
+    text: str, country: str, number: str, kind: str, docdb: str, epodoc: str
+) -> None:
+    """A number part with letters parses and round-trips through all three spellings."""
+    result = parse_pubnum(text)
+    assert result.country == country
+    assert result.number == number
+    assert result.kind == kind
+    assert result.docdb() == docdb
+    assert result.epodoc() == epodoc
+    # google() is the epodoc spelling: the US ten-digit padding applies to
+    # digit-only numbers only.
+    assert result.google() == epodoc
+
+
+LETTER_NUMBER_INVALID_CASES = [
+    "USA11468338B2",  # three-letter country code: US is not a leading-letter office
+    "INDEL2013985A",  # leading letters without separators, and IN is not listed
+    "US11468338B22",  # kind with two digits, not an inner letter block
+    "IN.985DE201.A",  # inner letter block followed by only 3 digits
+    "JP.H.A",  # a letter block with no digits at all
+    "JP.H0218652B.A",  # number part ending in a letter
+    "IN.985DEFGH2013.A",  # inner letter block of 5 letters
+    "JP.H" + "1" * 12 + ".A",  # 13-character number part: one past the ceiling
+]
+
+
+@pytest.mark.parametrize("text", LETTER_NUMBER_INVALID_CASES, ids=LETTER_NUMBER_INVALID_CASES)
+def test_parse_pubnum_rejects_number_parts_outside_the_grammar(text: str) -> None:
+    """Spellings the letter grammar must keep out still raise ValueError."""
+    with pytest.raises(ValueError):
+        parse_pubnum(text)
+
+
+def test_parse_pubnum_reports_an_over_long_letter_bearing_number_part_by_characters() -> None:
+    """The ceiling counts characters of the number part, letters included."""
+    with pytest.raises(ValueError, match="13 characters"):
+        parse_pubnum("JP.H" + "1" * 12 + ".A")
+
+
+def test_parse_pubnum_accepts_the_longest_allowed_letter_bearing_number_part() -> None:
+    """A number part of exactly MAX_NUMBER_DIGITS characters is still accepted."""
+    result = parse_pubnum("JP.H" + "1" * (MAX_NUMBER_DIGITS - 1) + ".A")
+    assert result.number == "H" + "1" * (MAX_NUMBER_DIGITS - 1)
+    assert len(result.number) == MAX_NUMBER_DIGITS
+
+
+def test_parse_pubnum_accepts_a_separated_leading_letter_for_an_unlisted_country() -> None:
+    """Separators disambiguate, so a leading letter block is accepted for any office.
+
+    ``US.A1234567.B2`` parses although US is not in
+    ``LEADING_LETTER_COUNTRIES``: the dots show where the number part begins,
+    so the letter cannot be mistaken for a third letter of the country code.
+    The same string without separators (``USA1234567B2``) stays invalid.
+    """
+    result = parse_pubnum("US.A1234567.B2")
+    assert result.number == "A1234567"
+    assert result.docdb() == "US.A1234567.B2"
+    with pytest.raises(ValueError):
+        parse_pubnum("USA1234567B2")
+
+
+def test_leading_letter_countries_lists_the_offices_seen_in_ops_data() -> None:
+    """The unseparated leading-letter allowance is limited to the observed offices."""
+    assert LEADING_LETTER_COUNTRIES == frozenset({"JP", "TW", "HU", "BR"})
+
+
+def test_google_does_not_pad_a_letter_bearing_us_number() -> None:
+    """The US ten-digit padding is limited to digit-only numbers.
+
+    The number used here is 10 characters long and starts with "20", so it
+    meets every other condition of the padding rule; only the letters inside
+    rule it out, because a year-plus-serial reading makes no sense for it.
+    """
+    pubnum = PubNumber(country="US", number="2020DE1234", kind="A1")
+    assert pubnum.google() == "US2020DE1234A1"
+
+
+def test_parse_pubnum_does_not_shrink_a_letter_bearing_us_application_number() -> None:
+    """The 2026 year rule applies to digit-only numbers, so letters pass through."""
+    result = parse_pubnum("US.20A00123456.A1")
+    assert result.number == "20A00123456"
+    assert result.docdb() == "US.20A00123456.A1"
