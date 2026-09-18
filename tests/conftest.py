@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -45,3 +46,16 @@ def _reset_dotenv_loaded(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """
     monkeypatch.setattr(config, "_dotenv_loaded", False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pacing_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point the shared pacing state at this test's own temporary directory.
+
+    ``patent_checker.pacing`` defaults to ``config.pacing_dir()``, which is
+    under the real user's data directory. A test must never write there
+    (nor pace itself against whatever the user's own runs left behind), and
+    the default is reached from several layers, so the isolation is applied
+    to every test rather than per test module.
+    """
+    monkeypatch.setenv(config.ENV_PACING_DIR, str(tmp_path / "pacing"))

@@ -189,6 +189,40 @@ def test_cache_base_empty_cache_dir_env_is_treated_as_unset(monkeypatch, tmp_pat
     assert config.cache_base() == data_dir / "cache"
 
 
+def test_pacing_dir_honours_the_env_var(monkeypatch, tmp_path) -> None:
+    """``PATENT_CHECKER_PACING_DIR`` selects the shared pacing directory."""
+    pacing_dir = tmp_path / "pacing-dir"
+    monkeypatch.setenv(config.ENV_PACING_DIR, str(pacing_dir))
+
+    assert config.pacing_dir() == pacing_dir
+
+
+def test_pacing_dir_empty_env_is_treated_as_unset(monkeypatch, tmp_path) -> None:
+    """An empty ``PATENT_CHECKER_PACING_DIR`` falls back to the user data directory."""
+    monkeypatch.setenv(config.ENV_PACING_DIR, "")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    assert config.pacing_dir() == config.user_data_dir() / "pacing"
+
+
+def test_pacing_dir_defaults_to_user_data_dir_pacing(monkeypatch, tmp_path) -> None:
+    """The pacing state is per user, so the data base and its override do not move it."""
+    monkeypatch.delenv(config.ENV_PACING_DIR, raising=False)
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data-dir"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    config.set_data_base(tmp_path / "override-base")
+
+    assert config.pacing_dir() == config.user_data_dir() / "pacing"
+
+
+def test_the_test_suite_isolates_the_pacing_dir(tmp_path) -> None:
+    """The autouse fixture in ``conftest.py`` keeps every test out of the real one."""
+    resolved = config.pacing_dir()
+
+    assert os.environ[config.ENV_PACING_DIR] == str(resolved)
+    assert resolved.is_relative_to(tmp_path), f"{resolved} is outside {tmp_path}"
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [

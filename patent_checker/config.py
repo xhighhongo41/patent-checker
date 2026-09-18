@@ -21,6 +21,7 @@ ALLOWED_HOSTS: frozenset[str] = frozenset({"ops.epo.org", "patents.google.com"})
 ENV_CACHE_DIR = "PATENT_CHECKER_CACHE_DIR"
 ENV_CACHE_TTL = "PATENT_CHECKER_CACHE_TTL"
 ENV_LOG_LEVEL = "PATENT_CHECKER_LOG_LEVEL"
+ENV_PACING_DIR = "PATENT_CHECKER_PACING_DIR"
 
 # Accepted values of ``ENV_LOG_LEVEL``, matched case-insensitively.
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -190,6 +191,25 @@ def cache_base() -> Path:
     if data_base_is_explicit:
         return data_base() / "cache"
     return user_data_dir() / "cache"
+
+
+def pacing_dir() -> Path:
+    """Resolve the directory of the shared pacing state, without creating it.
+
+    ``$PATENT_CHECKER_PACING_DIR`` if set and non-empty, otherwise
+    ``<user_data_dir()>/pacing``.
+
+    The default is deliberately per user and not under :func:`data_base`:
+    what the state paces is the quota of the user's own OPS key, which is
+    the same however many projects the user works on, so all of the user's
+    processes have to queue behind one another. The container image sets
+    the environment variable to ``/data/pacing``, where the image's data
+    volume is mounted.
+    """
+    env_value = os.environ.get(ENV_PACING_DIR)
+    if env_value:
+        return Path(env_value)
+    return user_data_dir() / "pacing"
 
 
 def parse_ttl(text: str) -> timedelta | None:
