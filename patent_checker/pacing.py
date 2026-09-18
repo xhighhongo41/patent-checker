@@ -59,7 +59,7 @@ import math
 import os
 import time
 from collections.abc import Callable, Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -183,9 +183,22 @@ def _mapping(section: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def _spell(timestamp: float) -> str:
-    """Spell *timestamp* as a local-time ISO string with its UTC offset, to the second."""
-    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
+def spell_epoch(timestamp: float) -> str:
+    """Spell *timestamp* as a local-time ISO string with its UTC offset, to the second.
+
+    The offset is part of the spelling because the value travels: it is
+    written into the shared state and read back by another process, possibly
+    under a different ``TZ``. The conversion goes through an aware UTC value
+    first, and falls back to the UTC spelling when the platform cannot
+    express the local time (Windows raises ``OSError`` for timestamps near
+    or before the epoch, which a test clock may well produce).
+    """
+    moment = datetime.fromtimestamp(timestamp, tz=UTC)
+    try:
+        moment = moment.astimezone()
+    except (OSError, OverflowError, ValueError):
+        pass
+    return moment.isoformat(timespec="seconds")
 
 
 class Pacer:
@@ -387,7 +400,7 @@ class Pacer:
                         continue
                     reason = blocked_reasons.get(service)
                     blocked[service] = {
-                        "until": _spell(deadline),
+                        "until": spell_epoch(deadline),
                         "reason": reason if isinstance(reason, str) else "",
                     }
             last_requests = section.get("last_request_at")
@@ -396,12 +409,14 @@ class Pacer:
                 for service, value in last_requests.items():
                     timestamp = _stored_timestamp(value, reference)
                     if timestamp is not None:
-                        spelled_requests[service] = _spell(timestamp)
+                        spelled_requests[service] = spell_epoch(timestamp)
             upstreams[name] = {
                 "last_request_at": spelled_requests,
                 "intervals": _stored_intervals(section),
                 "cool_down_until": (
-                    _spell(cool_down) if cool_down is not None and cool_down > reference else None
+                    spell_epoch(cool_down)
+                    if cool_down is not None and cool_down > reference
+                    else None
                 ),
                 "blocked": blocked,
             }

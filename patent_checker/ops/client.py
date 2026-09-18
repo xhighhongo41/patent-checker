@@ -99,16 +99,6 @@ _THROTTLING_STATE_RE = re.compile(r"(\w+)=(\w+):(\d+)")
 _THROTTLING_SYSTEM_RE = re.compile(r"^\s*([A-Za-z_]+)\s*\(([^)]*)\)")
 
 
-def _spell_epoch(timestamp: float) -> str:
-    """Spell *timestamp* as a local-time ISO string with its UTC offset, to the second.
-
-    The offset is part of the spelling because the value travels: it is
-    written into the shared pacing state, which another process (possibly
-    started under a different ``TZ``) reads back.
-    """
-    return datetime.fromtimestamp(timestamp).astimezone().isoformat(timespec="seconds")
-
-
 class OpsServiceBlocked(RuntimeError):
     """Raised instead of calling a service OPS is currently refusing.
 
@@ -131,7 +121,8 @@ class OpsServiceBlocked(RuntimeError):
 
     def __str__(self) -> str:
         """Return the message, naming the service and the local retry time."""
-        return f"OPS blocked the {self.service} service; retry after {_spell_epoch(self.until)}"
+        retry_after = pacing.spell_epoch(self.until)
+        return f"OPS blocked the {self.service} service; retry after {retry_after}"
 
 
 def parse_throttling_header(value: str) -> tuple[str, dict[str, tuple[str, int]]]:
@@ -487,7 +478,7 @@ class OpsClient:
         reason = f"HTTP {resp.status_code}"
         if state is not None:
             reason += f" with {service}={state[0]}:{state[1]}"
-        reason += f" at {_spell_epoch(now)}"
+        reason += f" at {pacing.spell_epoch(now)}"
         self._pacer.note(
             "ops",
             service,

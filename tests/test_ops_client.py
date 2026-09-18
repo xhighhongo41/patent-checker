@@ -661,7 +661,9 @@ class _VirtualClock:
     """
 
     def __init__(self) -> None:
-        self._now = 1000.0
+        # A realistic epoch: the spelled retry times must be representable as
+        # local dates on every platform (Windows cannot spell times near 1970).
+        self._now = 1_700_000_000.0
         self._lock = threading.Lock()
 
     def monotonic(self) -> float:
