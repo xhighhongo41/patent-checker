@@ -1182,7 +1182,7 @@ def test_offline_and_google_patents_tools_still_work_without_ops(
     """Degraded mode: the non-OPS tools keep working and status says so."""
     # The Google Patents pacing global is process-wide; reset it so this test
     # never sleeps for the courtesy interval left over from another test.
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     mcp = build_server(settings, state=make_state(ops_client=None))
 
     claims = _call(mcp, "get_claims", {"pub": "US11468338B2"})
@@ -1444,7 +1444,7 @@ def test_concurrent_claims_calls_serialize_the_google_patents_request(
     and the request, so this drives the real fetch function and watches the
     Google Patents transport instead of the tool.
     """
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     # The courtesy interval would serialize the two requests on its own; with
     # it out of the way, only the lock can keep them apart.
     monkeypatch.setattr(gp_fetch, "MIN_INTERVAL_SECONDS", 0.0)

@@ -39,7 +39,7 @@ def _ops_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "dummy-secret")
     monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(ops_client.time, "sleep", lambda seconds: None)
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
 
 
 @pytest.fixture

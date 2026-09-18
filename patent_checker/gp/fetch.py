@@ -14,7 +14,12 @@ whatever character set the page declared.
 
 Downloads are serialized by a module-level lock, so several threads (the MCP
 server serves tool calls from a thread pool) still keep the courtesy interval
-between actual requests. Cache hits never take that path and are not delayed.
+between actual requests within one process. The interval itself lives in the
+shared pacing state (:mod:`patent_checker.pacing`), so it also holds across
+processes: two CLI invocations run one after another still keep the courtesy
+interval apart. When that shared state is unavailable, pacing degrades to
+this process only (still serialized by the same lock), exactly like before
+v1.2. Cache hits never take that path and are not delayed.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from pathlib import Path
 
 import httpx
 
+from patent_checker import pacing
 from patent_checker.cache import Cache, format_timestamp, normalize_timestamp, pub_key
 from patent_checker.net import allowlist_transport
 from patent_checker.pubnum import parse_pubnum
@@ -49,7 +55,9 @@ MIN_INTERVAL_SECONDS = 2.0
 # Timeout of the client built when the caller supplies none (seconds).
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
-_last_request_at: float | None = None
+# The shared pacer, resolved lazily (see ``_get_pacer``) so a caller or a
+# test may still redirect ``PATENT_CHECKER_PACING_DIR`` before the first use.
+_pacer: pacing.Pacer | None = None
 
 # Guards the interval bookkeeping and the request it spaces, so two threads
 # cannot both decide that they may send now.
@@ -110,19 +118,31 @@ def build_default_client() -> httpx.Client:
     )
 
 
-def _wait_for_interval() -> None:
-    """Sleep until MIN_INTERVAL_SECONDS have passed since the last request.
+def _get_pacer() -> pacing.Pacer:
+    """Return the shared pacer, creating it lazily on first use.
 
-    ``_request_lock`` must be held by the caller: the wait and the request it
-    spaces form one unit.
+    Lazy so that a caller (or a test) may still redirect
+    ``PATENT_CHECKER_PACING_DIR`` before the first request; a test resets the
+    module to a fresh instance by setting ``fetch._pacer`` back to ``None``.
     """
-    global _last_request_at
-    now = time.monotonic()
-    if _last_request_at is not None:
-        remaining = MIN_INTERVAL_SECONDS - (now - _last_request_at)
-        if remaining > 0:
-            time.sleep(remaining)
-    _last_request_at = time.monotonic()
+    global _pacer
+    if _pacer is None:
+        _pacer = pacing.Pacer()
+    return _pacer
+
+
+def _wait_for_interval() -> None:
+    """Sleep until this request's slot in the shared pacing state comes.
+
+    Reserves the next ``gp``/``page`` slot first, which records it in the
+    shared state so the interval holds across processes, then sleeps only
+    the remainder between now and that slot. ``_request_lock`` must be held
+    by the caller: the wait and the request it spaces form one unit.
+    """
+    slot = _get_pacer().reserve("gp", "page", MIN_INTERVAL_SECONDS)
+    remaining = slot - time.time()
+    if remaining > 0:
+        time.sleep(remaining)
 
 
 def fetch_patent_html(

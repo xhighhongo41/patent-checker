@@ -867,11 +867,11 @@ def test_claims_gp_route_uses_the_same_cache(
     courtesy interval are replaced), because what is under test is that the
     page is served from the cache the service was given, without a request.
     """
-    monkeypatch.setattr(gp_fetch, "_last_request_at", None)
+    monkeypatch.setattr(gp_fetch, "_pacer", None)
     monkeypatch.setattr(
         gp_fetch,
         "time",
-        SimpleNamespace(monotonic=time.monotonic, sleep=lambda _seconds: None),
+        SimpleNamespace(monotonic=time.monotonic, time=time.time, sleep=lambda _seconds: None),
     )
     monkeypatch.setattr(service, "parse_patent_html", lambda html: _sample_gp_doc())
     requests: list[str] = []

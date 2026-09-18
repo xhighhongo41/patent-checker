@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from patent_checker import pacing
 from patent_checker.cache import Cache, pub_key
 from patent_checker.gp import fetch
 from patent_checker.gp.fetch import FetchedPage, GPUnavailable, fetch_patent_html
@@ -37,9 +38,9 @@ def _no_courtesy_wait(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         fetch,
         "time",
-        SimpleNamespace(monotonic=time.monotonic, sleep=lambda _seconds: None),
+        SimpleNamespace(time=time.time, monotonic=time.monotonic, sleep=lambda _seconds: None),
     )
-    monkeypatch.setattr(fetch, "_last_request_at", None)
+    monkeypatch.setattr(fetch, "_pacer", None)
 
 
 @pytest.fixture
@@ -84,6 +85,11 @@ class _VirtualClock:
 
     def monotonic(self) -> float:
         """Return the current virtual time."""
+        with self._lock:
+            return self._now
+
+    def time(self) -> float:
+        """Return the current virtual time (same scale as :meth:`monotonic` here)."""
         with self._lock:
             return self._now
 
@@ -319,7 +325,8 @@ def test_concurrent_fetches_are_serialized_and_keep_the_courtesy_interval(
     """Two threads downloading at once never overlap and stay one interval apart."""
     clock = _VirtualClock()
     monkeypatch.setattr(fetch, "time", clock)
-    monkeypatch.setattr(fetch, "_last_request_at", None)
+    monkeypatch.setattr(pacing, "time", clock)
+    monkeypatch.setattr(fetch, "_pacer", None)
 
     in_flight = 0
     max_in_flight = 0
@@ -360,6 +367,92 @@ def test_concurrent_fetches_are_serialized_and_keep_the_courtesy_interval(
     assert max_in_flight == 1
     assert len(starts) == 2
     assert starts[1] - starts[0] >= fetch.MIN_INTERVAL_SECONDS
+
+
+# --- Shared pacing across processes (v1.2) ----------------------------------
+
+
+def test_two_consecutive_fetches_in_one_process_are_two_seconds_apart(
+    monkeypatch: pytest.MonkeyPatch, cache: Cache
+) -> None:
+    """Sequential fetches in the same process still keep the courtesy interval."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(fetch, "time", clock)
+    monkeypatch.setattr(pacing, "time", clock)
+    monkeypatch.setattr(fetch, "_pacer", None)
+
+    starts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        starts.append(clock.monotonic())
+        return httpx.Response(200, text=PAGE_HTML)
+
+    with _client_for(handler) as client:
+        fetch_patent_html(PUB, client=client, cache=cache)
+        fetch_patent_html("US11461300B2", client=client, cache=cache)
+
+    assert len(starts) == 2
+    assert starts[1] - starts[0] == fetch.MIN_INTERVAL_SECONDS
+
+
+def test_a_fresh_pacer_in_the_same_directory_still_honours_the_prior_slot(
+    monkeypatch: pytest.MonkeyPatch, cache: Cache
+) -> None:
+    """Resetting ``_pacer`` (as a new process would start with) still waits the interval.
+
+    The state carrying the first slot lives on disk, not in ``_pacer``, so a
+    freshly created pacer pointed at the same directory reads it back.
+    """
+    clock = _VirtualClock()
+    monkeypatch.setattr(fetch, "time", clock)
+    monkeypatch.setattr(pacing, "time", clock)
+    monkeypatch.setattr(fetch, "_pacer", None)
+
+    starts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        starts.append(clock.monotonic())
+        return httpx.Response(200, text=PAGE_HTML)
+
+    with _client_for(handler) as client:
+        fetch_patent_html(PUB, client=client, cache=cache)
+
+    # Simulate a brand new process: a fresh Pacer instance, same directory
+    # (the pacing directory is pointed at tmp_path by the test conftest, and
+    # is untouched by this reset).
+    monkeypatch.setattr(fetch, "_pacer", None)
+
+    with _client_for(handler) as client:
+        fetch_patent_html("US11461300B2", client=client, cache=cache)
+
+    assert len(starts) == 2
+    assert starts[1] - starts[0] == fetch.MIN_INTERVAL_SECONDS
+
+
+def test_the_default_client_and_a_supplied_client_share_the_same_reservation(
+    monkeypatch: pytest.MonkeyPatch, cache: Cache
+) -> None:
+    """A fetch through the default client paces against the same slot as a supplied one."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(fetch, "time", clock)
+    monkeypatch.setattr(pacing, "time", clock)
+    monkeypatch.setattr(fetch, "_pacer", None)
+
+    starts: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        starts.append(clock.monotonic())
+        return httpx.Response(200, text=PAGE_HTML)
+
+    with _client_for(handler) as client:
+        fetch_patent_html(PUB, client=client, cache=cache)
+
+    monkeypatch.setattr(fetch, "build_default_client", lambda: _client_for(handler))
+    result = fetch_patent_html("US11461300B2", cache=cache)
+
+    assert isinstance(result, FetchedPage)
+    assert len(starts) == 2
+    assert starts[1] - starts[0] == fetch.MIN_INTERVAL_SECONDS
 
 
 # --- fetched_at (v1.1) -------------------------------------------------------
