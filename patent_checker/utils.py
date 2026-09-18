@@ -312,16 +312,18 @@ def usage_report(headers_path: Path | None = None, since: datetime | None = None
             when ``None``.
         since: When given, only lines whose ``"at"`` is at or after it are
             aggregated (including "first_at"/"last_at" and "today", which are
-            then built from that narrowed set only). ``"at"`` is always a
-            naive local timestamp (as written by ``OpsClient``); an
-            offset-aware *since* is converted to local time and its offset
-            dropped before the comparison, and the same is done to an
-            offset-aware ``"at"`` value, so both sides are always compared as
-            local, naive instants. A line whose ``"at"`` cannot be parsed as
-            a timestamp is excluded and counted in ``"undated_lines"``
-            instead of ``"skipped_lines"`` (its JSON was still well-formed).
-            Omitting *since* leaves every line, and the returned shape,
-            exactly as before this parameter existed.
+            then built from that narrowed set only). Both spellings of
+            ``"at"`` are accepted: the offset-aware one ``OpsClient`` writes
+            since v1.2, and the naive one written before it, which is read as
+            local time. Both sides of the comparison are converted to
+            offset-aware local time, so a line is judged by the instant it
+            means and not by how it is spelled; the same conversion decides
+            which lines fall into the ``"today"`` bucket. A naive *since* is
+            likewise read as local time. A line whose ``"at"`` cannot be
+            parsed as a timestamp is excluded and counted in
+            ``"undated_lines"`` instead of ``"skipped_lines"`` (its JSON was
+            still well-formed). Omitting *since* leaves every line, and the
+            returned shape, exactly as before this parameter existed.
 
     Returns:
         ``{"available": False, "path": str}`` when the log file does not
@@ -339,6 +341,9 @@ def usage_report(headers_path: Path | None = None, since: datetime | None = None
     if not path.exists():
         return {"available": False, "path": str(path)}
 
+    # Two spellings of the same bound: the aware one is what the comparison
+    # uses, the naive one is what the result reports (unchanged since v1.1).
+    since_aware = None if since is None else _as_local_aware(since)
     since_local = None if since is None else _as_local_naive(since)
 
     today = datetime.now().date()
@@ -374,12 +379,12 @@ def usage_report(headers_path: Path | None = None, since: datetime | None = None
             if not isinstance(at, str):
                 at = str(at)
 
-            if since_local is not None:
-                at_local = _log_at_as_local_naive(at)
-                if at_local is None:
+            if since_aware is not None:
+                at_aware = _log_at_as_local_aware(at)
+                if at_aware is None:
                     undated_lines += 1
                     continue
-                if at_local < since_local:
+                if at_aware < since_aware:
                     continue
 
             total_requests += 1
@@ -587,18 +592,32 @@ def _run_search_plan_check(
 def _local_date(at: Any) -> Any:
     """Return the local calendar date encoded in an ``"at"`` timestamp, or None.
 
+    The value is converted to local time first, so an offset-aware timestamp
+    counts towards the day it happened *here*: its offset may be another
+    machine's (or another season's), in which case the date spelled in the
+    string is not the local one.
+
     A log line written by another tool may carry a number (an epoch stamp) or
     any other type there; such a value is simply not a date this report can
     use, so it is reported as ``None`` rather than raising.
     """
-    try:
-        return datetime.fromisoformat(at).date()
-    except (TypeError, ValueError):
-        return None
+    local = _log_at_as_local_aware(at)
+    return None if local is None else local.date()
+
+
+def _as_local_aware(moment: datetime) -> datetime:
+    """Return *moment* as an offset-aware local datetime.
+
+    A naive value is assumed to be local time (which is how ``OpsClient``
+    wrote its log before v1.2); an offset-aware one is converted to local
+    time. Comparing two of these compares the instants they denote,
+    independently of how either was spelled.
+    """
+    return moment.astimezone()
 
 
 def _as_local_naive(moment: datetime) -> datetime:
-    """Return *moment* as a naive local datetime, matching how log timestamps are written.
+    """Return *moment* as a naive local datetime, the spelling ``"since"`` is reported in.
 
     An offset-aware value is converted to local time and its tzinfo dropped;
     a naive value is assumed to already be local time and returned as is.
@@ -608,10 +627,14 @@ def _as_local_naive(moment: datetime) -> datetime:
     return moment
 
 
-def _log_at_as_local_naive(at: str) -> datetime | None:
-    """Return a log line's ``"at"`` value as a naive local datetime, or None if unparseable."""
+def _log_at_as_local_aware(at: Any) -> datetime | None:
+    """Return a log line's ``"at"`` value as an offset-aware local datetime, or None.
+
+    ``None`` means the value is not a timestamp at all (a number, or any
+    other shape a foreign log line may carry).
+    """
     try:
         parsed = datetime.fromisoformat(at)
     except (TypeError, ValueError):
         return None
-    return _as_local_naive(parsed)
+    return _as_local_aware(parsed)

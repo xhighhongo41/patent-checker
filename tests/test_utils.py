@@ -6,7 +6,7 @@ client instead of a real OpsClient/httpx transport.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -629,6 +629,68 @@ def test_usage_report_since_counts_an_unparseable_at_as_undated(tmp_path: Path) 
     assert result["total_requests"] == 1
     assert result["undated_lines"] == 1
     assert result["skipped_lines"] == 0
+
+
+# --- usage_report: offset-aware log timestamps (v1.2) -----------------------
+
+
+def _in_a_foreign_offset(moment: datetime) -> str:
+    """Spell *moment* as the same instant seen from an offset 13 hours away.
+
+    The wall-clock date of that spelling is never the local date, so a report
+    that read the date straight out of the string would get it wrong. The
+    shift is taken towards UTC so the result stays inside the +/-24 h a fixed
+    offset may have, whatever timezone the test runs in.
+    """
+    offset = moment.utcoffset()
+    assert offset is not None, "moment must be offset-aware"
+    shift = timedelta(hours=-13) if offset >= timedelta(0) else timedelta(hours=13)
+    return moment.astimezone(timezone(offset + shift)).isoformat(timespec="seconds")
+
+
+def test_usage_report_counts_an_offset_aware_line_in_todays_bucket(tmp_path: Path) -> None:
+    """An offset-aware "at" is converted to local time before its date is taken."""
+    noon_local = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
+    aware_today = _in_a_foreign_offset(noon_local)
+    naive_today = noon_local.replace(tzinfo=None).isoformat(timespec="seconds")
+    lines = [
+        f'{{"at": "{aware_today}", "kind": "search", "url": "u1", "status": 200}}',
+        f'{{"at": "{naive_today}", "kind": "biblio", "url": "u2", "status": 200}}',
+        '{"at": "2020-01-01T00:00:00", "kind": "claims", "url": "u3", "status": 200}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path)
+
+    assert result["total_requests"] == 3
+    assert result["today"]["date"] == datetime.now().date().isoformat()
+    assert result["today"]["total_requests"] == 2
+    assert result["today"]["by_kind"] == {"search": 1, "biblio": 1}
+
+
+def test_usage_report_since_counts_naive_and_offset_aware_lines_alike(tmp_path: Path) -> None:
+    """Both spellings of "at" are compared with since as the instant they mean."""
+    bound = datetime(2026, 1, 2, 12, 0, 0)
+    early_naive = (bound - timedelta(hours=1)).isoformat(timespec="seconds")
+    late_naive = (bound + timedelta(hours=1)).isoformat(timespec="seconds")
+    early_aware = _in_a_foreign_offset((bound - timedelta(hours=2)).astimezone())
+    late_aware = _in_a_foreign_offset((bound + timedelta(hours=2)).astimezone())
+    lines = [
+        f'{{"at": "{early_naive}", "kind": "claims", "url": "u1", "status": 200}}',
+        f'{{"at": "{late_naive}", "kind": "search", "url": "u2", "status": 200}}',
+        f'{{"at": "{early_aware}", "kind": "family", "url": "u3", "status": 200}}',
+        f'{{"at": "{late_aware}", "kind": "biblio", "url": "u4", "status": 200}}',
+    ]
+    path = tmp_path / "headers.jsonl"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = usage_report(path, since=bound)
+
+    assert result["total_requests"] == 2
+    assert result["by_kind"] == {"search": 1, "biblio": 1}
+    assert result["undated_lines"] == 0
+    assert result["since"] == bound.isoformat(timespec="seconds")
 
 
 # --- Input-shape errors (v1.0: TypeError normalized to ValueError) ----------

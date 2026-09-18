@@ -5,17 +5,21 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 import pytest
 
+from patent_checker import pacing
 from patent_checker.net import AllowlistTransport, HostNotAllowedError
 from patent_checker.ops import client as ops_client
 from patent_checker.ops.client import (
+    BLOCK_SECONDS,
     COOL_DOWN_SECONDS,
     MIN_INTERVAL_SECONDS,
     OpsClient,
+    OpsServiceBlocked,
     parse_throttling_header,
 )
 from tests._fixtures import fixture_path
@@ -42,6 +46,13 @@ _OVERLOADED_HEADER = (
 _OVERLOADED_YELLOW_HEADER = (
     "overloaded (images=green:50, inpadoc=green:30, other=green:1000, "
     "retrieval=green:50, search=yellow:5)"
+)
+# Measured in v1.1: CLI searches started from separate processes 1-4 s apart
+# walked the search service from yellow through red to this, and the
+# response carrying it was an HTTP 403.
+_BLACK_SEARCH_HEADER = (
+    "busy (images=green:100, inpadoc=green:45, other=green:1000, "
+    "retrieval=green:100, search=black:0)"
 )
 
 
@@ -100,13 +111,20 @@ def _header_records(data_dir: Path) -> list[dict[str, object]]:
 
 @pytest.fixture(autouse=True)
 def ops_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Use dummy credentials, a temp data directory, and never sleep for real."""
+    """Use dummy credentials, a temp data directory, and never sleep for real.
+
+    The data directory is a subdirectory rather than ``tmp_path`` itself, so
+    that the shared pacing state (which ``conftest.py`` puts elsewhere under
+    ``tmp_path``) is not mistaken for something the client wrote there; see
+    :func:`_written_files`.
+    """
+    data_dir = tmp_path / "data"
     monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "dummy-key")
     monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "dummy-secret")
-    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(data_dir))
     # Rate limiting must not consume wall-clock time in tests.
     monkeypatch.setattr(ops_client.time, "sleep", lambda seconds: None)
-    return tmp_path
+    return data_dir
 
 
 # --- Range pre-validation ---------------------------------------------------
@@ -634,10 +652,12 @@ def test_an_injected_transport_is_used_as_is() -> None:
 
 
 class _VirtualClock:
-    """A monotonic clock that only advances when someone sleeps.
+    """A clock that only advances when someone sleeps.
 
     Tests must not depend on wall-clock timing, so the client's spacing is
-    measured against this clock instead.
+    measured against this clock instead. ``monotonic`` and ``time`` run on
+    the same scale here: the shared pacing state stores wall-clock times, so
+    a test that reasons about a reserved slot needs both to advance together.
     """
 
     def __init__(self) -> None:
@@ -649,11 +669,21 @@ class _VirtualClock:
         with self._lock:
             return self._now
 
+    def time(self) -> float:
+        """Return the current virtual time as a wall-clock (epoch) value."""
+        with self._lock:
+            return self._now
+
     def sleep(self, seconds: float) -> None:
         """Advance the virtual time by *seconds* (never backwards)."""
         with self._lock:
             if seconds > 0:
                 self._now += seconds
+
+    def advance(self, seconds: float) -> None:
+        """Advance the virtual time by *seconds*, for the test's own use."""
+        with self._lock:
+            self._now += seconds
 
 
 def test_concurrent_calls_are_serialized_and_keep_the_service_interval(
@@ -704,3 +734,266 @@ def test_concurrent_calls_are_serialized_and_keep_the_service_interval(
     assert max_in_flight == 1
     assert len(starts) == 2
     assert starts[1] - starts[0] >= MIN_INTERVAL_SECONDS["retrieval"]
+
+
+# --- Pacing shared with the user's other processes (v1.2) -------------------
+
+
+@pytest.fixture
+def shared_clock(monkeypatch: pytest.MonkeyPatch) -> _VirtualClock:
+    """Install one virtual clock in both the client and the pacing module.
+
+    The shared state stores wall-clock times, so the two modules have to
+    agree on what "now" is before a test can reason about a reserved slot.
+    The pacing directory itself is isolated per test by ``conftest.py``.
+    """
+    clock = _VirtualClock()
+    monkeypatch.setattr(ops_client, "time", clock)
+    monkeypatch.setattr(pacing, "time", clock)
+    return clock
+
+
+def _stamped(
+    clock: _VirtualClock,
+    stamps: list[float],
+    *,
+    throttling: str | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Return a 200 responder recording the virtual time of every API request.
+
+    The token handshake is answered by :class:`_Recorder` itself, so only the
+    requests a test is pacing reach this responder.
+    """
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        stamps.append(clock.time())
+        headers = {} if throttling is None else {"X-Throttling-Control": throttling}
+        return httpx.Response(200, content=b"<ok/>", headers=headers)
+
+    return responder
+
+
+def _block_the_search_service() -> None:
+    """Drive one client into an OPS block: a 403 reporting ``search=black:0``."""
+    client, _ = _make_client(
+        lambda request: httpx.Response(
+            403,
+            content=b"<fault/>",
+            headers={"X-Throttling-Control": _BLACK_SEARCH_HEADER},
+        )
+    )
+    with client, pytest.raises(httpx.HTTPStatusError):
+        client.search("ta=computer")
+
+
+def _shared_state() -> dict[str, object]:
+    """Return the ``ops`` section of the shared pacing state file."""
+    state = json.loads(pacing.Pacer().path.read_text(encoding="utf-8"))
+    return state["ops"]
+
+
+def test_a_second_client_waits_out_the_first_clients_search_interval(
+    shared_clock: _VirtualClock,
+) -> None:
+    """Two clients (as two processes are) keep one search interval between them."""
+    first: list[float] = []
+    second: list[float] = []
+    client_a, _ = _make_client(_stamped(shared_clock, first))
+    client_b, _ = _make_client(_stamped(shared_clock, second))
+
+    with client_a:
+        client_a.search("ta=computer")
+    with client_b:
+        client_b.search("ta=computer")
+
+    # Client B has no memory of client A's request: the wait can only come
+    # from the shared state.
+    assert second[0] - first[0] == pytest.approx(MIN_INTERVAL_SECONDS["search"])
+
+
+def test_a_cool_down_noted_by_one_client_delays_the_other(
+    shared_clock: _VirtualClock,
+) -> None:
+    """A non-green colour seen by one client pauses every service for the next one."""
+    cooled: list[float] = []
+    later: list[float] = []
+    client_a, _ = _make_client(_stamped(shared_clock, cooled, throttling=_BUSY_YELLOW_HEADER))
+    client_b, _ = _make_client(_stamped(shared_clock, later))
+
+    with client_a:
+        client_a.search("ta=computer")
+    with client_b:
+        client_b.biblio("EP4645156A1")
+
+    assert later[0] - cooled[0] == pytest.approx(COOL_DOWN_SECONDS)
+
+
+def test_an_overloaded_header_from_one_client_tightens_the_other(
+    shared_clock: _VirtualClock,
+) -> None:
+    """The tightened intervals of an "overloaded" report reach the next client."""
+    first: list[float] = []
+    second: list[float] = []
+    client_a, _ = _make_client(_stamped(shared_clock, first, throttling=_OVERLOADED_HEADER))
+    client_b, _ = _make_client(_stamped(shared_clock, second))
+
+    with client_a:
+        client_a.search("ta=computer")
+    with client_b:
+        client_b.search("ta=computer")
+
+    # search=5/min -> 12 s, while client B's own state still says 4 s.
+    assert client_b._interval_for("search") == MIN_INTERVAL_SECONDS["search"]
+    assert second[0] - first[0] == pytest.approx(12.0)
+
+
+def test_an_idle_header_clears_the_tightening_for_the_other_client(
+    shared_clock: _VirtualClock,
+) -> None:
+    """Once the system reports idle again, the next client is back to static spacing."""
+    reports = [_OVERLOADED_HEADER, _IDLE_HEADER]
+    first: list[float] = []
+    second: list[float] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        first.append(shared_clock.time())
+        return httpx.Response(
+            200, content=b"<ok/>", headers={"X-Throttling-Control": reports.pop(0)}
+        )
+
+    client_a, _ = _make_client(responder)
+    client_b, _ = _make_client(_stamped(shared_clock, second))
+
+    with client_a:
+        client_a.search("ta=computer")
+        client_a.search("ta=database")
+    with client_b:
+        client_b.search("ta=computer")
+
+    assert first[1] - first[0] == pytest.approx(12.0)
+    assert second[0] - first[1] == pytest.approx(MIN_INTERVAL_SECONDS["search"])
+
+
+def test_a_forbidden_black_search_records_a_block_in_the_shared_state(
+    shared_clock: _VirtualClock,
+) -> None:
+    """A 403 reporting black for the service just used is written down as a block."""
+    _block_the_search_service()
+
+    section = _shared_state()
+    assert section["blocked_until"]["search"] == pytest.approx(shared_clock.time() + BLOCK_SECONDS)
+    reason = section["blocked_reason"]["search"]
+    assert "403" in reason
+    assert "search=black:0" in reason
+    # The reason ends in the local time of the refusal, offset included.
+    assert datetime.fromisoformat(reason.split(" at ")[-1]).utcoffset() is not None
+
+
+def test_a_blocked_service_refuses_the_next_request_without_any_upstream_call(
+    shared_clock: _VirtualClock,
+) -> None:
+    """A fresh client raises before sending anything, not even the token handshake."""
+    _block_the_search_service()
+
+    client, recorder = _make_client(_ok(b"<ok/>"))
+    with client, pytest.raises(OpsServiceBlocked, match="search"):
+        client.search("ta=computer")
+
+    assert recorder.requests == []
+
+
+def test_a_block_stops_only_the_blocked_service(shared_clock: _VirtualClock) -> None:
+    """Retrieval keeps working while search is blocked."""
+    _block_the_search_service()
+
+    client, recorder = _make_client(_ok(b"<ok/>"))
+    with client:
+        assert client.biblio("EP4645156A1") == b"<ok/>"
+
+    assert len(recorder.api_requests) == 1
+
+
+def test_a_block_lapses_once_the_block_window_has_passed(
+    shared_clock: _VirtualClock,
+) -> None:
+    """Recovery is purely time-based: after BLOCK_SECONDS the service is tried again."""
+    _block_the_search_service()
+    shared_clock.advance(BLOCK_SECONDS)
+
+    client, recorder = _make_client(_ok(b"<ok/>"))
+    with client:
+        assert client.search("ta=computer") == b"<ok/>"
+
+    assert len(recorder.api_requests) == 1
+
+
+def test_a_black_colour_reported_by_another_service_neither_blocks_nor_cools_down(
+    shared_clock: _VirtualClock,
+) -> None:
+    """Only the colour of the service just used is trusted (measured in v1.1).
+
+    After a block was lifted, legal and family responses still reported
+    ``search=black:0`` and ``search=green:15`` alternately, so such a colour
+    says nothing about the search service.
+    """
+    ignored: list[float] = []
+    client_a, _ = _make_client(_stamped(shared_clock, ignored, throttling=_BLACK_SEARCH_HEADER))
+    with client_a:
+        client_a.legal("EP4645156A1")
+
+    assert client_a._cool_down_until == 0.0
+    assert pacing.Pacer().blocked_until("ops", "search") is None
+    assert _shared_state().get("cool_down_until", 0.0) == 0.0
+
+    searched: list[float] = []
+    client_b, recorder = _make_client(_stamped(shared_clock, searched))
+    with client_b:
+        assert client_b.search("ta=computer") == b"<ok/>"
+
+    assert len(recorder.api_requests) == 1
+
+
+def test_the_block_error_names_the_service_and_when_to_retry() -> None:
+    """The message carries the service and an offset-aware ISO retry time."""
+    error = OpsServiceBlocked("search", 1_700_000_000.0)
+
+    message = str(error)
+    assert "search" in message
+    spelled = message.split("retry after ", 1)[1]
+    parsed = datetime.fromisoformat(spelled)
+    assert parsed.utcoffset() is not None
+    assert parsed.timestamp() == pytest.approx(1_700_000_000.0)
+    assert (error.service, error.until) == ("search", 1_700_000_000.0)
+
+
+def test_the_request_log_timestamp_carries_the_utc_offset(ops_env: Path) -> None:
+    """Every "at" is local time *with* its offset, so a log stays readable elsewhere."""
+    client, _ = _make_client(_ok(b"<ok/>"))
+    with client:
+        client.claims("EP4645156A1")
+
+    records = _header_records(ops_env)
+    assert len(records) == 2
+    for record in records:
+        assert datetime.fromisoformat(str(record["at"])).utcoffset() is not None
+
+
+def test_an_unusable_shared_state_falls_back_to_in_process_pacing(
+    shared_clock: _VirtualClock, tmp_path: Path
+) -> None:
+    """A pacer that cannot use its directory degrades to the pre-v1.2 behaviour."""
+    # A plain file where the pacing directory should be: creating the
+    # directory fails, which is what degradation is for.
+    blocker = tmp_path / "unusable-pacing-dir"
+    blocker.write_text("", encoding="utf-8")
+    pacer = pacing.Pacer(blocker)
+
+    stamps: list[float] = []
+    recorder = _Recorder(_stamped(shared_clock, stamps))
+    client = OpsClient(transport=httpx.MockTransport(recorder), pacer=pacer)
+    with client:
+        client.search("ta=computer")
+        client.search("ta=database")
+
+    assert pacer.available is False
+    assert stamps[1] - stamps[0] == pytest.approx(MIN_INTERVAL_SECONDS["search"])
