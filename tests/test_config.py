@@ -605,3 +605,289 @@ def test_log_level_rejects_an_invalid_value(monkeypatch) -> None:
 
     with pytest.raises(config.ConfigError):
         config.log_level()
+
+
+# --- per-user credentials file ---------------------------------------------
+
+
+_FAKE_USER_KEY = "fake-user-key"
+_FAKE_USER_SECRET = "fake-user-secret"
+
+
+@pytest.fixture
+def clean_ops_env(monkeypatch) -> None:
+    """Remove every OPS variable, and remove again whatever a test loads into it.
+
+    ``monkeypatch.delenv`` on an unset name records nothing to undo, so each
+    name is set first: undoing the pair then deletes the name, even when the
+    code under test wrote it straight into ``os.environ`` meanwhile.
+    """
+    for name in config.OPS_CREDENTIAL_VARIABLES:
+        monkeypatch.setenv(name, "placeholder")
+        monkeypatch.delenv(name)
+
+
+def _write_user_file(text: str, mode: int = 0o600) -> Path:
+    """Write the per-user credentials file (the path conftest isolates) and return it."""
+    path = config.credentials_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, mode)
+    return path
+
+
+def _user_file_with_both() -> Path:
+    """Write a user file defining both OPS secrets directly."""
+    return _write_user_file(
+        f"PATENT_CHECKER_OPS_KEY={_FAKE_USER_KEY}\nPATENT_CHECKER_OPS_SECRET={_FAKE_USER_SECRET}\n"
+    )
+
+
+def test_credentials_path_honours_the_env_var(monkeypatch, tmp_path) -> None:
+    """``$PATENT_CHECKER_CREDENTIALS_FILE`` names the file when set."""
+    target = tmp_path / "elsewhere" / "creds.env"
+    monkeypatch.setenv(config.ENV_CREDENTIALS_FILE, str(target))
+
+    assert config.credentials_path() == target
+
+
+def test_credentials_path_defaults_next_to_the_user_consent_record(monkeypatch, tmp_path) -> None:
+    """Without the env var, the file sits in ``$XDG_CONFIG_HOME/patent-checker``."""
+    monkeypatch.delenv(config.ENV_CREDENTIALS_FILE)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+
+    assert (
+        config.credentials_path() == tmp_path / "xdg-config" / "patent-checker" / "credentials.env"
+    )
+
+
+def test_credentials_path_falls_back_to_dot_config(monkeypatch, tmp_path) -> None:
+    """With neither variable set (or the override empty), ``~/.config`` is used."""
+    fake_home = tmp_path / "fake-home"
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.setenv(config.ENV_CREDENTIALS_FILE, "")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+    assert config.credentials_path() == fake_home / ".config" / "patent-checker" / "credentials.env"
+
+
+def test_ops_credentials_fall_back_to_the_user_file(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """With no OPS variable anywhere else, the per-user file supplies them."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+
+    assert config.ops_credentials() == (_FAKE_USER_KEY, _FAKE_USER_SECRET)
+    assert config.ops_configured() is True
+
+
+def test_process_environment_beats_the_user_file(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """Credentials in the process environment win; the user file is not read."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "fake-env-key")
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "fake-env-secret")
+
+    assert config.ops_credentials() == ("fake-env-key", "fake-env-secret")
+
+
+def test_project_dotenv_beats_the_user_file(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """A project ``.env`` defining the credentials wins over the user file."""
+    _home, project, sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(
+        "PATENT_CHECKER_OPS_KEY=fake-dotenv-key\nPATENT_CHECKER_OPS_SECRET=fake-dotenv-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+
+    assert config.ops_credentials() == ("fake-dotenv-key", "fake-dotenv-secret")
+
+
+def test_process_environment_beats_project_dotenv_and_user_file(
+    monkeypatch, tmp_path, clean_ops_env
+) -> None:
+    """The full order: process environment, then project ``.env``, then user file."""
+    _home, project, sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(
+        "PATENT_CHECKER_OPS_KEY=fake-dotenv-key\nPATENT_CHECKER_OPS_SECRET=fake-dotenv-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "fake-env-key")
+
+    assert config.ops_credentials() == ("fake-env-key", "fake-dotenv-secret")
+
+
+@pytest.mark.parametrize("name", config.OPS_CREDENTIAL_VARIABLES)
+def test_any_ops_variable_disables_the_user_file(
+    monkeypatch, tmp_path, clean_ops_env, name
+) -> None:
+    """One OPS variable set elsewhere (``_FILE`` variants included) means no mixing."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+    monkeypatch.setenv(name, "fake-partial-value")
+
+    assert config.ops_configured() is False
+    other_names = [other for other in config.OPS_CREDENTIAL_VARIABLES if other != name]
+    assert all(other not in os.environ for other in other_names)
+
+
+def test_project_dotenv_with_only_a_file_variant_disables_the_user_file(
+    monkeypatch, tmp_path, clean_ops_env
+) -> None:
+    """An OPS ``_FILE`` variable from the project ``.env`` also keeps the user file out."""
+    _home, project, sub = _home_tree(monkeypatch, tmp_path)
+    (project / ".env").write_text(
+        f"PATENT_CHECKER_OPS_KEY_FILE={tmp_path / 'missing-key.txt'}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+
+    assert config.ops_configured() is False
+    assert "PATENT_CHECKER_OPS_KEY" not in os.environ
+    assert "PATENT_CHECKER_OPS_SECRET" not in os.environ
+
+
+def test_user_file_does_not_inject_unrelated_variables(
+    monkeypatch, tmp_path, clean_ops_env
+) -> None:
+    """Keys other than the four OPS variables in the user file are ignored."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    monkeypatch.delenv(_LOAD_ENV_VAR, raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_DATA_DIR", raising=False)
+    _write_user_file(
+        f"PATENT_CHECKER_OPS_KEY={_FAKE_USER_KEY}\n"
+        f"PATENT_CHECKER_OPS_SECRET={_FAKE_USER_SECRET}\n"
+        f"{_LOAD_ENV_VAR}=injected\n"
+        "PATENT_CHECKER_DATA_DIR=/injected\n"
+    )
+
+    assert config.ops_configured() is True
+    assert _LOAD_ENV_VAR not in os.environ
+    assert "PATENT_CHECKER_DATA_DIR" not in os.environ
+
+
+def test_missing_user_file_is_a_no_op(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """Without the user file, nothing is loaded and nothing is raised."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    assert not config.credentials_path().exists()
+
+    config._load_user_credentials(force=True)
+
+    assert config.ops_configured() is False
+    assert all(name not in os.environ for name in config.OPS_CREDENTIAL_VARIABLES)
+
+
+def test_user_file_may_use_the_file_variants(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """``_FILE`` variables inside the user file resolve like anywhere else."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    key_file = tmp_path / "key.txt"
+    secret_file = tmp_path / "secret.txt"
+    key_file.write_text(f"{_FAKE_USER_KEY}\n", encoding="utf-8")
+    secret_file.write_text(f"{_FAKE_USER_SECRET}\n", encoding="utf-8")
+    _write_user_file(
+        f"PATENT_CHECKER_OPS_KEY_FILE={key_file}\nPATENT_CHECKER_OPS_SECRET_FILE={secret_file}\n"
+    )
+
+    assert config.ops_credentials() == (_FAKE_USER_KEY, _FAKE_USER_SECRET)
+
+
+def test_user_file_is_considered_once_per_process(monkeypatch, tmp_path, clean_ops_env) -> None:
+    """A second lookup does not re-read the file; ``force=True`` does."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+
+    config._load_user_credentials()
+    assert os.environ["PATENT_CHECKER_OPS_KEY"] == _FAKE_USER_KEY
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY")
+    config._load_user_credentials()
+    assert "PATENT_CHECKER_OPS_KEY" not in os.environ
+
+    monkeypatch.delenv("PATENT_CHECKER_OPS_SECRET")
+    config._load_user_credentials(force=True)
+    assert os.environ["PATENT_CHECKER_OPS_KEY"] == _FAKE_USER_KEY
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_user_file_readable_by_others_warns_once(
+    monkeypatch, tmp_path, clean_ops_env, caplog
+) -> None:
+    """A 0644 file is still used, after one warning that never quotes its content."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    path = _user_file_with_both()
+    os.chmod(path, 0o644)
+
+    with caplog.at_level("WARNING", logger="patent_checker.config"):
+        config._load_user_credentials(force=True)
+        for name in config.OPS_CREDENTIAL_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+        config._load_user_credentials(force=True)
+
+    warnings = [record for record in caplog.records if record.name == "patent_checker.config"]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert f"chmod 600 {path}" in message
+    assert _FAKE_USER_KEY not in caplog.text
+    assert _FAKE_USER_SECRET not in caplog.text
+    assert os.environ["PATENT_CHECKER_OPS_KEY"] == _FAKE_USER_KEY
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-specific file modes")
+def test_owner_only_user_file_does_not_warn(monkeypatch, tmp_path, clean_ops_env, caplog) -> None:
+    """A 0600 file is read silently."""
+    _home, _project, sub = _home_tree(monkeypatch, tmp_path)
+    monkeypatch.chdir(sub)
+    _user_file_with_both()
+
+    with caplog.at_level("WARNING", logger="patent_checker.config"):
+        assert config.ops_configured() is True
+
+    assert [record for record in caplog.records if record.name == "patent_checker.config"] == []
+
+
+def test_credentials_file_mode_ok_is_none_for_a_missing_file(tmp_path) -> None:
+    """There is nothing to judge when the file does not exist."""
+    assert config.credentials_file_mode_ok(tmp_path / "absent.env") is None
+
+
+def test_credentials_file_mode_ok_is_none_on_windows(monkeypatch, tmp_path) -> None:
+    """Windows has no POSIX modes, so no verdict is given there."""
+    path = tmp_path / "creds.env"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(os, "name", "nt")
+
+    assert config.credentials_file_mode_ok(path) is None
+
+
+def test_read_credentials_file_keeps_only_non_empty_ops_variables(tmp_path) -> None:
+    """Unrelated and empty entries are dropped."""
+    path = tmp_path / "creds.env"
+    path.write_text(
+        "PATENT_CHECKER_OPS_KEY=fake-key\nPATENT_CHECKER_OPS_SECRET=\nOTHER=value\n",
+        encoding="utf-8",
+    )
+
+    assert config.read_credentials_file(path) == {"PATENT_CHECKER_OPS_KEY": "fake-key"}
+
+
+def test_missing_credentials_error_mentions_the_credentials_command(
+    monkeypatch, clean_ops_env
+) -> None:
+    """The error for missing credentials points at ``patent-checker credentials set``."""
+    with pytest.raises(config.ConfigError, match="patent-checker credentials set"):
+        config._resolve_secret("OPS_KEY")
+
+
+def test_resolve_secret_reads_from_a_given_mapping(monkeypatch, clean_ops_env) -> None:
+    """An explicit mapping is resolved instead of the process environment."""
+    assert config._resolve_secret("OPS_KEY", {"PATENT_CHECKER_OPS_KEY": "fake-key"}) == "fake-key"

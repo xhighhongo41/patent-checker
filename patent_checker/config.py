@@ -1,18 +1,23 @@
 """Configuration for patent-checker.
 
-Loads credentials from a ``.env`` file and resolves the local directory
-where raw API responses are stored.
+Loads credentials from the environment, a project ``.env`` file or the
+per-user credentials file, and resolves the local directory where raw API
+responses are stored.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
-from collections.abc import Collection
+import stat
+from collections.abc import Collection, Mapping
 from datetime import timedelta
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
+
+from patent_checker import consent
 
 # The only upstream hosts patent-checker is allowed to contact. Enforced by
 # ``patent_checker.net.AllowlistTransport`` before any connection is made.
@@ -22,6 +27,26 @@ ENV_CACHE_DIR = "PATENT_CHECKER_CACHE_DIR"
 ENV_CACHE_TTL = "PATENT_CHECKER_CACHE_TTL"
 ENV_LOG_LEVEL = "PATENT_CHECKER_LOG_LEVEL"
 ENV_PACING_DIR = "PATENT_CHECKER_PACING_DIR"
+ENV_CREDENTIALS_FILE = "PATENT_CHECKER_CREDENTIALS_FILE"
+
+# The only variables that carry OPS credentials. They are the only names the
+# per-user credentials file may set, and setting any one of them (in the
+# process environment or a project ``.env``) disables that file entirely.
+OPS_CREDENTIAL_VARIABLES: tuple[str, ...] = (
+    "PATENT_CHECKER_OPS_KEY",
+    "PATENT_CHECKER_OPS_SECRET",
+    "PATENT_CHECKER_OPS_KEY_FILE",
+    "PATENT_CHECKER_OPS_SECRET_FILE",
+)
+
+# File name of the per-user credentials file, next to the consent record.
+_CREDENTIALS_FILENAME = "credentials.env"
+
+# Permission bits that must be clear on the credentials file (POSIX only):
+# anything granted to the group or to others.
+_NON_OWNER_BITS = 0o077
+
+_LOGGER = logging.getLogger(__name__)
 
 # Accepted values of ``ENV_LOG_LEVEL``, matched case-insensitively.
 LOG_LEVELS = ("debug", "info", "warning", "error")
@@ -38,6 +63,14 @@ _data_base_override: Path | None = None
 # called from several entry points, and re-reading would mean walking the
 # directory tree again on every credential lookup.
 _dotenv_loaded = False
+
+# Latch making :func:`_load_user_credentials` consider the per-user
+# credentials file at most once per process, for the same reason.
+_user_credentials_loaded = False
+
+# One warning per process about a credentials file readable by others: it is
+# the same file every time, so repeating the warning would only add noise.
+_credentials_mode_warning_emitted = False
 
 
 class ConfigError(RuntimeError):
@@ -108,6 +141,119 @@ def load_env(*, force: bool = False) -> None:
         if candidate.is_file():
             load_dotenv(candidate, override=False)
             return
+
+
+def credentials_path() -> Path:
+    """Return the path of the per-user credentials file, without creating it.
+
+    ``$PATENT_CHECKER_CREDENTIALS_FILE`` if set and non-empty, otherwise
+    ``credentials.env`` next to the per-user consent record, i.e.
+    ``$XDG_CONFIG_HOME/patent-checker/credentials.env`` (default
+    ``~/.config/patent-checker/credentials.env``) on every platform.
+    """
+    env_value = os.environ.get(ENV_CREDENTIALS_FILE)
+    if env_value:
+        return Path(env_value)
+    return consent.user_consent_path().parent / _CREDENTIALS_FILENAME
+
+
+def credentials_file_mode_ok(path: Path) -> bool | None:
+    """Report whether *path* is private to its owner.
+
+    Args:
+        path: The credentials file to inspect.
+
+    Returns:
+        ``True`` when neither the group nor others have any permission on
+        the file, ``False`` when they do, and ``None`` when the question
+        does not apply: on Windows (no POSIX modes) or when the file cannot
+        be inspected (typically because it does not exist).
+    """
+    if os.name == "nt":
+        return None
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return None
+    return not mode & _NON_OWNER_BITS
+
+
+def read_credentials_file(path: Path) -> dict[str, str]:
+    """Read the OPS credential variables defined in a dotenv-style file.
+
+    Only the names in :data:`OPS_CREDENTIAL_VARIABLES` are returned, and
+    only those with a non-empty value: any other key in the file is
+    ignored, so the file cannot inject unrelated variables.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The OPS variables the file defines, by name.
+
+    Raises:
+        OSError: If the file exists but cannot be read.
+    """
+    values = dotenv_values(path, encoding="utf-8")
+    found: dict[str, str] = {}
+    for name in OPS_CREDENTIAL_VARIABLES:
+        value = values.get(name)
+        if value:
+            found[name] = value
+    return found
+
+
+def _warn_if_readable_by_others(path: Path) -> None:
+    """Warn, once per process, when the credentials file is not owner-only.
+
+    The warning names the file and the command that fixes it; it never
+    includes anything read from the file.
+    """
+    global _credentials_mode_warning_emitted
+    if _credentials_mode_warning_emitted:
+        return
+    if credentials_file_mode_ok(path) is False:
+        _credentials_mode_warning_emitted = True
+        _LOGGER.warning(
+            "the credentials file %s is readable by other users; restrict it with: chmod 600 %s",
+            path,
+            path,
+        )
+
+
+def _load_user_credentials(*, force: bool = False) -> None:
+    """Fill in OPS credentials from the per-user credentials file, once per process.
+
+    The file (see :func:`credentials_path`) is the last resort: it is only
+    read when none of :data:`OPS_CREDENTIAL_VARIABLES` is set (non-empty) in
+    the environment, which by then also holds whatever the project ``.env``
+    defined (:func:`load_env` runs first). The credentials are then taken
+    from one place only, never mixed from two. Only those four names are
+    copied into the environment; other keys in the file are ignored. A
+    missing file is not an error. A file other users can read is still
+    used, after a warning (POSIX only).
+
+    Args:
+        force: Consider the file again even if it was already considered.
+            Meant for tests.
+    """
+    global _user_credentials_loaded
+    if _user_credentials_loaded and not force:
+        return
+    # Latched before the checks, so an unsuccessful attempt is not repeated.
+    _user_credentials_loaded = True
+    if any(os.environ.get(name) for name in OPS_CREDENTIAL_VARIABLES):
+        return
+    path = credentials_path()
+    if not path.is_file():
+        return
+    _warn_if_readable_by_others(path)
+    try:
+        values = read_credentials_file(path)
+    except OSError as exc:
+        _LOGGER.warning("cannot read the credentials file %s (%s)", path, exc.strerror or exc)
+        return
+    os.environ.update(values)
 
 
 def set_data_base(path: Path | None) -> None:
@@ -314,13 +460,19 @@ def log_level() -> str:
     return normalized
 
 
-def _resolve_secret(name: str) -> str:
+def _resolve_secret(name: str, environ: Mapping[str, str] | None = None) -> str:
     """Resolve one secret value from ``PATENT_CHECKER_<name>`` or its ``_FILE`` variant.
 
     Exactly one of ``PATENT_CHECKER_<name>`` and ``PATENT_CHECKER_<name>_FILE``
     may be set. The ``_FILE`` variant is read from disk and stripped; an
     empty (or whitespace-only) file is treated as a configuration error, not
     as an empty secret.
+
+    Args:
+        name: The secret's name without the prefix, e.g. ``"OPS_KEY"``.
+        environ: The variables to resolve from; ``None`` means
+            :data:`os.environ`. Lets a caller check a prospective
+            environment without modifying the real one.
 
     Raises:
         ConfigError: If neither variable is set, if both are set, if the
@@ -329,8 +481,9 @@ def _resolve_secret(name: str) -> str:
     """
     direct_name = f"PATENT_CHECKER_{name}"
     file_name = f"{direct_name}_FILE"
-    direct_value = os.environ.get(direct_name, "")
-    file_path = os.environ.get(file_name, "")
+    variables = os.environ if environ is None else environ
+    direct_value = variables.get(direct_name, "")
+    file_path = variables.get(file_name, "")
 
     if direct_value and file_path:
         raise ConfigError(f"{direct_name} and {file_name} are both set; ambiguous configuration")
@@ -348,7 +501,8 @@ def _resolve_secret(name: str) -> str:
         return value
 
     raise ConfigError(
-        f"{direct_name} / {file_name} are not set; copy .env.example to .env and fill them in"
+        f"{direct_name} / {file_name} are not set; run `patent-checker credentials set` "
+        "to store them for your user, or copy .env.example to .env and fill them in"
     )
 
 
@@ -359,10 +513,17 @@ def ops_credentials() -> tuple[str, str]:
     ``PATENT_CHECKER_OPS_SECRET``) or via a file
     (``PATENT_CHECKER_OPS_KEY_FILE`` / ``PATENT_CHECKER_OPS_SECRET_FILE``).
 
+    The variables are looked up in this order: the process environment,
+    then the nearest project ``.env`` (:func:`load_env`), then the per-user
+    credentials file (:func:`credentials_path`, written by
+    ``patent-checker credentials set``). The per-user file is only used
+    when neither of the first two sets any OPS variable at all.
+
     Raises:
         ConfigError: If either secret is missing, ambiguous, or unreadable.
     """
     load_env()
+    _load_user_credentials()
     key = _resolve_secret("OPS_KEY")
     secret = _resolve_secret("OPS_SECRET")
     return key, secret

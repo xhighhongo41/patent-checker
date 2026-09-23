@@ -59,3 +59,21 @@ def _isolate_pacing_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
     to every test rather than per test module.
     """
     monkeypatch.setenv(config.ENV_PACING_DIR, str(tmp_path / "pacing"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point the per-user credentials file at a non-existent file of this test.
+
+    ``config.ops_credentials`` falls back to ``config.credentials_path()``,
+    which defaults to a file under the real user's configuration directory.
+    No test may read (or write) that file, so every test gets a path that
+    does not exist unless the test itself creates it. The once-per-process
+    latches of the loader and of its permission warning are reset too, for
+    the same reason as :func:`_reset_dotenv_loaded`.
+    """
+    monkeypatch.setenv(
+        config.ENV_CREDENTIALS_FILE, str(tmp_path / "user-config" / "credentials.env")
+    )
+    monkeypatch.setattr(config, "_user_credentials_loaded", False)
+    monkeypatch.setattr(config, "_credentials_mode_warning_emitted", False)

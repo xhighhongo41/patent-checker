@@ -22,15 +22,15 @@ import json
 import os
 import shlex
 import shutil
-import stat
 import subprocess
-import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from patent_checker.utils import OWNER_ONLY_MODE, write_atomically
 
 from .errors import InstallerError
 
@@ -50,7 +50,11 @@ _DEFAULT_INDENT = 2
 _WIDE_INDENT = 4
 
 #: Mode given to configuration files we create; they may hold a token.
-_OWNER_ONLY = 0o600
+_OWNER_ONLY = OWNER_ONLY_MODE
+
+# The atomic, optionally owner-only writer lives in the core package so the
+# credentials module can share it; the private name is kept for call sites.
+_write_atomically = write_atomically
 
 #: Seconds a vendor CLI may run before it is treated as unusable.
 _CLI_TIMEOUT = 60
@@ -169,52 +173,6 @@ def _back_up(path: Path, *, sensitive: bool) -> Path | None:
     if sensitive and os.name != "nt":
         os.chmod(backup, _OWNER_ONLY)
     return backup
-
-
-def _write_atomically(path: Path, text: str, *, sensitive: bool = False) -> None:
-    """Replace *path* with *text*, creating parent directories as needed.
-
-    The text is written to a temporary file in the destination directory
-    and moved onto the target, so a crash never leaves a half-written
-    configuration file.
-
-    Args:
-        path: The file to replace.
-        text: Its new content.
-        sensitive: Whether *text* embeds the bearer token. A sensitive file
-            keeps the owner-only mode of the temporary file even when it
-            existed before, so a token cannot end up in a world-readable
-            configuration; a file that only references an environment
-            variable keeps whatever mode the user gave it.
-
-    Note:
-        Windows has no POSIX modes, so the mode is left to the directory's
-        inherited ACL there (as elsewhere in this module).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        previous_mode: int | None = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        previous_mode = None
-    if sensitive:
-        previous_mode = None
-    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-        # ``mkstemp`` already restricts the new file to its owner, which is
-        # what we want for a file we create and for every file holding a
-        # token; only an existing, non-sensitive file needs its own mode
-        # restored. Windows has no POSIX modes to preserve.
-        if previous_mode is not None and os.name != "nt":
-            os.chmod(tmp_path, previous_mode)
-        elif sensitive and os.name != "nt":
-            os.chmod(tmp_path, _OWNER_ONLY)
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def merge_json(
