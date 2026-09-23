@@ -12,6 +12,11 @@ report replaces the earlier one as the document to read, and the earlier
 one stays on disk as the record of what was known then. What differs from
 the previous run goes into "Changes since the previous exploration".
 
+The report opens with the disclaimer, then "In plain terms" — the same
+picture as §5–§9 told without patent vocabulary, each item pointing to the
+section that holds the detail — and only then the changes and the numbered
+sections.
+
 ---
 
 # [Target name] — Prior-art exploration report
@@ -44,6 +49,50 @@ the previous run goes into "Changes since the previous exploration".
 > of the review that followed; §8 holds that review record.
 > [In degraded mode, add the four-item limitation notice here — SKILL.md
 > step 11.]
+
+## In plain terms
+[Write this for a reader who knows neither patents nor law, but do not say
+so in the report. Use everyday words and no patent vocabulary: not
+"claim", "element", "family", "kind code" or "prior art" — say "what the
+patent protects", "the mechanism the patent describes", "the same
+invention filed in several countries".
+
+3–8 bullets of 1–3 sentences. One bullet per part of the target (a
+function, a processing step, a design choice) that at least one document
+came near; add one bullet for the design boundaries of §9 if there are
+any. Each bullet says:
+- what that part of the target does, in plain words;
+- which documents it was compared with, and how many;
+- where they ended up, using only what the report already records — the
+  three observations, the section a document was placed in (§5.1 rights in
+  force, §5.2 set aside because the target lacks something they require,
+  §5.3 still pending, §9 would come near only if the target were extended)
+  and counts;
+- in parentheses, the section to read next, by number and heading.
+
+Say the three observations in plain words and give the report's own term
+in brackets the first time: "the wording of what the patent protects
+points toward this part (reads-on direction)", "the target lacks something
+the patent requires (lacks)", "the wording alone does not settle it
+(unclear)".
+
+Carry the degree only through those observations, sections and counts. Do
+not introduce a scale, rating, percentage or any word of degree such as
+"high", "low", "likely", "safe" or "dangerous". This section adds no
+judgment and never says more than §5–§9 say. In a follow-up run it
+describes the current picture; the changes come in the next section.]
+
+- [The part of the target, in everyday words] was compared with [n]
+  patents that describe a similar mechanism. For [n] of them, still in
+  force, [the wording of what the patent protects points toward this part
+  (reads-on direction) / the wording alone does not settle it (unclear)];
+  for the other [n], the target lacks a step each of them requires
+  (lacks). (Details: §5.1
+  Correspondence with rights in force; §5.2 Key documents confirmed in the
+  lacks direction)
+- [A direction the target could be extended in] would bring it near [n]
+  documents that it does not come near today. (Details: §9 Design
+  boundaries)
 
 ## Changes since the previous exploration
 [Baseline run: write "First exploration of this target — nothing to

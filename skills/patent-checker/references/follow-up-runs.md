@@ -12,9 +12,10 @@ Three things must hold in every later run:
 2. **Never fetch or read the same thing twice.** What the ledger and the
    cache already hold is reused; only what is new or may have changed is
    fetched, and only what has a reason to be re-read is re-read.
-3. **Say what changed.** The report opens with the changes since the
-   previous run — of the target, of the facts, and of your observations —
-   and says just as clearly what was checked and found unchanged.
+3. **Say what changed.** Right after its plain-language summary, the
+   report sets out the changes since the previous run — of the target, of
+   the facts, and of your observations — and says just as clearly what was
+   checked and found unchanged.
 
 ## Choosing the kind of run (step 0.6)
 
@@ -183,8 +184,9 @@ them indefinitely: nothing is downloaded twice.
 
 ### F9. Report
 Write the full report from `references/report-template.md` — the current
-state of everything, not a delta — and fill the section **"Changes since
-the previous exploration"** right after the disclaimer. Carry the response
+state of everything, not a delta — with **"In plain terms"** right after
+the disclaimer and **"Changes since the previous exploration"** right after
+that. Carry the response
 record of §8 forward **verbatim**, including lines the user added by hand,
 and append this run's lines. Observations stay three-valued; a change is
 written as "observation changed from lacks to reads-on direction because
