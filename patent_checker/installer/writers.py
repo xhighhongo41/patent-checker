@@ -28,7 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from patent_checker.utils import OWNER_ONLY_MODE, write_atomically
 
@@ -61,6 +61,12 @@ _CLI_TIMEOUT = 60
 
 #: How many trailing stderr lines are quoted in a failure message.
 _STDERR_TAIL_LINES = 3
+
+#: What a vendor CLI is run for by :func:`run_vendor_cli`.
+Purpose = Literal["register", "remove"]
+
+#: Past tense of each :data:`Purpose`, for the success message.
+_DONE: dict[str, str] = {"register": "registered", "remove": "removed"}
 
 
 class Outcome(StrEnum):
@@ -381,8 +387,9 @@ def run_vendor_cli(
     runner: Runner | None = None,
     secrets: Sequence[str] = (),
     dry_run: bool = False,
+    purpose: Purpose = "register",
 ) -> WriteResult:
-    """Register the server by running a vendor's own ``mcp add`` command.
+    """Register (or remove) the server by running a vendor's own ``mcp`` command.
 
     Preferred over editing a file whenever the host application ships a
     CLI, since the vendor's command knows the current schema. A missing
@@ -396,11 +403,15 @@ def run_vendor_cli(
             :func:`subprocess.run` with a 60 second timeout.
         secrets: Values to hide in the message (the bearer token).
         dry_run: When ``True``, do not call *runner*.
+        purpose: ``"register"`` for ``mcp add`` and ``"remove"`` for
+            ``mcp remove``; it only changes the wording of the message.
 
     Returns:
         :attr:`Outcome.REGISTERED_BY_CLI` on exit code 0 (the message names
         only the program, never the arguments, which carry the token), or
-        :attr:`Outcome.MANUAL` with the redacted tail of stderr.
+        :attr:`Outcome.MANUAL` with the redacted tail of stderr. A removal
+        reports success with the same member: it means "done by the
+        vendor's CLI" in both directions.
 
     Raises:
         InstallerError: *argv* is empty.
@@ -408,6 +419,7 @@ def run_vendor_cli(
     if not argv:
         raise InstallerError("no command to run: the vendor CLI argv is empty")
     program = Path(argv[0]).name
+    by_hand = f"{purpose} the server by hand"
     if dry_run:
         shown = shlex.join(redact(argument, secrets) for argument in argv)
         return WriteResult(
@@ -418,20 +430,18 @@ def run_vendor_cli(
     try:
         completed = run(argv)
     except FileNotFoundError:
-        return WriteResult(
-            Outcome.MANUAL, None, f"{program} is not installed; register the server by hand"
-        )
+        return WriteResult(Outcome.MANUAL, None, f"{program} is not installed; {by_hand}")
     except subprocess.TimeoutExpired:
         return WriteResult(
             Outcome.MANUAL,
             None,
-            f"{program} did not finish within {_CLI_TIMEOUT}s; register the server by hand",
+            f"{program} did not finish within {_CLI_TIMEOUT}s; {by_hand}",
         )
 
     if completed.returncode == 0:
-        return WriteResult(Outcome.REGISTERED_BY_CLI, None, f"registered by {program}")
+        return WriteResult(Outcome.REGISTERED_BY_CLI, None, f"{_DONE[purpose]} by {program}")
     tail = "\n".join((completed.stderr or "").strip().splitlines()[-_STDERR_TAIL_LINES:])
-    message = f"{program} failed with exit code {completed.returncode}; register the server by hand"
+    message = f"{program} failed with exit code {completed.returncode}; {by_hand}"
     if tail:
         message = f"{message}: {redact(tail, secrets)}"
     return WriteResult(Outcome.MANUAL, None, message)

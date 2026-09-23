@@ -23,6 +23,7 @@ documentation, retrieved 2026-09-06 (see the v0.5 plan, section 2.2.1).
 from __future__ import annotations
 
 import json
+import tomllib
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -826,4 +827,419 @@ _REGISTRARS: dict[str, Callable[[_Request], Registration]] = {
     "gemini-cli": _register_gemini_cli,
     "copilot-cli": _register_copilot_cli,
     "hermes": _register_hermes,
+}
+
+
+# --- removal -------------------------------------------------------------
+#
+# The mirror image of the handlers above: one remover per host, each
+# returning a :class:`Registration` so ``uninstall`` reports look like
+# ``install`` ones. A successful vendor ``mcp remove`` is reported with
+# :attr:`~.writers.Outcome.REGISTERED_BY_CLI` ("done by the vendor's CLI")
+# and a removed JSON entry with :attr:`~.writers.Outcome.WRITTEN` (the file
+# was rewritten); both messages say "removed".
+
+
+def unregister_mcp(
+    key: str,
+    *,
+    scope: str,
+    home: Path,
+    cwd: Path,
+    which: Callable[[str], str | None],
+    runner: Runner | None,
+    dry_run: bool,
+) -> Registration:
+    """Remove the MCP server entry :func:`register_mcp` created for host *key*.
+
+    Only the ``patent-checker`` entry is taken out; every other setting of
+    the host is kept, and a container left empty stays in the file. Hosts
+    whose file we never rewrite (TOML, YAML) or whose vendor CLI could not
+    do it are reported as :attr:`~.writers.Outcome.MANUAL` with a snippet
+    naming the file and the entry to delete; a host that has no entry at
+    all is :attr:`~.writers.Outcome.SKIPPED`.
+
+    Args:
+        key: One of :data:`~.skill.AGENT_KEYS`.
+        scope: ``"user"`` or ``"project"``.
+        home: The user's home directory.
+        cwd: The project directory (used by ``"project"`` scope).
+        which: :func:`shutil.which`, or a stand-in.
+        runner: Runner for a vendor CLI (see :func:`~.writers.run_vendor_cli`).
+        dry_run: When ``True``, run and write nothing.
+
+    Returns:
+        The :class:`Registration` describing the removal for this host.
+
+    Raises:
+        InstallerError: *key* is not a known agent, or *scope* is neither
+            ``"user"`` nor ``"project"``.
+        OSError: A configuration file could not be written back. The
+            caller (:func:`~.uninstall.uninstall`) turns this into a
+            manual step.
+    """
+    request = _removal_request(key, scope=scope, home=home, cwd=cwd, which=which, runner=runner)
+    return _REMOVERS[key](replace(request, dry_run=dry_run))
+
+
+def removal_snippet(agent: str, *, scope: str, home: Path, cwd: Path) -> str:
+    """Return what the user has to delete by hand to unregister *agent*.
+
+    Pure: nothing is read or written, so the caller can use it after a
+    write has already failed.
+
+    Args:
+        agent: One of :data:`~.skill.AGENT_KEYS`.
+        scope: ``"user"`` or ``"project"``.
+        home: The user's home directory.
+        cwd: The project directory.
+
+    Returns:
+        Instructions naming the file (or command) and the entry to delete.
+
+    Raises:
+        InstallerError: *agent* is not a known agent, or *scope* is neither
+            ``"user"`` nor ``"project"``.
+    """
+    request = _removal_request(
+        agent, scope=scope, home=home, cwd=cwd, which=lambda program: None, runner=None
+    )
+    return _REMOVAL_SNIPPETS[agent](request)
+
+
+def _removal_request(
+    key: str,
+    *,
+    scope: str,
+    home: Path,
+    cwd: Path,
+    which: Callable[[str], str | None],
+    runner: Runner | None,
+) -> _Request:
+    """Return a dry-run :class:`_Request` for removing the server from *key*.
+
+    A removal needs no token, and the endpoint only appears in the
+    OpenHands snippet, where the default one is named.
+
+    Raises:
+        InstallerError: *key* or *scope* is unknown.
+    """
+    if key not in AGENTS:
+        raise InstallerError(f"unknown agent {key!r}: expected one of {', '.join(AGENT_KEYS)}")
+    if scope not in SCOPES:
+        raise InstallerError(f"unknown scope {scope!r}: expected one of {', '.join(SCOPES)}")
+    return _Request(
+        spec=AGENTS[key],
+        scope=scope,
+        home=home,
+        cwd=cwd,
+        url=DEFAULT_URL,
+        token="",
+        token_env=False,
+        which=which,
+        runner=runner,
+        dry_run=True,
+    )
+
+
+class _NotRegistered(Exception):
+    """The JSON file holds no ``patent-checker`` entry to remove."""
+
+
+#: Phrases a vendor ``mcp remove`` prints when it does not know the server
+#: (matched case-insensitively). Claude Code says "No MCP server found with
+#: name: ..."; the others are guesses that also cover common wordings.
+_NOT_FOUND_PHRASES = ("not found", "does not exist", "no such", "no mcp server")
+
+
+def _delete_from(path: Path, entry: str, how: str) -> str:
+    """Return a snippet asking the user to delete *entry* from *path*."""
+    return f"Delete {entry} from {path}{how}."
+
+
+def _json_removal_snippet(path: Path, container: str) -> str:
+    """Return the manual step for a JSON host: which key to delete where."""
+    return _delete_from(path, f'the "{SERVER_NAME}" entry', f' (inside "{container}")')
+
+
+def _remove_entry(path: Path, container: str, *, dry_run: bool) -> WriteResult:
+    """Remove ``<container>.patent-checker`` from the JSON file *path*.
+
+    The container is kept even when it becomes empty, the file's indent is
+    kept (see :func:`~.writers.merge_json`), and a file or container that
+    holds no such entry is left untouched and reported as
+    :attr:`~.writers.Outcome.SKIPPED`.
+    """
+    if not path.exists():
+        return WriteResult(Outcome.SKIPPED, path, f"{path}: not registered (no such file)")
+
+    def update(data: dict[str, Any]) -> None:
+        servers = data.get(container)
+        if not isinstance(servers, dict) or SERVER_NAME not in servers:
+            raise _NotRegistered
+        del servers[SERVER_NAME]
+
+    try:
+        result = merge_json(path, update, dry_run=dry_run)
+    except _NotRegistered:
+        return WriteResult(Outcome.SKIPPED, path, f"{path}: not registered")
+    if result.outcome is not Outcome.WRITTEN:
+        return result
+    if dry_run:
+        return replace(result, message=f"would remove {SERVER_NAME} from {path} (dry run)")
+    return replace(result, message=f"removed {SERVER_NAME} from {path}")
+
+
+def _json_removal(path: Path, container: str, request: _Request) -> Registration:
+    """Remove our entry from a JSON host file and attach a snippet when manual."""
+    result = _remove_entry(path, container, dry_run=request.dry_run)
+    snippet = _json_removal_snippet(path, container) if result.outcome is Outcome.MANUAL else None
+    return Registration(result, snippet)
+
+
+def _run_remove_cli(request: _Request, argv: list[str]) -> WriteResult:
+    """Run a vendor's ``mcp remove``; an unknown server becomes SKIPPED."""
+    result = run_vendor_cli(argv, runner=request.runner, dry_run=request.dry_run, purpose="remove")
+    lowered = result.message.lower()
+    if result.outcome is Outcome.MANUAL and any(phrase in lowered for phrase in _NOT_FOUND_PHRASES):
+        program = Path(argv[0]).name
+        return WriteResult(Outcome.SKIPPED, None, f"not registered ({program} does not know it)")
+    return result
+
+
+def _cli_then_json(request: _Request, argv: list[str], path: Path, container: str) -> Registration:
+    """Remove through the vendor CLI (when on ``PATH``) and from its JSON file.
+
+    The JSON file is cleaned whatever the CLI did, because the installer's
+    own fallback wrote there. The more informative outcome is reported: a
+    file the user must edit (MANUAL) first, then the CLI's removal, then the
+    file's, and SKIPPED only when neither had the entry.
+    """
+    cli_result: WriteResult | None = None
+    if request.which(argv[0]) is not None:
+        cli_result = _run_remove_cli(request, argv)
+    file_result = _remove_entry(path, container, dry_run=request.dry_run)
+    snippet = _json_removal_snippet(path, container)
+
+    if cli_result is None:
+        return Registration(file_result, snippet if file_result.outcome is Outcome.MANUAL else None)
+    if file_result.outcome is Outcome.MANUAL:
+        return Registration(
+            replace(file_result, message=f"{cli_result.message}; {file_result.message}"), snippet
+        )
+    if cli_result.outcome is Outcome.REGISTERED_BY_CLI:
+        if file_result.outcome is Outcome.WRITTEN:
+            cli_result = replace(cli_result, message=f"{cli_result.message}; {file_result.message}")
+        return Registration(cli_result)
+    if file_result.outcome is Outcome.WRITTEN:
+        if cli_result.outcome is Outcome.MANUAL:
+            summary = f"CLI failed: {cli_result.message}; {file_result.message}"
+            return Registration(replace(file_result, message=summary))
+        return Registration(file_result)
+    # Neither had it. The CLI keeps its servers in the same file, so a CLI
+    # that failed for another reason (its remove syntax is unverified) is
+    # mentioned but does not turn a provably absent entry into manual work.
+    message = file_result.message
+    if cli_result.outcome is Outcome.MANUAL:
+        message = f"{message} (CLI failed: {cli_result.message})"
+    return Registration(replace(file_result, message=message))
+
+
+def _remove_claude_code(request: _Request) -> Registration:
+    """Remove from Claude Code through ``claude mcp remove``, else by hand."""
+    argv = ["claude", "mcp", "remove", "--scope", request.scope, SERVER_NAME]
+    snippet = _claude_code_removal_snippet(request)
+    if request.which("claude") is None:
+        return Registration(
+            WriteResult(Outcome.MANUAL, None, "claude is not on PATH; remove the server by hand"),
+            snippet,
+        )
+    result = _run_remove_cli(request, argv)
+    return Registration(result, snippet if result.outcome is Outcome.MANUAL else None)
+
+
+def _claude_code_removal_snippet(request: _Request) -> str:
+    """Return the command (and, for a project, the file) to remove by hand."""
+    lines = ["Run:", "", f"  claude mcp remove --scope {request.scope} {SERVER_NAME}"]
+    if request.scope == "project":
+        lines += ["", _json_removal_snippet(request.cwd / ".mcp.json", "mcpServers")]
+    return "\n".join(lines)
+
+
+def _codex_table_state(path: Path) -> bool | None:
+    """Return whether Codex's config at *path* holds our table (read only).
+
+    ``None`` means the file exists but cannot be read or parsed, so only
+    the user can tell.
+    """
+    if not path.exists():
+        return False
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return None
+    servers = data.get("mcp_servers")
+    return isinstance(servers, dict) and SERVER_NAME in servers
+
+
+def _remove_codex(request: _Request) -> Registration:
+    """Remove from Codex through ``codex mcp remove``, else hand the table back.
+
+    The TOML file is never rewritten (see :func:`~.writers.append_toml_table`);
+    it is only read to tell whether the table is (still) there.
+    """
+    path = _codex_path(request)
+    snippet = _codex_removal_snippet(request)
+    cli_result: WriteResult | None = None
+    if request.which("codex") is not None:
+        # Not verified against the real codex CLI (syntax from its docs).
+        cli_result = _run_remove_cli(request, ["codex", "mcp", "remove", SERVER_NAME])
+        if request.dry_run and cli_result.outcome is Outcome.REGISTERED_BY_CLI:
+            return Registration(cli_result)
+
+    state = _codex_table_state(path)
+    if state is False:
+        if cli_result is not None and cli_result.outcome is Outcome.REGISTERED_BY_CLI:
+            return Registration(cli_result)
+        message = f"{path}: not registered"
+        if cli_result is not None and cli_result.outcome is Outcome.MANUAL:
+            message = f"{message} (CLI failed: {cli_result.message})"
+        return Registration(WriteResult(Outcome.SKIPPED, path, message))
+
+    reason = (
+        f"[mcp_servers.{SERVER_NAME}] is still in {path}"
+        if state
+        else f"{path}: could not be read as TOML"
+    )
+    message = f"{reason}; delete the table by hand"
+    if cli_result is not None:
+        message = f"{cli_result.message}; {message}"
+    return Registration(WriteResult(Outcome.MANUAL, path, message), snippet)
+
+
+def _codex_removal_snippet(request: _Request) -> str:
+    """Return which table to delete from Codex's ``config.toml``."""
+    return _delete_from(
+        _codex_path(request),
+        f"the [mcp_servers.{SERVER_NAME}] table",
+        " (the header line and the key = value lines below it)",
+    )
+
+
+def _remove_opencode(request: _Request) -> Registration:
+    """Remove from OpenCode's JSON config; a JSONC config is left to the user."""
+    path = _opencode_path(request)
+    jsonc = path.with_suffix(".jsonc")
+    if jsonc.exists():
+        return Registration(
+            WriteResult(
+                Outcome.MANUAL,
+                jsonc,
+                f"{jsonc}: JSONC is not edited automatically; remove the entry by hand",
+            ),
+            _json_removal_snippet(jsonc, "mcp"),
+        )
+    return _json_removal(path, "mcp", request)
+
+
+def _opencode_removal_snippet(request: _Request) -> str:
+    """Return which key to delete from OpenCode's config."""
+    return _json_removal_snippet(_opencode_path(request), "mcp")
+
+
+def _remove_openhands(request: _Request) -> Registration:
+    """Report OpenHands as manual: its TOML config is not rewritten.
+
+    Kept separate from the other removers so a later OpenHands CLI route
+    can be added here alone.
+    """
+    path = _openhands_path(request)
+    message = f"{path}: OpenHands has no removal command; remove the server by hand"
+    return Registration(
+        WriteResult(Outcome.MANUAL, path, message), _openhands_removal_snippet(request)
+    )
+
+
+def _openhands_removal_snippet(request: _Request) -> str:
+    """Return which ``shttp_servers`` entry to delete from OpenHands' config."""
+    return (
+        f"Delete the entry with url = {json.dumps(request.url)} (or the URL you registered) "
+        f"from shttp_servers in the [mcp] table of {_openhands_path(request)}."
+    )
+
+
+def _remove_cursor(request: _Request) -> Registration:
+    """Remove from Cursor's ``mcp.json``."""
+    return _json_removal(_cursor_path(request), "mcpServers", request)
+
+
+def _cursor_removal_snippet(request: _Request) -> str:
+    """Return which key to delete from Cursor's ``mcp.json``."""
+    return _json_removal_snippet(_cursor_path(request), "mcpServers")
+
+
+def _remove_gemini_cli(request: _Request) -> Registration:
+    """Remove from Gemini CLI through its command and from ``settings.json``."""
+    # Not verified against the real gemini CLI (mirrors its `mcp add` syntax).
+    argv = ["gemini", "mcp", "remove", "--scope", request.scope, SERVER_NAME]
+    return _cli_then_json(request, argv, _gemini_cli_path(request), "mcpServers")
+
+
+def _gemini_cli_removal_snippet(request: _Request) -> str:
+    """Return which key to delete from Gemini CLI's ``settings.json``."""
+    return _json_removal_snippet(_gemini_cli_path(request), "mcpServers")
+
+
+def _remove_copilot_cli(request: _Request) -> Registration:
+    """Remove from Copilot CLI through its command and from its JSON file."""
+    # Not verified against the real copilot CLI (mirrors its `mcp add` syntax).
+    argv = ["copilot", "mcp", "remove", SERVER_NAME]
+    return _cli_then_json(request, argv, _copilot_cli_path(request), "mcpServers")
+
+
+def _copilot_cli_removal_snippet(request: _Request) -> str:
+    """Return which key to delete from Copilot CLI's JSON file."""
+    return _json_removal_snippet(_copilot_cli_path(request), "mcpServers")
+
+
+def _remove_hermes(request: _Request) -> Registration:
+    """Report Hermes as manual: its config is YAML, which we do not rewrite."""
+    path = _hermes_path(request)
+    message = f"{path}: Hermes stores its servers in YAML; remove the server by hand"
+    return Registration(
+        WriteResult(Outcome.MANUAL, path, message), _hermes_removal_snippet(request)
+    )
+
+
+def _hermes_removal_snippet(request: _Request) -> str:
+    """Return which YAML block to delete from Hermes' ``config.yaml``."""
+    return _delete_from(
+        _hermes_path(request),
+        f"mcp_servers.{SERVER_NAME}",
+        f' (the "{SERVER_NAME}:" key under mcp_servers and everything indented below it)',
+    )
+
+
+#: Removal snippet per agent key; every one is pure.
+_REMOVAL_SNIPPETS: dict[str, Callable[[_Request], str]] = {
+    "claude-code": _claude_code_removal_snippet,
+    "codex": _codex_removal_snippet,
+    "opencode": _opencode_removal_snippet,
+    "openhands": _openhands_removal_snippet,
+    "cursor": _cursor_removal_snippet,
+    "gemini-cli": _gemini_cli_removal_snippet,
+    "copilot-cli": _copilot_cli_removal_snippet,
+    "hermes": _hermes_removal_snippet,
+}
+
+#: Remover per agent key, paired with :data:`_REGISTRARS`.
+_REMOVERS: dict[str, Callable[[_Request], Registration]] = {
+    "claude-code": _remove_claude_code,
+    "codex": _remove_codex,
+    "opencode": _remove_opencode,
+    "openhands": _remove_openhands,
+    "cursor": _remove_cursor,
+    "gemini-cli": _remove_gemini_cli,
+    "copilot-cli": _remove_copilot_cli,
+    "hermes": _remove_hermes,
 }
