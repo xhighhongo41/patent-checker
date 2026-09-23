@@ -16,7 +16,7 @@ Patent Checker は、あなた自身のソフトウェアプロジェクトに�
 
 Patent Checker は**何かが特許を侵害するかどうかを判定しません**。レポートに含まれるのは所見、調査範囲の記述、未解決の問いであり、結論ではありません。
 
-**状態: 安定版(v1.2)。**
+**状態: 安定版(v1.3)。**
 
 ## 重要なお知らせ
 
@@ -41,14 +41,14 @@ your agent ──(Skill: 判断)──► patent-checker MCP サーバー ──
 1. Skill がコードベースを読み、請求されうる技術的特徴を列挙し、特許の語彙に翻訳して検索式を組み立てます。
 2. MCP サーバーが EPO OPS に対して検索を実行し、候補文書(請求項は Google Patents、書誌と権利状態は OPS)を取得して、すべての文書をキャッシュします。同じものを二度取得しません。
 3. Skill が候補を段階的にふるい、請求項の構成要件をあなたの特徴に対応づけ、レポートを書きます。何を検索し、何が見つかり、各候補があなたのコードとどう関係し、何が*カバーされていない*かを記します。
-4. Skill は探索の**台帳**(特徴、検索式、ふるい分け済みのファミリー、監視している特許とその状態の現況記録)もプロジェクトの中に残します。次の実行はそこから始まります。サーバーが保存済みの現況記録と現在の記録を突き合わせ、新しいレポートは「何が変わったか」から始まります。
+4. Skill は探索の**台帳**(特徴、検索式、ふるい分け済みのファミリー、監視している特許とその状態の現況記録)もプロジェクトの中に残します。次の実行はそこから始まります。サーバーが保存済みの現況記録と現在の記録を突き合わせ、新しいレポートは平易な要約に続けて「何が変わったか」を示します。
 
 サーバーが受け取るのは公開特許データだけです。検索式、公報番号、ファミリー番号、日付、そしてサーバー自身が以前返した状態の現況記録です。あなたのソースコード、プロジェクトの説明、台帳はマシンの外に出ません。分析はエージェントの中で行われます。
 
 ## 前提条件
 
 - **Agent Skill と MCP に対応した AI コーディングエージェント**: Claude Code、OpenAI Codex CLI、Cursor、Gemini CLI、GitHub Copilot CLI、OpenCode、OpenHands、Hermes Agent のいずれか。
-- **Python 3.12 以上と [uv](https://docs.astral.sh/uv/)**(コマンドラインツールとインストーラ用。`pipx` や仮想環境内の `pip install` でも構いません)。後述のベアラートークンを生成するのにも Python が最も手軽です。
+- **[uv](https://docs.astral.sh/uv/)**(コマンドラインツールとインストーラ用)。マシンに Python 3.12 以上が無ければ uv が自分で取得します。後述のベアラートークンを生成するのにも Python が最も手軽です。
 - **Docker と Compose v2**(サーバーをコンテナで動かす場合。推奨)。Docker が無くてもサーバーは通常のプロセスとして動きます。
 - **EPO Open Patent Services のアカウント**(推奨)。<https://developers.epo.org/> で登録し、アプリを作成してコンシューマキーとシークレットを取得します。**早めに申請してください。承認は手動で、通常 1 営業日ほどかかります。** 無い場合、サーバーは[縮退モード](#epo-ops-アカウントが無い場合縮退モード)で動きます。
 
@@ -124,12 +124,12 @@ $token = python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 シークレットファイルは起動時に一度だけ読まれます。空の OPS ファイルは「未設定」(縮退モード)を意味します。Linux の Docker Engine を UID 1000 でないアカウントで動かしている場合は、[`secrets/README.md`](secrets/README.md) のファイル所有権の注記を参照してください。
 
-LAN や VPN で提供する(複数のマシンで 1 つのサーバーを使う)場合は [docs/deploy-lan_ja.md](docs/deploy-lan_ja.md) を参照してください。同じコンテナの前に TLS を終端するプロキシを置きます。
+複数のマシンで 1 つのサーバーを共有する(tailnet、VPN、LAN)場合は [docs/deploy-lan_ja.md](docs/deploy-lan_ja.md) を参照してください。Tailscale Serve、同じコンテナの前に置く TLS 終端プロキシ、プライベートネットワーク上の素の HTTP の 3 通りと、それぞれで利用者に任される点を説明しています。
 
 ### 方法 B: Docker を使わない
 
 ```sh
-uv tool install patent-checker          # または: pipx install patent-checker
+uv tool install patent-checker
 mkdir patent-checker-server && cd patent-checker-server
 curl -fsSLO https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/.env.example
 cp .env.example .env
@@ -166,7 +166,7 @@ curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/in
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.ps1 | iex"
 ```
 
-2 つのスクリプトは進むところまでが違います。シェルスクリプトは端末から実行された場合(たとえばダウンロードして実行した場合)、そのまま `patent-checker install` に進みます。上のように `sh` にパイプすると標準入力は端末ではなくパイプになるため、uv とツールのインストールまでを行い、次に実行する `patent-checker install` コマンドを表示します。PowerShell スクリプトはどちらの場合も `patent-checker install` に進みます。
+どちらのスクリプトも uv とツールをインストールし、続けて `patent-checker install` に進みます。上のように `sh` にパイプすると、シェルスクリプトの標準入力はパイプになるので、質問は端末に直接表示して尋ねます。端末がまったく無いとき(CI のジョブなど)だけは、次に実行する `patent-checker install` コマンドを表示して止まります。
 
 先にスクリプトを読みたい場合は `| sh` の代わりに `| more` で取得するか、スクリプトを使わず次の 2 ステップを自分で実行することもできます。
 
@@ -180,7 +180,7 @@ patent-checker install
 1. 利用者向け通知を表示して同意を求める(`~/.config/patent-checker/consent.json` に日付と通知の版を記録。再び尋ねられるのは通知が変わったときだけ)。
 2. ベアラートークンを尋ねる(または `--token-file` から読む)。
 3. Skill を `~/.agents/skills/patent-checker/`(Codex CLI、OpenCode、Cursor、Gemini CLI、Copilot CLI が読む)と、専用ディレクトリが必要なエージェントの場所(`~/.claude/skills/`、`~/.openhands/skills/`、`~/.hermes/skills/`)にコピーする。
-4. 検出した各エージェントにサーバー(`--url` を渡さなければ `http://127.0.0.1:8642/mcp`)を登録する。エージェント自身の `mcp add` コマンドがあればそれを使い(Claude Code、Gemini CLI、Copilot CLI、`--token-env` 指定時の Codex CLI)、無ければエージェントの JSON または TOML 設定を編集し(Cursor、OpenCode、Codex CLI)、設定に触れないエージェント(OpenHands、Hermes Agent)には貼り付け用のスニペットを表示する。
+4. 検出した各エージェントにサーバー(`--url` を渡さなければ `http://127.0.0.1:8642/mcp`)を登録する。エージェント自身の `mcp add` コマンドがあればそれを使い(Claude Code、Gemini CLI、Copilot CLI、`--token-env` 指定時の Codex CLI)、無ければエージェントの JSON または TOML 設定を編集し(Cursor、OpenCode、Codex CLI)、設定に触れないエージェント(Hermes Agent と、CLI が入っていない場合の OpenHands)には貼り付け用のスニペットを表示する。
 5. エージェントごとに何をしたかの表を表示する。いずれかのステップが失敗すると終了コードは非ゼロになります。スニペットの表示は失敗ではありません。
 
 | エージェント | 登録方法 | 設定ファイル |
@@ -191,9 +191,12 @@ patent-checker install
 | Cursor | ファイルを直接編集 | `~/.cursor/mcp.json` |
 | OpenCode | ファイルを直接編集 | `~/.config/opencode/opencode.json` |
 | Codex CLI | `codex mcp add` / 追記 | `~/.codex/config.toml` |
-| OpenHands、Hermes Agent | 貼り付け用スニペット | `config.toml`、`~/.hermes/config.yaml` |
+| OpenHands | `openhands mcp add`(CLI が無ければ貼り付け用スニペット) | OpenHands の CLI が管理 |
+| Hermes Agent | 貼り付け用スニペット | `~/.hermes/config.yaml` |
 
-便利なオプション: `--list-agents`(何がどこにインストールされるか)、`--dry-run`(書き込み以外をすべて行う)、`--agent claude-code --agent cursor`(自動検出の代わりに指定。`--agent all` で対応する全エージェント)、`--scope project`(ホームディレクトリではなく現在のプロジェクトにインストール)、`--lang ja`(日本語の通知)、`--agree`(尋ねずに通知に同意する。尋ねる端末が無いときは必須)、`--no-skill` / `--no-mcp`。インストーラの再実行は安全です。Skill のコピーを更新し、サーバーの項目をその場で更新し、初回に作った元の設定ファイルのバックアップ(`.bak`)は決して上書きしません。唯一の例外は Codex CLI で、既存の項目はそのまま残ります。変更するには `~/.codex/config.toml` を編集してください。
+OpenCode のファイルは、`XDG_CONFIG_HOME` が設定されていればそれに従います。Gemini CLI、Copilot CLI、OpenHands のコマンドは各製品の文書のとおりに使っていますが、実物での動作は未確認です。失敗したときはファイルの編集かスニペットに切り替え、その旨を表示します。
+
+便利なオプション: `--list-agents`(何がどこにインストールされるか)、`--dry-run`(書き込み以外をすべて行う)、`--agent claude-code --agent cursor`(自動検出の代わりに指定。`--agent all` で対応する全エージェント)、`--scope project`(ホームディレクトリではなく現在のプロジェクトにインストール)、`--lang ja`(日本語の通知)、`--agree`(尋ねずに通知に同意する。尋ねる端末が無いときは必須)、`--no-skill` / `--no-mcp`、`--json`(スクリプト向けにレポートを 1 つの JSON 文書として出力。通知と質問は標準エラーに出ます)。インストーラの再実行は安全です。Skill のコピーを更新し、サーバーの項目をその場で更新し、初回に作った元の設定ファイルのバックアップ(`.bak`)は決して上書きしません。唯一の例外は Codex CLI で、既存の項目はそのまま残ります。変更するには `~/.codex/config.toml` を編集してください。
 
 ### ベアラートークンを露出させずに渡す
 
@@ -243,10 +246,22 @@ Skill はまず同意記録を確認し、(プロジェクトごとに一度)`.p
 
 Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 種類の実行のどちらかを提案します。
 
-- **追跡探索**は、前回探索したコミットからコードの何が変わったかを読み、以前の検索式はそれ以降に公開された特許に対してだけ実行し(新しい特徴には新しい検索式を全期間で)、初めて見るファミリーだけをふるいにかけ、監視している特許をすべて確認し直します。文書を読み直すのは、あなたの特徴、その請求項、または以前の読みが変わったときだけです。レポートは全体の現在の状態を書き、冒頭に**「前回の探索からの変更点」**を置きます。プロジェクトの変化、新しい文書、権利状態と請求項の変化、変わった所見とその理由、そして確認して変化が無かった文書です。
+- **追跡探索**は、前回探索したコミットからコードの何が変わったかを読み、以前の検索式はそれ以降に公開された特許に対してだけ実行し(新しい特徴には新しい検索式を全期間で)、初めて見るファミリーだけをふるいにかけ、監視している特許をすべて確認し直します。文書を読み直すのは、あなたの特徴、その請求項、または以前の読みが変わったときだけです。レポートは全体の現在の状態を書きます。冒頭の短い要約**「In plain terms」**(平易な要約)は、特許の用語を使わずに、プロジェクトのどの部分がどの特許に近づいたか、レポートのどこで扱っているかを示します。その後に**「前回の探索からの変更点」**が続きます。プロジェクトの変化、新しい文書、権利状態と請求項の変化、変わった所見とその理由、そして確認して変化が無かった文書です。
 - **監視のみの実行**は、監視している特許を確認し直すだけで、短い `update-<target>-<YYYYMMDD-HHMM>.md` を書きます。費用は探索 1 回のごく一部で、検索を行っていないことを明記します。
 
 同じものを二度ダウンロードしません。請求項はキャッシュにずっと残り、権利状態は 1 週間、ファミリーは 1 か月で取り直されます。すべての結果に取得時刻が付くので、レポートは事実が「いつ時点のものか」を書けます。開発中の実測では、中規模プロジェクトの最初の探索から 3 週間後に、保存済みの 17 の検索式は新しい公開期間について 11 ヒット(全期間では 712 ヒット)を返し、そのうち 8 件は判定済みのファミリーでした。監視している 25 件の特許の再確認は上流への要求 約 50 回で済み、同じ日に行った監視のみの実行は上流への要求が 0 回でした。以前の版で探索したプロジェクトでは、Skill がまず直近のレポートを台帳に取り込むことを提案します。
+
+### MCP サーバーが使えないとき
+
+サーバーに到達できないとき、Skill はあなたのマシンの `patent-checker` コマンドラインツールで作業を続けます。ツールは同じ操作を提供します(後述のコマンド一覧)。何かをインストールする前には必ず尋ねます。そのためにマシンを準備する、あるいは自分でコマンドを実行するには次のようにします。
+
+```sh
+uv tool install patent-checker
+patent-checker credentials set      # EPO OPS のキーとシークレットを、画面に表示せずに尋ねる
+patent-checker status               # 何が設定されていて、どこから来ているか(ネットワークは使わない)
+```
+
+`credentials set` はキーとシークレットを利用者単位で `~/.config/patent-checker/credentials.env`(本人だけが読める)に保存するので、どのプロジェクトからでもツールが見つけられます。環境変数やプロジェクトの `.env` にある値はこのファイルより優先されます。どれが使われているかは `patent-checker credentials status` で確認でき、`credentials clear` でファイルを削除します。OPS の認証情報が無ければ Skill は縮退モードを提案します。ツールの更新と削除は `uv tool upgrade patent-checker` と `uv tool uninstall patent-checker` です。
 
 ## 設定
 
@@ -254,10 +269,11 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 
 | 変数 | 既定 | 意味 |
 |---|---|---|
-| `PATENT_CHECKER_OPS_KEY`、`PATENT_CHECKER_OPS_SECRET` | 未設定 | EPO OPS のコンシューマキーとシークレット。値そのものか、`_FILE` 変種(`PATENT_CHECKER_OPS_KEY_FILE` など)で値を持つファイルのパスを指定。両方は不可。空ファイルは「未設定」(縮退モード)。 |
+| `PATENT_CHECKER_OPS_KEY`、`PATENT_CHECKER_OPS_SECRET` | 未設定 | EPO OPS のコンシューマキーとシークレット。値そのものか、`_FILE` 変種(`PATENT_CHECKER_OPS_KEY_FILE` など)で値を持つファイルのパスを指定。両方は不可。空ファイルは「未設定」(縮退モード)。4 つのどれも設定されていなければ、利用者単位の認証情報ファイルを読みます。 |
+| `PATENT_CHECKER_CREDENTIALS_FILE` | `~/.config/patent-checker/credentials.env` | `patent-checker credentials set` が書く利用者単位の認証情報ファイル。読み取るのは OPS の 4 変数だけです。他人が読めるファイルは警告のうえで使います。 |
 | `PATENT_CHECKER_OPERATOR_CONSENT` | 未設定(必須) | 承認した運用者向け告知の版(`1.0`)。無いとサーバーは起動を拒否します。 |
 | `PATENT_CHECKER_SERVER_TOKEN`(`_FILE`) | 未設定(http では必須) | クライアントが提示すべきベアラートークン。 |
-| `PATENT_CHECKER_SERVER_HOST`、`PATENT_CHECKER_SERVER_PORT` | `127.0.0.1`、`8642` | バインド先。ループバック以外へのバインドには、さらに `PATENT_CHECKER_SERVER_ALLOWED_HOSTS` と前段の TLS が必要です。 |
+| `PATENT_CHECKER_SERVER_HOST`、`PATENT_CHECKER_SERVER_PORT` | `127.0.0.1`、`8642` | バインド先。ループバック以外へのバインドには、さらに `PATENT_CHECKER_SERVER_ALLOWED_HOSTS` が必要です。暗号化はネットワークかプロキシに任されます([docs/deploy-lan_ja.md](docs/deploy-lan_ja.md))。 |
 | `PATENT_CHECKER_SERVER_ALLOWED_HOSTS` | 未設定 | クライアントが Host ヘッダで使うホスト名のカンマ区切り。名前のみ。ワイルドカードは拒否され、IPv6 アドレスは角括弧なしで書きます。 |
 | `PATENT_CHECKER_SERVER_RPS`、`PATENT_CHECKER_SERVER_BURST` | `5`、`10` | 受け付ける MCP リクエストの上限(暴走したエージェントのループへの備え。上流の間隔制御は別)。 |
 | `PATENT_CHECKER_DATA_DIR` | 利用者単位のデータディレクトリ(サーバー)、`./.patent-checker`(CLI) | 検索キャッシュ、リクエストログ、設定時は共有文書キャッシュ(`<dir>/cache`)。サーバーはそれを動かす利用者のもとに、CLI は実行したプロジェクトのもとにデータを置きます。コンテナイメージは `/data` に設定しています。 |
@@ -268,7 +284,7 @@ Skill は `.patent-checker/ledger/<target>/` の台帳を見つけ、次の 2 �
 
 patent-checker 自身のものではない変数も 3 つ尊重します。Linux と macOS では、利用者単位のデータディレクトリは `XDG_DATA_HOME` に従い(`$XDG_DATA_HOME/patent-checker`、未設定なら `~/.local/share/patent-checker`)、利用者単位の同意記録は `XDG_CONFIG_HOME` に従います(`$XDG_CONFIG_HOME/patent-checker/consent.json`、未設定なら `~/.config/patent-checker/consent.json`)。Windows では利用者単位のデータディレクトリは `%LOCALAPPDATA%\patent-checker`(未設定なら `~\AppData\Local\patent-checker`)です。`patent-checker install --lang` の既定値は `LC_ALL` または `LANG` から決まります。
 
-`.env` はすべての `patent-checker` コマンドが、実行ディレクトリかその親から読みます。ホームディレクトリとファイルシステムのルートからは読みません。Compose では認証情報は `secrets/` のファイルから来て、`compose.yaml` と同じ場所の `.env` が `PATENT_CHECKER_OPERATOR_CONSENT`(任意で `PATENT_CHECKER_IMAGE`、`PATENT_CHECKER_PORT`、`PATENT_CHECKER_LOG_LEVEL`)を提供します。他の変数は `compose.yaml` の `environment:` に追加できます。
+`.env` はすべての `patent-checker` コマンドが、実行ディレクトリかその親から読みます。ホームディレクトリとファイルシステムのルートからは読みません。OPS の認証情報は、環境変数、その `.env`、利用者単位の認証情報ファイルの順に探します。Compose では認証情報は `secrets/` のファイルから来て、`compose.yaml` と同じ場所の `.env` が `PATENT_CHECKER_OPERATOR_CONSENT`(任意で `PATENT_CHECKER_IMAGE`、`PATENT_CHECKER_PORT`、`PATENT_CHECKER_SERVER_ALLOWED_HOSTS`、`PATENT_CHECKER_LOG_LEVEL`)を提供します。他の変数は `compose.yaml` の `environment:` に追加できます。
 
 <details>
 <summary>コンテナと CLI で文書キャッシュを共有する(上級者向け)</summary>
@@ -296,7 +312,7 @@ patent-checker 自身のものではない変数も 3 つ尊重します。Linux
 
 | MCP ツール | CLI コマンド | 用途 |
 |---|---|---|
-| `server_status` | —(`patent-checker --version` と、設定の有無を見るための OPS 系コマンド) | サーバーの版、動作モード、キャッシュの場所 |
+| `server_status` | `patent-checker status` | 版、OPS が設定されているか(とその出どころ)、データの場所、同意、間隔制御。CLI 版はネットワークを使いません |
 | `ops_search` | `patent-checker search "<cql>"` | 公開データの CQL 検索 |
 | `ops_search_biblio` | `patent-checker search-biblio "<cql>"` | 同じ検索を、各ヒットの書誌付きで |
 | `search_plan_check` | `patent-checker plan-check "<q1>" "<q2>" …` | 検索前に複数の検索式のヒット件数を見る |
@@ -313,10 +329,12 @@ patent-checker 自身のものではない変数も 3 つ尊重します。Linux
 | — | `patent-checker cache status` / `cache clear` | 何がキャッシュされているか、その削除 |
 | — | `patent-checker clean` | このプロジェクトの痕跡を消す |
 | — | `patent-checker consent status` / `consent show` / `consent record` | 利用者向け通知とその同意記録 |
-| — | `patent-checker install` | Skill の配置とエージェントへのサーバー登録 |
+| — | `patent-checker install [--json]` | Skill の配置とエージェントへのサーバー登録 |
+| — | `patent-checker uninstall [--json]` | Skill とサーバー登録を取り除く |
+| — | `patent-checker credentials set` / `credentials status` / `credentials clear` | 利用者単位の OPS 認証情報ファイル |
 | — | `patent-checker serve` | MCP サーバーの起動 |
 
-取得系のコマンド(`search`、`search-biblio`、`plan-check`、`biblio`、`claims`、`legal`、`family`、`watch`)は `--refresh` を受け付け、その 1 回だけキャッシュを使いません。MCP に対応するツールが無い 6 つのコマンドは意図的にそうなっています。サーバーはプロジェクトのファイルを読むことも消すこともありません。
+取得系のコマンド(`search`、`search-biblio`、`plan-check`、`biblio`、`claims`、`legal`、`family`、`watch`)は `--refresh` を受け付け、その 1 回だけキャッシュを使いません。MCP に対応するツールが無いコマンドは意図的にそうなっています。サーバーはプロジェクトのファイルを読むことも消すこともなく、あなたの認証情報も扱いません。
 
 ## セキュリティモデル
 
@@ -325,10 +343,10 @@ patent-checker 自身のものではない変数も 3 つ尊重します。Linux
 - 受け取るのは公開特許データだけです(検索式、公報番号、ファミリー番号、日付、サーバー自身が以前返した状態の現況記録)。大きすぎるリクエストは拒否します。あなたのコード、文書、台帳は、あなたのマシン上のエージェントが扱います。認証済みのクライアントはサーバーがデータを置く場所を見ることができます(`server_status`)が、ホストについてそれ以外は露出しません。
 - 受け付けるリクエストにはレート制限があり、上流へのリクエストは間隔を空け、1 つずつ直列に実行し、キャッシュするので、暴走したエージェントがデータソースを叩き続けることはありません。
 - `GET /health` はコンテナのヘルスチェック用に認証不要で、状態、版、トランスポートだけを返します。
-- 認証情報は環境変数かファイルから読まれ、ログに出ず、起動バナーやエラーメッセージにも現れません。
+- 認証情報は、環境変数、プロジェクトの `.env`、`_FILE` 変数が指すファイル、または利用者単位の認証情報ファイルから読まれます。ログに出ず、`status` や `credentials status` も値を表示せず、起動バナーやエラーメッセージにも現れません。利用者単位のファイルは本人だけが読める形で書かれ、他人が読めるときは警告が出ます。
 - コンテナは非特権ユーザーとして、読み取り専用のファイルシステムで、ケーパビリティをすべて落として動きます。書けるのは `/data` だけです。
 - `--transport stdio` には認証がありません。サーバーがあなたの権限で動くことを承知のうえ、単一のローカルクライアントにだけ使ってください。
-- LAN やインターネットへの提供は可能ですが、あなたの責任です。トランスポートは素の HTTP なので、TLS を終端するリバースプロキシを前に置き([docs/deploy-lan_ja.md](docs/deploy-lan_ja.md))、`PATENT_CHECKER_SERVER_ALLOWED_HOSTS` を設定し、トークンをネットワークとあなたの OPS 割り当ての間にある唯一のものとして扱ってください。
+- 他のマシンへの提供は可能で、あなたの責任で行います。トランスポートは素の HTTP で、サーバーは TLS を提供しません。トークンを守るのはネットワーク(tailnet、VPN)か前段の TLS 終端プロキシだけで、置けるところではプロキシを推奨します([docs/deploy-lan_ja.md](docs/deploy-lan_ja.md))。`PATENT_CHECKER_SERVER_ALLOWED_HOSTS` を設定し、トークンをネットワークとあなたの OPS 割り当ての間にある唯一のものとして扱ってください。
 - Skill はサーバーが返すもの(特許本文を含む)を、従うべき指示ではなく分析対象のデータとして扱います。
 - リリースはバージョンタグから CI がビルド・公開し、依存パッケージとコンテナイメージは変更のたびに既知の脆弱性をスキャンします。セキュリティ上の問題の報告は [SECURITY.md](SECURITY.md) を参照してください。
 
@@ -351,7 +369,7 @@ patent-checker 自身のものではない変数も 3 つ尊重します。Linux
 **Docker なし**: 動いているサーバーを止めてから、
 
 ```sh
-uv tool upgrade patent-checker      # または: pipx upgrade patent-checker
+uv tool upgrade patent-checker
 patent-checker serve
 ```
 
@@ -359,12 +377,13 @@ patent-checker serve
 
 ## アンインストール
 
-- **エージェント**: 各エージェントの MCP 設定から `patent-checker` の項目を削除し(`claude mcp remove patent-checker`、`gemini mcp remove patent-checker`、または上の表のファイルから項目を削除)、Skill のディレクトリ `~/.agents/skills/patent-checker/`、`~/.claude/skills/patent-checker/`、`~/.openhands/skills/patent-checker/`、`~/.hermes/skills/patent-checker/`(および `--scope project` を使ったプロジェクトの `.agents/skills/` と `.claude/skills/` の同名ディレクトリ)を削除します。
+- **エージェント**: `patent-checker uninstall` が、`patent-checker install` の行ったサーバー登録と Skill のコピーを取り除きます(`--scope project` でインストールしたプロジェクトではそれを付け、`--dry-run` で何をするかを先に確認できます)。JSON の設定を編集し、エージェント自身の `mcp remove` コマンドがあればそれを使い、Skill のディレクトリはこの Skill が入っているときだけ削除します。取り除けずに残すものは一覧で示します。`codex` コマンドが無いときの Codex CLI のテーブル `[mcp_servers.patent-checker]`、OpenHands と Hermes Agent の項目、元の設定ファイルの `.bak` バックアップです。
 - **サーバー**: `docker compose down -v`(コンテナ、キャッシュ、すべて)または `uv tool uninstall patent-checker`(キャッシュも消すなら、利用者単位のデータディレクトリ `~/.local/share/patent-checker` または `%LOCALAPPDATA%\patent-checker` も)。
-- **記録**: プロジェクト内で `patent-checker clean --yes --include-artifacts --include-consent` を実行すると、そのプロジェクトのレポート、メモ、同意記録が消えます(ツールをアンインストールする前に実行してください)。利用者単位の同意記録は `~/.config/patent-checker/consent.json` にあります。
+- **記録**: プロジェクト内で `patent-checker clean --yes --include-artifacts --include-consent` を実行すると、そのプロジェクトのレポート、メモ、同意記録が消えます(ツールをアンインストールする前に実行してください)。利用者単位の同意記録は `~/.config/patent-checker/consent.json` にあり、利用者単位の認証情報ファイルは `patent-checker credentials clear` で削除します。
 
 ## 変更履歴
 
+- **v1.3**(2026-09): レポートの冒頭に**「In plain terms」**(平易な要約)を置きました。特許の用語を使わずに、プロジェクトのどの部分がどの特許に近づいたか、レポートのどこで扱っているかを示し、独自の判断は加えません。コマンドラインツールだけで作業できるようにしました。`patent-checker credentials set` が OPS のキーとシークレットを利用者単位で保存し、`patent-checker status` がネットワークを使わずに設定を表示し、Skill はサーバーに到達できないとき CLI に切り替えます。新しい `patent-checker uninstall`、`install --json`、OpenHands の CLI による登録、OpenCode の設定の `XDG_CONFIG_HOME` 対応、パイプ経由のシェルのブートストラップは端末で質問します。ネットワーク向けの手引きは Caddy の構成例に加えて Tailscale Serve とプライベートネットワーク上の素の HTTP を扱い、TLS は推奨としつつ運用者の判断に任せます。
 - **v1.2**(2026-09): プロセスをまたいで効く間隔制御。OPS のサービスごとの最小間隔・クールダウン・引き締めた間隔を、ファイルロックで守った利用者単位の小さな状態ファイルに置き、続けて実行する CLI コマンドもサーバーの呼び出しと同じ間隔になります。OPS が拒否したサービス(HTTP 403、スロットリング状態 `black`)は 15 分間ローカルで遮断し、以後の呼び出しは再試行できる時刻を添えて即座に失敗します(`PATENT_CHECKER_PACING_DIR`、`patent-checker usage` が状態を表示)。番号部に英字を含む公報番号(`JP.H0218652.A`、`IN.985DE2013.A`、`TW.I707812.B`)を解釈・往復できるようになり、OPS がそのような番号で挙げる文書を取得・監視できます。CLI の引数エラーと読めない上流データを区別、`ledger status` は `ledger check` と同じ対象を一覧、`cache status` は種別コード無しの番号で保存したエントリとその失効を表示、要求ログの時刻に UTC オフセット。文書をコードの実態に合わせました(パイプ経由のブートストラップの挙動、`/health`、受け付ける Host ヘッダー、運用者告知のサーバーが受け取る情報、コマンド一覧)。
 - **v1.1**(2026-09): 繰り返し実行のための版。プロジェクトごとの台帳が探索を次の実行へ引き継ぎます。追跡探索は新しく公開された特許だけを検索し、新しいファミリーだけをふるいにかけます。新しい `watch_check` ツールが、監視している特許の権利状態とファミリーを前回の実行と比較します。レポートは「前回の探索からの変更点」から始まり、状態の確認だけを行う短い監視更新レポートもあります。すべての結果に取得時刻(`fetched_at`)が付き、請求項の結果は実際に読んだ公報(`pub_docdb`)を示し、種別コード無しで取得した請求項はずっとキャッシュに残ることがなくなり、`dedup_families` は既知のファミリーに印を付け、`usage_report` は開始時刻を受け取ります。新しいコマンド `patent-checker watch` と `patent-checker ledger status|check`。コンテナイメージはビルド時にディストリビューションのセキュリティ更新を適用します。
 - **v1.0**(2026-09): 安定版。ベアラートークンの定数時間比較、`.env` をホームディレクトリとファイルシステムのルートから読まない、リクエストのサイズ上限、コンテナのハードニング(読み取り専用、ケーパビリティなし)、Caddy による LAN/TLS の構成例、インストーラの改善(`--token-env` はトークンの値を要求しない、設定ファイルは所有者のみ読める、バックアップを上書きしない、失敗時は非ゼロ終了、Codex CLI の登録)、キャッシュとパーサーの修正(並行書き込み、CPC 記号、空の権利状態、非 UTF-8 ページ)、上流呼び出しの 401/429/503 での 1 回の再試行と無関係なツールを待たせない改善、すべてのコマンドが `.env` を読む、トレースバックの代わりに分かりやすいエラーメッセージ、Python 3.12 以上が必要(3.13 でも試験)、CI でのセキュリティスキャン、MCP Registry への掲載、文書の再構成。

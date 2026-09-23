@@ -124,8 +124,9 @@ cache), `search_cache_dir`, `cache_ttl` (expiry per kind), `cache_entries`
 (entries per kind), `operator_notice_version` and `log_level`. Record
 `version` in the exploration artifacts. If `ops_configured` is `false`, the
 server runs without OPS credentials: skip to the degraded mode of step 11
-(only `get_claims` and the offline helpers work). If the call itself fails because no `patent-checker` MCP
-server is registered, see "CLI fallback". If the server does not offer
+(only `get_claims` and the offline helpers work). If no `server_status`
+tool is offered, or calls fail twice in a row (connection refused,
+time-out, 401, 5xx), switch to "CLI fallback". If the server does not offer
 `watch_check`, it is older than this Skill: ask the operator to update it
 ("Older servers" in `references/follow-up-runs.md`).
 
@@ -265,7 +266,9 @@ symbol alone hits too much.
 
 ### 9. Report
 Write the report per `references/report-template.md`. Required elements:
-disclaimer, changes since the previous exploration, feature table,
+disclaimer, **"In plain terms"** (the picture of §5–§9 in everyday words
+without patent vocabulary, each item pointing to its section, no rating
+and no judgment of its own), changes since the previous exploration, feature table,
 translation-table reference, scope and limitations (say explicitly what
 was NOT searched), screening record, element tables, findings with the
 dated response record, **design boundaries** (extensions that would
@@ -372,6 +375,15 @@ the CLI equivalent of that tool-error prefix) or an invalid cache setting
 (`config_error`). Unreadable upstream data is `upstream_data` with exit
 code 3.
 
+**Switching to the CLI.** Run `patent-checker --version` first. If the
+command is missing, show the user `uv tool install patent-checker` and ask
+before anything is installed — never install on your own. Then run
+`patent-checker status` (no network): if `ops.configured` is `false`,
+suggest `patent-checker credentials set`, which the user runs in their own
+terminal — never ask for the key or secret in the conversation. If the user
+declines, continue in the degraded mode of step 11. Note in "Scope and
+limitations" that this run used the CLI instead of the server.
+
 **The CLI paces itself across invocations.** Every command is a new
 process, but the spacing, cool-downs and blocks are shared through a
 per-user state file, so consecutive commands wait for each other the way
@@ -385,7 +397,7 @@ searches after a pause.
 
 | MCP tool | CLI subcommand |
 |---|---|
-| `server_status` | (none — check `patent-checker --version` and run any OPS command; exit code 4 means degraded mode) |
+| `server_status` | `patent-checker status` (no network: version, whether OPS credentials are set and where from, data directories, consent, pacing) |
 | `ops_search` | `patent-checker search "<cql>" --begin N --end M` |
 | `ops_search_biblio` | `patent-checker search-biblio "<cql>" --begin N --end M` |
 | `search_plan_check` | `patent-checker plan-check "<q1>" "<q2>" ... [--file queries.txt] [--max-total N]` |

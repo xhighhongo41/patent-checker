@@ -22,15 +22,15 @@ import json
 import os
 import shlex
 import shutil
-import stat
 import subprocess
-import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from patent_checker.utils import OWNER_ONLY_MODE, write_atomically
 
 from .errors import InstallerError
 
@@ -50,13 +50,23 @@ _DEFAULT_INDENT = 2
 _WIDE_INDENT = 4
 
 #: Mode given to configuration files we create; they may hold a token.
-_OWNER_ONLY = 0o600
+_OWNER_ONLY = OWNER_ONLY_MODE
+
+# The atomic, optionally owner-only writer lives in the core package so the
+# credentials module can share it; the private name is kept for call sites.
+_write_atomically = write_atomically
 
 #: Seconds a vendor CLI may run before it is treated as unusable.
 _CLI_TIMEOUT = 60
 
 #: How many trailing stderr lines are quoted in a failure message.
 _STDERR_TAIL_LINES = 3
+
+#: What a vendor CLI is run for by :func:`run_vendor_cli`.
+Purpose = Literal["register", "remove"]
+
+#: Past tense of each :data:`Purpose`, for the success message.
+_DONE: dict[str, str] = {"register": "registered", "remove": "removed"}
 
 
 class Outcome(StrEnum):
@@ -169,52 +179,6 @@ def _back_up(path: Path, *, sensitive: bool) -> Path | None:
     if sensitive and os.name != "nt":
         os.chmod(backup, _OWNER_ONLY)
     return backup
-
-
-def _write_atomically(path: Path, text: str, *, sensitive: bool = False) -> None:
-    """Replace *path* with *text*, creating parent directories as needed.
-
-    The text is written to a temporary file in the destination directory
-    and moved onto the target, so a crash never leaves a half-written
-    configuration file.
-
-    Args:
-        path: The file to replace.
-        text: Its new content.
-        sensitive: Whether *text* embeds the bearer token. A sensitive file
-            keeps the owner-only mode of the temporary file even when it
-            existed before, so a token cannot end up in a world-readable
-            configuration; a file that only references an environment
-            variable keeps whatever mode the user gave it.
-
-    Note:
-        Windows has no POSIX modes, so the mode is left to the directory's
-        inherited ACL there (as elsewhere in this module).
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        previous_mode: int | None = stat.S_IMODE(path.stat().st_mode)
-    except OSError:
-        previous_mode = None
-    if sensitive:
-        previous_mode = None
-    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-        # ``mkstemp`` already restricts the new file to its owner, which is
-        # what we want for a file we create and for every file holding a
-        # token; only an existing, non-sensitive file needs its own mode
-        # restored. Windows has no POSIX modes to preserve.
-        if previous_mode is not None and os.name != "nt":
-            os.chmod(tmp_path, previous_mode)
-        elif sensitive and os.name != "nt":
-            os.chmod(tmp_path, _OWNER_ONLY)
-        os.replace(tmp_path, path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def merge_json(
@@ -423,8 +387,9 @@ def run_vendor_cli(
     runner: Runner | None = None,
     secrets: Sequence[str] = (),
     dry_run: bool = False,
+    purpose: Purpose = "register",
 ) -> WriteResult:
-    """Register the server by running a vendor's own ``mcp add`` command.
+    """Register (or remove) the server by running a vendor's own ``mcp`` command.
 
     Preferred over editing a file whenever the host application ships a
     CLI, since the vendor's command knows the current schema. A missing
@@ -438,11 +403,15 @@ def run_vendor_cli(
             :func:`subprocess.run` with a 60 second timeout.
         secrets: Values to hide in the message (the bearer token).
         dry_run: When ``True``, do not call *runner*.
+        purpose: ``"register"`` for ``mcp add`` and ``"remove"`` for
+            ``mcp remove``; it only changes the wording of the message.
 
     Returns:
         :attr:`Outcome.REGISTERED_BY_CLI` on exit code 0 (the message names
         only the program, never the arguments, which carry the token), or
-        :attr:`Outcome.MANUAL` with the redacted tail of stderr.
+        :attr:`Outcome.MANUAL` with the redacted tail of stderr. A removal
+        reports success with the same member: it means "done by the
+        vendor's CLI" in both directions.
 
     Raises:
         InstallerError: *argv* is empty.
@@ -450,6 +419,7 @@ def run_vendor_cli(
     if not argv:
         raise InstallerError("no command to run: the vendor CLI argv is empty")
     program = Path(argv[0]).name
+    by_hand = f"{purpose} the server by hand"
     if dry_run:
         shown = shlex.join(redact(argument, secrets) for argument in argv)
         return WriteResult(
@@ -460,20 +430,18 @@ def run_vendor_cli(
     try:
         completed = run(argv)
     except FileNotFoundError:
-        return WriteResult(
-            Outcome.MANUAL, None, f"{program} is not installed; register the server by hand"
-        )
+        return WriteResult(Outcome.MANUAL, None, f"{program} is not installed; {by_hand}")
     except subprocess.TimeoutExpired:
         return WriteResult(
             Outcome.MANUAL,
             None,
-            f"{program} did not finish within {_CLI_TIMEOUT}s; register the server by hand",
+            f"{program} did not finish within {_CLI_TIMEOUT}s; {by_hand}",
         )
 
     if completed.returncode == 0:
-        return WriteResult(Outcome.REGISTERED_BY_CLI, None, f"registered by {program}")
+        return WriteResult(Outcome.REGISTERED_BY_CLI, None, f"{_DONE[purpose]} by {program}")
     tail = "\n".join((completed.stderr or "").strip().splitlines()[-_STDERR_TAIL_LINES:])
-    message = f"{program} failed with exit code {completed.returncode}; register the server by hand"
+    message = f"{program} failed with exit code {completed.returncode}; {by_hand}"
     if tail:
         message = f"{message}: {redact(tail, secrets)}"
     return WriteResult(Outcome.MANUAL, None, message)

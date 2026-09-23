@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from patent_checker import consent
 
@@ -77,6 +77,10 @@ NEXT_STEP = "Next: start the server (see README) and open a new session in your 
 TOKEN_IN_PROJECT_WARNING = (
     "Warning: these files below the working directory contain the token itself; do not commit them"
 )
+
+#: Version of the document :meth:`InstallReport.to_dict` produces, bumped
+#: whenever its shape changes so a caller can branch on it.
+REPORT_FORMAT = 1
 
 
 class InstallAborted(InstallerError):
@@ -160,6 +164,51 @@ class InstallReport:
         """
         return 1 if any(result.outcome is Outcome.ERROR for result in self.results()) else 0
 
+    def to_dict(self, *, dry_run: bool) -> dict[str, Any]:
+        """Return this report as the document ``patent-checker install --json`` prints.
+
+        Every message and snippet is already redacted by the producer that
+        built it (see :func:`~.writers.redact`), so nothing here needs to
+        hide the token again; this only reshapes what :func:`format_report`
+        already renders as text into a structure a script or agent can
+        parse without scraping the report's tables.
+
+        Args:
+            dry_run: Whether the run that produced this report was a dry
+                run. The report itself does not carry the option it was
+                built from, so the caller passes it back in.
+
+        Returns:
+            A JSON-ready ``dict`` at format version :data:`REPORT_FORMAT`.
+        """
+        return {
+            "format": REPORT_FORMAT,
+            "command": "install",
+            "dry_run": dry_run,
+            "consent": self.consent,
+            "agents": list(self.agents),
+            "skill": [_result_to_dict(result) for result in self.skill],
+            "mcp": {key: _registration_to_dict(item) for key, item in self.mcp.items()},
+            "token_files": [str(path) for path in self.token_files],
+            "warnings": [TOKEN_IN_PROJECT_WARNING] if self.token_files else [],
+            "exit_code": self.exit_code(),
+        }
+
+
+def _result_to_dict(result: WriteResult) -> dict[str, Any]:
+    """Return *result* as a JSON-ready dict (see :meth:`InstallReport.to_dict`)."""
+    return {
+        "outcome": str(result.outcome),
+        "path": str(result.path) if result.path is not None else None,
+        "message": result.message,
+        "dry_run": result.dry_run,
+    }
+
+
+def _registration_to_dict(registration: Registration) -> dict[str, Any]:
+    """Return *registration* as a JSON-ready dict, snippet included when there is one."""
+    return {**_result_to_dict(registration.result), "snippet": registration.snippet}
+
 
 def install(
     options: InstallOptions,
@@ -200,7 +249,7 @@ def install(
         raise InstallerError(
             f"unknown scope {options.scope!r}: expected one of {', '.join(SCOPES)}"
         )
-    agents = _resolve_agents(options.agents, home=home, which=which)
+    agents = _resolve_agents(options.agents, home=home, which=which, environ=environ)
     consent_line = _consent_step(options, stdin_is_tty=stdin_is_tty, confirm=confirm, out=out)
     # The token is resolved before anything is copied: a run that ends here
     # because no source has the token must not leave a Skill behind, half
@@ -218,7 +267,14 @@ def install(
     if options.mcp:
         for key in agents:
             registrations[key] = _mcp_step(
-                key, options, home=home, cwd=cwd, token=token, which=which, runner=runner
+                key,
+                options,
+                home=home,
+                cwd=cwd,
+                token=token,
+                which=which,
+                runner=runner,
+                environ=environ,
             )
 
     return InstallReport(
@@ -306,7 +362,11 @@ def list_agents(
 
 
 def _resolve_agents(
-    requested: tuple[str, ...] | None, *, home: Path, which: Callable[[str], str | None]
+    requested: tuple[str, ...] | None,
+    *,
+    home: Path,
+    which: Callable[[str], str | None],
+    environ: Mapping[str, str],
 ) -> list[str]:
     """Return the agent keys to install for, in report order.
 
@@ -315,13 +375,14 @@ def _resolve_agents(
             among the keys, or an explicit list.
         home: The user's home directory.
         which: :func:`shutil.which`, or a stand-in.
+        environ: The process environment, passed on to :func:`detect_agents`.
 
     Raises:
         InstallAborted: Nothing was requested and nothing was detected.
         InstallerError: A requested key is not a known agent.
     """
     if not requested:
-        detected = detect_agents(home=home, which=which)
+        detected = detect_agents(home=home, which=which, environ=environ)
         if not detected:
             raise InstallAborted(
                 "no supported agent detected; pass --agent to name one (or --agent all)"
@@ -471,6 +532,7 @@ def _mcp_step(
     token: str,
     which: Callable[[str], str | None],
     runner: Runner | None,
+    environ: Mapping[str, str],
 ) -> Registration:
     """Register the server with one agent, turning a write error into advice."""
     try:
@@ -485,6 +547,7 @@ def _mcp_step(
             which=which,
             runner=runner,
             dry_run=options.dry_run,
+            environ=environ,
         )
     except OSError as error:
         # Manual, not an error: the user can still paste the entry, so the

@@ -283,6 +283,45 @@ def test_report_template_opens_with_the_changes_since_the_previous_run() -> None
     assert "cumulative" in text.lower()
 
 
+def _section(text: str, heading: str) -> str:
+    """Return the body of the ``## `` section *heading* up to the next one."""
+    start = text.index(heading) + len(heading)
+    end = text.find("\n## ", start)
+    return text[start:] if end == -1 else text[start:end]
+
+
+# Words that would turn the plain-language summary into a rating or a
+# conclusion; the summary may only restate the report's own observations.
+_PLAIN_TERMS_FORBIDDEN = ("score", "risk level", "infring")
+
+
+def test_report_template_puts_the_plain_summary_between_disclaimer_and_changes() -> None:
+    """The plain-language summary follows the disclaimer and precedes the changes."""
+    text = (SKILL_DIR / "references" / "report-template.md").read_text(encoding="utf-8")
+    disclaimer = text.index("> **Disclaimer")
+    plain = text.index("## In plain terms")
+    changes = text.index("## Changes since the previous exploration")
+    assert disclaimer < plain < changes < text.index("## 1. Technical features")
+    body = _section(text, "## In plain terms")
+    for word in _PLAIN_TERMS_FORBIDDEN:
+        assert word not in body.lower(), f"plain summary mentions {word!r}"
+    # Every item points to where the detail is, and the degree stays in the
+    # report's own three observations.
+    for needle in ("§5.1", "§5.2", "§9", "reads-on direction", "lacks", "unclear"):
+        assert needle in body, f"plain summary guidance lacks {needle!r}"
+
+
+def test_update_report_template_has_the_short_plain_summary() -> None:
+    """The monitoring update carries the short form right after its disclaimer."""
+    text = (SKILL_DIR / "references" / "update-report-template.md").read_text(encoding="utf-8")
+    plain = text.index("## In plain terms")
+    assert text.index("> **Disclaimer") < plain < text.index("## Scope and limitations")
+    body = _section(text, "## In plain terms")
+    for word in _PLAIN_TERMS_FORBIDDEN:
+        assert word not in body.lower(), f"plain summary mentions {word!r}"
+    assert "Nothing changed" in body
+
+
 def test_update_report_template_keeps_the_safeguards_of_the_full_report() -> None:
     """The short monitoring update still carries the disclaimer and states no verdict."""
     text = (SKILL_DIR / "references" / "update-report-template.md").read_text(encoding="utf-8")

@@ -20,6 +20,7 @@ import pytest
 from patent_checker import consent
 from patent_checker.installer import (
     CONSENT_PROMPT,
+    REPORT_FORMAT,
     TOKEN_IN_PROJECT_WARNING,
     InstallAborted,
     InstallOptions,
@@ -1046,6 +1047,7 @@ def _register(
     which: Callable[[str], str | None] = _no_cli,
     runner: Runner | None = None,
     dry_run: bool = False,
+    environ: dict[str, str] | None = None,
 ) -> Registration:
     """Call :func:`register_mcp` with the defaults these tests share."""
     return register_mcp(
@@ -1059,6 +1061,7 @@ def _register(
         which=which,
         runner=runner,
         dry_run=dry_run,
+        environ=environ if environ is not None else {},
     )
 
 
@@ -1071,7 +1074,7 @@ def test_agents_table_names_a_cli_only_for_the_products_that_ship_one() -> None:
         "claude-code": "claude",
         "codex": "codex",
         "opencode": "opencode",
-        "openhands": None,
+        "openhands": "openhands",
         "cursor": None,
         "gemini-cli": "gemini",
         "copilot-cli": "copilot",
@@ -1104,6 +1107,31 @@ def test_detect_agents_finds_opencode_below_dot_config(tmp_path: Path) -> None:
     (home / ".config" / "opencode").mkdir(parents=True)
 
     assert detect_agents(home=home, which=_no_cli) == ["opencode"]
+
+
+def test_detect_agents_finds_opencode_below_xdg_config_home_when_set(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    xdg = tmp_path / "xdg-config"
+    # The default ~/.config/opencode is deliberately left absent, so this
+    # only passes if detection actually followed XDG_CONFIG_HOME.
+    (xdg / "opencode").mkdir(parents=True)
+
+    detected = detect_agents(home=home, which=_no_cli, environ={"XDG_CONFIG_HOME": str(xdg)})
+
+    assert "opencode" in detected
+
+
+def test_detect_agents_does_not_find_opencode_below_xdg_config_home_when_unset(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg-config"
+    (xdg / "opencode").mkdir(parents=True)
+
+    detected = detect_agents(home=home, which=_no_cli, environ={})
+
+    assert "opencode" not in detected
 
 
 def test_detect_agents_reports_the_keys_in_the_documented_order(tmp_path: Path) -> None:
@@ -1363,6 +1391,29 @@ def test_register_opencode_project_scope_writes_into_the_working_directory(tmp_p
     assert result.path == cwd / "opencode.json"
 
 
+def test_register_opencode_follows_xdg_config_home_when_set(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    xdg = tmp_path / "xdg-config"
+
+    result = _register(
+        "opencode", home=home, cwd=tmp_path / "project", environ={"XDG_CONFIG_HOME": str(xdg)}
+    ).result
+
+    assert result.path == xdg / "opencode" / "opencode.json"
+    assert not (home / ".config").exists()
+
+
+@pytest.mark.parametrize("environ", [{}, {"XDG_CONFIG_HOME": ""}], ids=["unset", "empty"])
+def test_register_opencode_falls_back_to_dot_config_without_xdg_config_home(
+    tmp_path: Path, environ: dict[str, str]
+) -> None:
+    home = tmp_path / "home"
+
+    result = _register("opencode", home=home, cwd=tmp_path / "project", environ=environ).result
+
+    assert result.path == home / ".config" / "opencode" / "opencode.json"
+
+
 def test_register_openhands_always_asks_for_a_manual_edit(tmp_path: Path) -> None:
     cwd = tmp_path / "project"
 
@@ -1384,12 +1435,93 @@ def test_register_openhands_snippet_flags_the_unverified_api_key(tmp_path: Path)
     assert "not confirmed" in registration.snippet
 
 
+def test_register_openhands_snippet_also_shows_the_cli_command(tmp_path: Path) -> None:
+    registration = _register("openhands", home=tmp_path / "home", cwd=tmp_path / "project")
+
+    assert registration.snippet is not None
+    assert "openhands mcp add" in registration.snippet
+    assert SERVER_NAME in registration.snippet
+    assert DEFAULT_URL in registration.snippet
+    assert TOKEN not in registration.snippet
+
+
 def test_register_openhands_says_that_token_env_is_not_supported(tmp_path: Path) -> None:
     registration = _register(
         "openhands", home=tmp_path / "home", cwd=tmp_path / "project", token_env=True
     )
 
     assert "--token-env" in registration.result.message
+
+
+def test_register_openhands_runs_its_cli_when_present(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    result = _register(
+        "openhands",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        which=_cli_named("openhands"),
+        runner=_fake_runner(calls=calls),
+    ).result
+
+    assert result.outcome is Outcome.REGISTERED_BY_CLI
+    assert calls == [
+        [
+            "openhands",
+            "mcp",
+            "add",
+            SERVER_NAME,
+            "--transport",
+            "http",
+            "--header",
+            f"Authorization: Bearer {TOKEN}",
+            DEFAULT_URL,
+        ]
+    ]
+
+
+def test_register_openhands_falls_back_to_the_manual_snippet_when_the_cli_fails(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "project"
+
+    registration = _register(
+        "openhands",
+        home=tmp_path / "home",
+        cwd=cwd,
+        which=_cli_named("openhands"),
+        runner=_fake_runner(returncode=1, stderr="unknown command mcp\n"),
+    )
+
+    # Unlike the CLI-backed hosts, a failed run is not merged into the
+    # message: OpenHands' CLI route is unverified, so the installer falls
+    # straight back to the same manual step it reports when the CLI is
+    # simply absent, rather than claiming to know why it failed.
+    assert registration.result.outcome is Outcome.MANUAL
+    assert registration.result.path == cwd / "config.toml"
+    assert registration.result.message == (
+        f"{cwd / 'config.toml'}: OpenHands has no registration command; add the server by hand"
+    )
+    assert registration.snippet is not None
+    assert "openhands mcp add" in registration.snippet
+    assert "[mcp]" in registration.snippet
+
+
+def test_register_openhands_does_not_run_its_cli_with_token_env(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    registration = _register(
+        "openhands",
+        home=tmp_path / "home",
+        cwd=tmp_path / "project",
+        token_env=True,
+        which=_cli_named("openhands"),
+        runner=_fake_runner(calls=calls),
+    )
+
+    assert registration.result.outcome is Outcome.MANUAL
+    assert "--token-env" in registration.result.message
+    assert calls == []
 
 
 def test_register_cursor_keeps_the_other_servers(tmp_path: Path) -> None:
@@ -2450,3 +2582,197 @@ def test_install_does_not_retry_a_claude_code_failure_that_is_not_a_duplicate(
 
     assert report.mcp["claude-code"].result.outcome is Outcome.MANUAL
     assert len(calls) == 1
+
+
+# --- InstallReport.to_dict() ---
+
+
+def test_to_dict_reports_the_format_version_and_the_run_it_describes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["format"] == REPORT_FORMAT == 1
+    assert data["command"] == "install"
+    assert data["dry_run"] is False
+    assert data["consent"] == report.consent
+    assert data["agents"] == ["cursor"]
+    assert data["exit_code"] == 0
+
+
+def test_to_dict_records_the_dry_run_flag_it_is_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The flag is passed in, not read from the report: it describes the run, not a step."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False, dry_run=True),
+        home=home,
+        cwd=cwd,
+    )
+
+    assert report.to_dict(dry_run=True)["dry_run"] is True
+    assert report.to_dict(dry_run=False)["dry_run"] is False
+
+
+def test_to_dict_skill_entry_matches_a_written_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert len(data["skill"]) == len(report.skill)
+    entry = data["skill"][0]
+    result = report.skill[0]
+    assert entry == {
+        "outcome": "written",
+        "path": str(result.path),
+        "message": result.message,
+        "dry_run": False,
+    }
+
+
+def test_to_dict_skill_entry_reports_error_for_a_broken_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    def broken() -> Path:
+        raise InstallerError("the bundled Skill is missing")
+
+    monkeypatch.setattr("patent_checker.installer.skill_source", broken)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["skill"] == [
+        {
+            "outcome": "error",
+            "path": None,
+            "message": "the bundled Skill is missing",
+            "dry_run": False,
+        }
+    ]
+    assert data["exit_code"] == 1
+
+
+def test_to_dict_mcp_entry_reports_registered_by_cli_with_no_path_or_snippet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude"),
+        runner=_fake_runner(returncode=0),
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["mcp"]["claude-code"] == {
+        "outcome": "registered-by-cli",
+        "path": None,
+        "message": "registered by claude",
+        "dry_run": False,
+        "snippet": None,
+    }
+
+
+def test_to_dict_mcp_entry_carries_the_manual_snippet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("hermes",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    entry = data["mcp"]["hermes"]
+    assert entry["outcome"] == "manual"
+    assert entry["path"] == str(report.mcp["hermes"].result.path)
+    assert entry["snippet"] == report.mcp["hermes"].snippet
+    assert "mcp_servers:" in entry["snippet"]
+
+
+def test_to_dict_mcp_entry_reports_skipped_for_an_existing_codex_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    config = home / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text(f'[mcp_servers.{SERVER_NAME}]\nurl = "http://old/mcp"\n', encoding="utf-8")
+
+    report = _run_install(
+        InstallOptions(agents=("codex",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["mcp"]["codex"]["outcome"] == "skipped"
+
+
+def test_to_dict_warns_about_token_files_written_below_the_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False, scope="project"),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["token_files"] == [str(cwd / ".cursor" / "mcp.json")]
+    assert data["warnings"] == [TOKEN_IN_PROJECT_WARNING]
+
+
+def test_to_dict_reports_no_warnings_without_token_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["token_files"] == []
+    assert data["warnings"] == []
+
+
+def test_to_dict_never_leaks_the_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No message, snippet or vendor-CLI failure text carries the token into the JSON."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("all",), agree=True),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude", "gemini", "copilot"),
+        runner=_fake_runner(returncode=1, stderr=f"rejected token {TOKEN}\n"),
+    )
+
+    assert TOKEN not in json.dumps(report.to_dict(dry_run=False))

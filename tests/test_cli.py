@@ -13,6 +13,7 @@ import errno
 import io
 import json
 import os
+import stat
 import sys
 import time
 from collections.abc import Iterator
@@ -28,7 +29,7 @@ import pytest
 import patent_checker.server.app as server_app
 import patent_checker.server.settings as server_settings
 import patent_checker.server.tools as server_tools
-from patent_checker import consent, installer, pacing, service
+from patent_checker import config, consent, credentials, installer, pacing, service
 from patent_checker.cache import Cache, default_cache
 from patent_checker.cli import main as cli_main
 from patent_checker.config import ConfigError
@@ -1360,6 +1361,227 @@ def test_consent_without_subcommand_is_invalid_input(capsys: pytest.CaptureFixtu
     assert data["error"]["type"] == "invalid_input"
 
 
+# --- credentials ------------------------------------------------------------
+
+
+def test_credentials_set_prompts_twice_without_echo_and_writes_the_file(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """credentials set, run at a terminal, prompts for the key and secret and writes them.
+
+    Neither value is ever echoed to a stream: the fake prompt only records
+    which prompt text was shown, and the file is checked instead of stdout.
+    """
+    monkeypatch.setattr(cli_main, "_stdin_is_tty", lambda: True)
+    seen_prompts: list[str] = []
+    values = iter(["k3y-value", "s3cret-value"])
+
+    def fake_prompt(prompt: str) -> str:
+        seen_prompts.append(prompt)
+        return next(values)
+
+    monkeypatch.setattr(cli_main, "_prompt_secret", fake_prompt)
+    target = cli_main.config.credentials_path()
+
+    rc, data, err = _invoke_with_stderr(["credentials", "set"], capsys)
+
+    assert rc == 0
+    assert data == {"path": str(target), "written": True}
+    assert seen_prompts == ["EPO OPS consumer key: ", "EPO OPS consumer secret: "]
+    content = target.read_text(encoding="utf-8")
+    assert "k3y-value" in content
+    assert "s3cret-value" in content
+    if os.name != "nt":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert "k3y-value" not in err
+    assert "s3cret-value" not in err
+
+
+def test_credentials_set_from_env_reads_the_process_environment(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--from-env takes the key/secret straight from the process environment."""
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "env-key")
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "env-secret")
+    target = cli_main.config.credentials_path()
+
+    rc, data = _invoke(["credentials", "set", "--from-env"], capsys)
+
+    assert rc == 0
+    assert data == {"path": str(target), "written": True}
+    content = target.read_text(encoding="utf-8")
+    assert "env-key" in content
+    assert "env-secret" in content
+
+
+def test_credentials_set_from_env_also_sees_a_project_dotenv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    restore_environ: None,
+) -> None:
+    """--from-env also picks up OPS variables a project .env sets.
+
+    ``main()`` reads the nearest ``.env`` before any subcommand runs (see
+    the module docstring), so by the time this handler reads the process
+    environment, values a project ``.env`` defines for the two variables
+    are already there -- not only ones already set outside of it.
+    """
+    monkeypatch.setattr(cli_main.config, "load_dotenv", dotenv.load_dotenv)
+    (tmp_path / ".env").write_text(
+        "PATENT_CHECKER_OPS_KEY=dotenv-key\nPATENT_CHECKER_OPS_SECRET=dotenv-secret\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_OPS_SECRET", raising=False)
+    target = cli_main.config.credentials_path()
+
+    rc, data = _invoke(["credentials", "set", "--from-env"], capsys)
+
+    assert rc == 0
+    assert data == {"path": str(target), "written": True}
+    content = target.read_text(encoding="utf-8")
+    assert "dotenv-key" in content
+    assert "dotenv-secret" in content
+
+
+def test_credentials_set_without_a_terminal_or_from_env_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without a terminal and without --from-env, credentials set refuses to guess."""
+    monkeypatch.setattr(cli_main, "_stdin_is_tty", lambda: False)
+
+    rc, data = _invoke(["credentials", "set"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "--from-env" in data["error"]["message"]
+
+
+def test_credentials_set_from_env_missing_variable_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--from-env without both variables set names the missing one(s)."""
+    monkeypatch.delenv("PATENT_CHECKER_OPS_KEY", raising=False)
+    monkeypatch.delenv("PATENT_CHECKER_OPS_SECRET", raising=False)
+
+    rc, data = _invoke(["credentials", "set", "--from-env"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+    assert "PATENT_CHECKER_OPS_KEY" in data["error"]["message"]
+    assert "PATENT_CHECKER_OPS_SECRET" in data["error"]["message"]
+
+
+def test_credentials_set_value_error_from_set_credentials_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ValueError raised by credentials.set_credentials (a bad value) is invalid_input."""
+    monkeypatch.setenv("PATENT_CHECKER_OPS_KEY", "bad-${value}")
+    monkeypatch.setenv("PATENT_CHECKER_OPS_SECRET", "s3cret-value")
+
+    rc, data = _invoke(["credentials", "set", "--from-env"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+def test_credentials_status_reports_stubbed_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """credentials status prints credentials.credentials_status()'s result verbatim."""
+    fake_status = {
+        "configured": False,
+        "source": "none",
+        "path": None,
+        "user_file": {"path": "/x/credentials.env", "exists": False, "mode_ok": None},
+        "warnings": [],
+    }
+    captured_kwargs: dict[str, Any] = {}
+
+    def fake_credentials_status(
+        *, cwd: Path | None = None, home: Path | None = None
+    ) -> dict[str, Any]:
+        captured_kwargs["cwd"] = cwd
+        return fake_status
+
+    monkeypatch.setattr(credentials, "credentials_status", fake_credentials_status)
+
+    rc, data = _invoke(["credentials", "status"], capsys)
+
+    assert rc == 0
+    assert data == fake_status
+    assert captured_kwargs["cwd"] == Path.cwd()
+
+
+def test_credentials_clear_reports_deleted_true(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """credentials clear deletes an existing file and reports deleted: true."""
+    target = tmp_path / "credentials.env"
+    target.write_text("PATENT_CHECKER_OPS_KEY=x\n", encoding="utf-8")
+    monkeypatch.setenv(config.ENV_CREDENTIALS_FILE, str(target))
+
+    rc, data = _invoke(["credentials", "clear"], capsys)
+
+    assert rc == 0
+    assert data == {"path": str(target), "deleted": True}
+    assert not target.exists()
+
+
+def test_credentials_clear_reports_deleted_false_when_nothing_to_delete(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """credentials clear on a file that does not exist reports deleted: false."""
+    target = cli_main.config.credentials_path()
+
+    rc, data = _invoke(["credentials", "clear"], capsys)
+
+    assert rc == 0
+    assert data == {"path": str(target), "deleted": False}
+
+
+def test_credentials_without_subcommand_is_invalid_input(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """'credentials' with no set/status/clear child is an argparse-level invalid_input error."""
+    rc, data = _invoke(["credentials"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
+
+
+# --- status -------------------------------------------------------------
+
+
+def test_status_reports_service_status_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """'patent-checker status' prints service.status()'s result verbatim."""
+    fake_status = {
+        "version": "9.9.9",
+        "ops": {
+            "configured": False,
+            "source": "none",
+            "path": None,
+            "user_file": {"path": "/x/credentials.env", "exists": False, "mode_ok": None},
+            "warnings": [],
+        },
+        "consent": {"consented": False, "notice_version": "1", "needs_reconsent": False},
+        "data_dir": "/x",
+        "cache_base": "/y",
+        "pacing_dir": "/z",
+        "pacing": {"available": False, "path": "/z/state.json", "upstreams": {}},
+    }
+    monkeypatch.setattr(service, "status", lambda: fake_status)
+
+    rc, data = _invoke(["status"], capsys)
+
+    assert rc == 0
+    assert data == fake_status
+
+
 # --- serve ------------------------------------------------------------
 
 
@@ -1995,6 +2217,8 @@ def test_help_lists_all_subcommands(capsys: pytest.CaptureFixture[str]) -> None:
         "verify",
         "usage",
         "consent",
+        "credentials",
+        "status",
         "serve",
         "cache",
         "ledger",
@@ -2179,6 +2403,209 @@ def test_install_shows_the_japanese_notice_for_a_japanese_locale(
 
     assert rc == 0
     assert "重要なお知らせ" in out
+
+
+def test_install_json_prints_one_document_and_keeps_the_notice_off_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json's stdout is the report alone; the notice and its hint move to stderr."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc, data, err = _invoke_with_stderr(
+        ["install", "--json", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 0
+    assert data["format"] == 1
+    assert data["command"] == "install"
+    assert data["dry_run"] is True
+    assert data["agents"] == ["cursor"]
+    assert "Important Notice" in err
+    assert installer.OPERATOR_NOTICE_HINT in err
+
+
+def test_install_json_dry_run_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json combines with --dry-run: the report says so and nothing is written."""
+    _install_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc, data, _err = _invoke_with_stderr(
+        ["install", "--json", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert _files_under(tmp_path) == before
+
+
+def test_install_json_exit_code_is_one_when_a_step_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A broken Skill source is reported through exit_code, not a Python traceback."""
+    _install_env(monkeypatch, tmp_path)
+
+    def broken() -> Path:
+        raise installer.InstallerError("the bundled Skill is missing")
+
+    monkeypatch.setattr("patent_checker.installer.skill_source", broken)
+
+    rc, data, _err = _invoke_with_stderr(
+        ["install", "--json", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 1
+    assert data["exit_code"] == 1
+    assert data["skill"][0]["outcome"] == "error"
+
+
+def test_install_json_exit_code_is_two_and_prints_nothing_to_stdout_when_aborted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without a terminal and without --agree, install aborts before a report exists."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--json", "--agent", "cursor", "--no-mcp"])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert captured.out == ""
+    # The notice itself also lands on stderr in --json mode (see the module
+    # docstring), so only the closing error line is checked here.
+    assert "error: stdin is not a terminal" in captured.err
+
+
+def test_install_list_agents_with_json_is_ignored_and_warned_about(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json only formats an installation report; --list-agents warns and ignores it."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--list-agents", "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "--json" in captured.err
+    assert "warning:" in captured.err
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured.out)
+    assert "cursor" in captured.out
+
+
+# --- uninstall -------------------------------------------------------------
+
+
+def _uninstall_fixture(home: Path) -> tuple[Path, Path]:
+    """Install a fake Skill and a Cursor entry below *home*; return both paths."""
+    skill = home / ".agents" / "skills" / "patent-checker"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: patent-checker\n---\n", encoding="utf-8")
+    config_path = home / ".cursor" / "mcp.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(
+        json.dumps({"mcpServers": {"patent-checker": {"url": "x"}, "notes": {}}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return skill, config_path
+
+
+def test_uninstall_removes_the_skill_and_the_entry_and_prints_a_text_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """uninstall takes back the Skill and the entry and lists what it left in place."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+    skill, config_path = _uninstall_fixture(home)
+
+    rc = cli_main.main(["uninstall", "--agent", "cursor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert not skill.exists()
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {"mcpServers": {"notes": {}}}
+    assert "Left in place" in out
+    assert "uv tool uninstall patent-checker" in out
+
+
+def test_uninstall_dry_run_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """uninstall --dry-run reports the plan and neither deletes nor writes a file."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+    _uninstall_fixture(home)
+    before = _files_under(tmp_path)
+
+    rc = cli_main.main(["uninstall", "--dry-run", "--agent", "cursor"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "dry run" in out
+    assert _files_under(tmp_path) == before
+
+
+def test_uninstall_json_prints_one_document(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json prints the report alone, with what is left in place."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+    _uninstall_fixture(home)
+
+    rc, data, err = _invoke_with_stderr(["uninstall", "--json", "--agent", "cursor"], capsys)
+
+    assert rc == 0
+    assert err == ""
+    assert data["command"] == "uninstall"
+    assert data["dry_run"] is False
+    assert data["agents"] == ["cursor"]
+    assert data["mcp"]["cursor"]["outcome"] == "written"
+    assert any("credentials clear" in item for item in data["left_in_place"])
+    assert data["exit_code"] == 0
+
+
+def test_uninstall_json_honours_no_skill_and_no_mcp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--no-skill and --no-mcp switch the two steps off, as for install."""
+    home, _ = _install_env(monkeypatch, tmp_path)
+    skill, config_path = _uninstall_fixture(home)
+    before = config_path.read_text(encoding="utf-8")
+
+    rc, data, _err = _invoke_with_stderr(
+        ["uninstall", "--json", "--agent", "cursor", "--no-skill", "--no-mcp"], capsys
+    )
+
+    assert rc == 0
+    assert data["skill"] == []
+    assert data["mcp"] == {}
+    assert skill.is_dir()
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_uninstall_without_a_detected_agent_exits_two(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With no agent detected and none named, uninstall stops before a report exists."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["uninstall", "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert captured.out == ""
+    assert captured.err.startswith("error: ")
+    assert "--agent" in captured.err
+
+
+def test_uninstall_with_an_unknown_agent_is_invalid_input(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """An agent argparse does not know is rejected through the JSON envelope."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc, data = _invoke(["uninstall", "--agent", "emacs"], capsys)
+
+    assert rc == 2
+    assert data["error"]["type"] == "invalid_input"
 
 
 @pytest.mark.parametrize(

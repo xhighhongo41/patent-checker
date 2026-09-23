@@ -178,7 +178,9 @@ def load_settings(
         raise ConfigError(
             f"binding to a non-loopback host ({resolved_host!r}) requires "
             f"{ENV_ALLOWED_HOSTS} (comma-separated hostnames clients will use in the Host "
-            "header) and TLS must be provided by a reverse proxy in front of the server"
+            "header); this server provides no TLS, so encryption is up to the network it "
+            "runs on and, ideally, a TLS-terminating reverse proxy in front of it -- see "
+            "docs/deploy-lan.md"
         )
 
     rps = _resolve_rps()

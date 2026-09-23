@@ -11,6 +11,9 @@ and produce them as JSON without an extra translation layer.
 from __future__ import annotations
 
 import json
+import os
+import stat
+import tempfile
 from collections import Counter
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime
@@ -24,6 +27,9 @@ from patent_checker.config import data_dir
 from patent_checker.ops.client import OpsClient, parse_throttling_header
 from patent_checker.ops.parse import parse_search_xml
 from patent_checker.pubnum import parse_pubnum
+
+#: Mode given to files written with ``sensitive=True`` by :func:`write_atomically`.
+OWNER_ONLY_MODE = 0o600
 
 # Name of the OPS request log written by OpsClient and read by usage_report().
 OPS_HEADERS_FILENAME = "headers.jsonl"
@@ -638,3 +644,48 @@ def _log_at_as_local_aware(at: Any) -> datetime | None:
     except (TypeError, ValueError):
         return None
     return _as_local_aware(parsed)
+
+
+def write_atomically(path: Path, text: str, *, sensitive: bool = False) -> None:
+    """Replace *path* with *text*, creating parent directories as needed.
+
+    The text is written to a temporary file in the destination directory
+    and moved onto the target, so a crash never leaves a half-written file.
+
+    Args:
+        path: The file to replace.
+        text: Its new content.
+        sensitive: Whether *text* embeds a secret (a bearer token, OPS
+            credentials). A sensitive file gets the owner-only mode
+            :data:`OWNER_ONLY_MODE` even when it existed before with a wider
+            one, so a secret cannot end up world-readable; a non-sensitive
+            file that already existed keeps whatever mode the user gave it.
+
+    Note:
+        Windows has no POSIX modes, so the mode is left to the directory's
+        inherited ACL there.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        previous_mode: int | None = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        previous_mode = None
+    if sensitive:
+        previous_mode = None
+    handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        # ``mkstemp`` already restricts the new file to its owner, which is
+        # what we want for a file we create and for every file holding a
+        # secret; only an existing, non-sensitive file needs its own mode
+        # restored. Windows has no POSIX modes to preserve.
+        if previous_mode is not None and os.name != "nt":
+            os.chmod(tmp_path, previous_mode)
+        elif sensitive and os.name != "nt":
+            os.chmod(tmp_path, OWNER_ONLY_MODE)
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise

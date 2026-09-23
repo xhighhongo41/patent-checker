@@ -107,7 +107,12 @@ run_or_show uv tool install --upgrade "$spec"
 # Step 3: confirm the CLI is on PATH and report its version.
 run_or_show patent-checker --version
 
-# Step 4: hand off to the interactive installer, when possible.
+# Step 4: hand off to the interactive installer, when possible. Stdin is a
+# TTY when the script is run directly ("sh install.sh"): the installer takes
+# over it as usual. Stdin is piped when the script is fetched with
+# "curl | sh"; the installer still runs, against /dev/tty, when that device
+# can be opened (a terminal is present, just not on stdin), and only the
+# next command is printed when it cannot (no terminal at all, e.g. CI).
 if [ "$dry_run" -eq 1 ]; then
     echo "would run: patent-checker install (if stdin is a TTY)"
     echo "would print: Next: run 'patent-checker install' in your project directory (it shows the notice, installs the Skill and registers the MCP server) (if stdin is not a TTY)"
@@ -116,6 +121,8 @@ fi
 
 if [ -t 0 ]; then
     exec patent-checker install
+elif (: </dev/tty) 2>/dev/null; then
+    exec patent-checker install </dev/tty
 else
     echo "Next: run 'patent-checker install' in your project directory (it shows the notice, installs the Skill and registers the MCP server)"
     exit 0

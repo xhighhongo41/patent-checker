@@ -20,9 +20,14 @@ that hold the real value private (`chmod 600`) and never commit them.
 | Cursor | JSON merge | `~/.cursor/mcp.json` or `.cursor/mcp.json` |
 | OpenCode | JSON merge | `~/.config/opencode/opencode.json` or `opencode.json` |
 | Codex CLI | `codex mcp add` with `--token-env`, TOML append otherwise | `~/.codex/config.toml` |
-| OpenHands | snippet to paste | `config.toml` in the working directory |
+| OpenHands | `openhands mcp add` (snippet to paste without the CLI) | managed by the OpenHands CLI (`~/.openhands/`) |
 | Hermes Agent | snippet to paste | `~/.hermes/config.yaml` |
-| Copilot coding agent | snippet to paste (GitHub.com repository settings) | repository settings |
+| Copilot coding agent | not registered (entered on GitHub.com) | repository settings |
+
+The Gemini CLI, Copilot CLI and OpenHands commands follow their
+documentation but have not been tried against the real tools.
+`patent-checker uninstall` takes back what the installer wrote; the
+sections below also say what to delete by hand.
 
 ## Claude Code
 
@@ -104,7 +109,11 @@ goes in:
 
 ## OpenCode
 
-`~/.config/opencode/opencode.json` (user) or `opencode.json` (project):
+`~/.config/opencode/opencode.json` (user; `$XDG_CONFIG_HOME/opencode/` when
+that variable is set) or `opencode.json` (project). OpenCode documents only
+the `~/.config` path; on Windows that is expected to be
+`%USERPROFILE%\.config\opencode\`, which has not been verified. OpenCode
+has no `mcp add` command, so the file is edited:
 
 ```json
 {"mcp": {"patent-checker": {"type": "remote", "url": "http://127.0.0.1:8642/mcp",
@@ -113,10 +122,23 @@ goes in:
 
 ## OpenHands
 
-`config.toml` in the working directory. OpenHands' documentation does not
-say which header `api_key` is sent in, so this is not guaranteed to reach
-the server as a bearer token; if the first call is refused with 401, use the
-OpenHands CLI's `--header "Authorization: Bearer ..."` option instead.
+The OpenHands CLI registers servers itself (it keeps them in
+`~/.openhands/mcp.json`); this is what the installer runs when `openhands`
+is on your PATH:
+
+```sh
+openhands mcp add patent-checker --transport http \
+  --header "Authorization: Bearer ${PATENT_CHECKER_SERVER_TOKEN}" http://127.0.0.1:8642/mcp
+openhands mcp list
+```
+
+Remove it with `openhands mcp remove patent-checker` if your OpenHands
+version has that command, or delete the entry from `~/.openhands/mcp.json`.
+
+The full OpenHands application (web UI or Docker) reads `config.toml` in the
+working directory instead. Its documentation does not say which header
+`api_key` is sent in, so this is not guaranteed to reach the server as a
+bearer token; if the first call is refused with 401, use the CLI form above.
 
 ```toml
 [mcp]
@@ -139,14 +161,21 @@ mcp_servers:
 ## GitHub Copilot coding agent
 
 The coding agent runs on GitHub.com and reaches your server only if it is
-published with TLS (see [deploy-lan.md](deploy-lan.md)). In the repository's
-Copilot settings, add an MCP configuration and store the token as a Copilot
-environment secret named with the `COPILOT_MCP_` prefix:
+published on the internet with TLS (see [deploy-lan.md](deploy-lan.md); a
+tailnet or VPN address is not reachable from GitHub). Its MCP configuration
+is entered in the repository's settings on GitHub.com (Settings → Copilot →
+Coding agent); there is no file or API the installer could write it to.
+Store the token as a Copilot environment secret named with the
+`COPILOT_MCP_` prefix and reference it:
 
 ```json
 {"mcpServers": {"patent-checker": {"type": "http", "url": "https://patents.example.com/mcp",
   "headers": {"Authorization": "Bearer $COPILOT_MCP_PATENT_CHECKER_TOKEN"}, "tools": ["*"]}}}
 ```
+
+A custom agent defined in the repository (`.github/agents/<name>.md`) can
+also carry MCP servers in its front matter under `mcp-servers`, with the
+same keys; that configuration applies to that custom agent only.
 
 ## stdio instead of HTTP
 

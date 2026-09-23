@@ -31,6 +31,15 @@ and never overwrite an earlier file.
 > This update and the report it belongs to are records of the user's
 > awareness of the documents listed, and of the review that followed.
 
+## In plain terms
+[The short form of the full report's "In plain terms", under the same
+rules (everyday words, no patent vocabulary, degree only through the
+three observations, the sections and counts, each item pointing to where
+the detail is). One bullet per part of the target whose picture changed in
+this update, saying what changed in plain words. If nothing changed, write
+one line: "Nothing changed since [previous report or update, date]; the
+picture in the full report still holds."]
+
 ## Scope and limitations of this update
 **No search was run.** Patents published since [date of the last search,
 `searched_through`] are not covered by this update; a follow-up exploration

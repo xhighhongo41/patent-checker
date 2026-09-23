@@ -14,11 +14,11 @@
 # The three secret files are created by hand once; see secrets/README.md.
 #
 # The port is published on the host's loopback only, which is what lets the
-# container accept just the `localhost` and `127.0.0.1` Host headers. To serve
-# a LAN, drop the `127.0.0.1:` prefix below, override
-# PATENT_CHECKER_SERVER_ALLOWED_HOSTS with the names clients will really use,
-# and put a TLS-terminating reverse proxy in front -- this transport is plain
-# HTTP and the bearer token would otherwise travel in the clear.
+# container accept just the `localhost` and `127.0.0.1` Host headers. To
+# reach it from other machines (Tailscale Serve, a VPN, a LAN), add the names
+# clients will use to PATENT_CHECKER_SERVER_ALLOWED_HOSTS in .env and follow
+# docs/deploy-lan.md. This transport is plain HTTP: the bearer token is
+# encrypted only if the network or a TLS-terminating proxy encrypts it.
 #
 # `docker compose down` keeps the search cache and the request log;
 # `docker compose down -v` deletes the patent-checker-data volume with them.
@@ -29,11 +29,13 @@ services:
     # Compose builds a missing image instead of pulling it, which breaks the
     # "download this one file and run it" path. To run a locally built image
     # instead: docker build -t patent-checker:dev . && PATENT_CHECKER_IMAGE=patent-checker:dev docker compose up -d
-    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.2}
+    image: ${PATENT_CHECKER_IMAGE:-ghcr.io/xhighhongo41/patent-checker:1.3}
     ports:
       - "127.0.0.1:${PATENT_CHECKER_PORT:-8642}:8642"
     environment:
       PATENT_CHECKER_OPERATOR_CONSENT: ${PATENT_CHECKER_OPERATOR_CONSENT:-}
+      # Host names the server accepts; the default matches the image's own.
+      PATENT_CHECKER_SERVER_ALLOWED_HOSTS: ${PATENT_CHECKER_SERVER_ALLOWED_HOSTS:-localhost,127.0.0.1}
       # Credentials arrive as files, never as environment values: an
       # environment variable is visible to anything that can inspect the
       # container. Empty files are read as "not configured", and the server
