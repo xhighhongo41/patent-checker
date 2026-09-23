@@ -20,6 +20,7 @@ import pytest
 from patent_checker import consent
 from patent_checker.installer import (
     CONSENT_PROMPT,
+    REPORT_FORMAT,
     TOKEN_IN_PROJECT_WARNING,
     InstallAborted,
     InstallOptions,
@@ -2450,3 +2451,197 @@ def test_install_does_not_retry_a_claude_code_failure_that_is_not_a_duplicate(
 
     assert report.mcp["claude-code"].result.outcome is Outcome.MANUAL
     assert len(calls) == 1
+
+
+# --- InstallReport.to_dict() ---
+
+
+def test_to_dict_reports_the_format_version_and_the_run_it_describes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["format"] == REPORT_FORMAT == 1
+    assert data["command"] == "install"
+    assert data["dry_run"] is False
+    assert data["consent"] == report.consent
+    assert data["agents"] == ["cursor"]
+    assert data["exit_code"] == 0
+
+
+def test_to_dict_records_the_dry_run_flag_it_is_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The flag is passed in, not read from the report: it describes the run, not a step."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False, dry_run=True),
+        home=home,
+        cwd=cwd,
+    )
+
+    assert report.to_dict(dry_run=True)["dry_run"] is True
+    assert report.to_dict(dry_run=False)["dry_run"] is False
+
+
+def test_to_dict_skill_entry_matches_a_written_outcome(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert len(data["skill"]) == len(report.skill)
+    entry = data["skill"][0]
+    result = report.skill[0]
+    assert entry == {
+        "outcome": "written",
+        "path": str(result.path),
+        "message": result.message,
+        "dry_run": False,
+    }
+
+
+def test_to_dict_skill_entry_reports_error_for_a_broken_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    def broken() -> Path:
+        raise InstallerError("the bundled Skill is missing")
+
+    monkeypatch.setattr("patent_checker.installer.skill_source", broken)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["skill"] == [
+        {
+            "outcome": "error",
+            "path": None,
+            "message": "the bundled Skill is missing",
+            "dry_run": False,
+        }
+    ]
+    assert data["exit_code"] == 1
+
+
+def test_to_dict_mcp_entry_reports_registered_by_cli_with_no_path_or_snippet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("claude-code",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude"),
+        runner=_fake_runner(returncode=0),
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["mcp"]["claude-code"] == {
+        "outcome": "registered-by-cli",
+        "path": None,
+        "message": "registered by claude",
+        "dry_run": False,
+        "snippet": None,
+    }
+
+
+def test_to_dict_mcp_entry_carries_the_manual_snippet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("hermes",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    entry = data["mcp"]["hermes"]
+    assert entry["outcome"] == "manual"
+    assert entry["path"] == str(report.mcp["hermes"].result.path)
+    assert entry["snippet"] == report.mcp["hermes"].snippet
+    assert "mcp_servers:" in entry["snippet"]
+
+
+def test_to_dict_mcp_entry_reports_skipped_for_an_existing_codex_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+    config = home / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text(f'[mcp_servers.{SERVER_NAME}]\nurl = "http://old/mcp"\n', encoding="utf-8")
+
+    report = _run_install(
+        InstallOptions(agents=("codex",), agree=True, skill=False),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["mcp"]["codex"]["outcome"] == "skipped"
+
+
+def test_to_dict_warns_about_token_files_written_below_the_project(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, skill=False, scope="project"),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["token_files"] == [str(cwd / ".cursor" / "mcp.json")]
+    assert data["warnings"] == [TOKEN_IN_PROJECT_WARNING]
+
+
+def test_to_dict_reports_no_warnings_without_token_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("cursor",), agree=True, mcp=False), home=home, cwd=cwd
+    )
+    data = report.to_dict(dry_run=False)
+
+    assert data["token_files"] == []
+    assert data["warnings"] == []
+
+
+def test_to_dict_never_leaks_the_token(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """No message, snippet or vendor-CLI failure text carries the token into the JSON."""
+    home, cwd = _isolate(monkeypatch, tmp_path)
+
+    report = _run_install(
+        InstallOptions(agents=("all",), agree=True),
+        home=home,
+        cwd=cwd,
+        environ={ENV_TOKEN: TOKEN},
+        which=_cli_named("claude", "gemini", "copilot"),
+        runner=_fake_runner(returncode=1, stderr=f"rejected token {TOKEN}\n"),
+    )
+
+    assert TOKEN not in json.dumps(report.to_dict(dry_run=False))

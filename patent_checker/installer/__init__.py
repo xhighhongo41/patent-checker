@@ -32,7 +32,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from patent_checker import consent
 
@@ -77,6 +77,10 @@ NEXT_STEP = "Next: start the server (see README) and open a new session in your 
 TOKEN_IN_PROJECT_WARNING = (
     "Warning: these files below the working directory contain the token itself; do not commit them"
 )
+
+#: Version of the document :meth:`InstallReport.to_dict` produces, bumped
+#: whenever its shape changes so a caller can branch on it.
+REPORT_FORMAT = 1
 
 
 class InstallAborted(InstallerError):
@@ -159,6 +163,51 @@ class InstallReport:
         before a report exists.
         """
         return 1 if any(result.outcome is Outcome.ERROR for result in self.results()) else 0
+
+    def to_dict(self, *, dry_run: bool) -> dict[str, Any]:
+        """Return this report as the document ``patent-checker install --json`` prints.
+
+        Every message and snippet is already redacted by the producer that
+        built it (see :func:`~.writers.redact`), so nothing here needs to
+        hide the token again; this only reshapes what :func:`format_report`
+        already renders as text into a structure a script or agent can
+        parse without scraping the report's tables.
+
+        Args:
+            dry_run: Whether the run that produced this report was a dry
+                run. The report itself does not carry the option it was
+                built from, so the caller passes it back in.
+
+        Returns:
+            A JSON-ready ``dict`` at format version :data:`REPORT_FORMAT`.
+        """
+        return {
+            "format": REPORT_FORMAT,
+            "command": "install",
+            "dry_run": dry_run,
+            "consent": self.consent,
+            "agents": list(self.agents),
+            "skill": [_result_to_dict(result) for result in self.skill],
+            "mcp": {key: _registration_to_dict(item) for key, item in self.mcp.items()},
+            "token_files": [str(path) for path in self.token_files],
+            "warnings": [TOKEN_IN_PROJECT_WARNING] if self.token_files else [],
+            "exit_code": self.exit_code(),
+        }
+
+
+def _result_to_dict(result: WriteResult) -> dict[str, Any]:
+    """Return *result* as a JSON-ready dict (see :meth:`InstallReport.to_dict`)."""
+    return {
+        "outcome": str(result.outcome),
+        "path": str(result.path) if result.path is not None else None,
+        "message": result.message,
+        "dry_run": result.dry_run,
+    }
+
+
+def _registration_to_dict(registration: Registration) -> dict[str, Any]:
+    """Return *registration* as a JSON-ready dict, snippet included when there is one."""
+    return {**_result_to_dict(registration.result), "snippet": registration.snippet}
 
 
 def install(

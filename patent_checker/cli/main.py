@@ -4,8 +4,11 @@ Every subcommand prints one JSON object to stdout (``json.dumps(...,
 ensure_ascii=False, indent=2)``); three subcommands are exceptions: like
 ``consent show``, ``serve --show-operator-notice`` prints the raw notice
 Markdown so it can be shown to a human as-is, ``install`` prints the notice
-and its own report as text and reports a failure as ``error: <message>`` on
-stderr (exit code 2), and ``serve`` on success prints
+and its own report as text (or, with ``--json``, the report alone as one
+JSON document -- see :meth:`~patent_checker.installer.InstallReport.to_dict`
+-- with the notice, its follow-up line and the consent prompt all moved to
+stderr so stdout carries nothing else) and reports a failure as
+``error: <message>`` on stderr (exit code 2), and ``serve`` on success prints
 nothing to stdout at all -- its startup banner goes to stderr (stdout is the
 protocol channel of the stdio transport) and it then blocks serving until the
 process is stopped. Errors are reported the same way, as
@@ -783,6 +786,21 @@ def _confirm(question: str) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
+def _confirm_on_stderr(question: str) -> bool:
+    """Ask *question* like :func:`_confirm`, printing it to stderr instead of stdout.
+
+    ``input(question)`` writes its prompt to stdout, which ``install --json``
+    must keep clear for the JSON document alone; the question is printed to
+    stderr here and ``input()`` is then called without one of its own.
+    """
+    print(question, end="", file=sys.stderr, flush=True)
+    try:
+        answer = input()
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
 def _default_lang(environ: Mapping[str, str]) -> str:
     """Return the notice language implied by the locale environment.
 
@@ -807,6 +825,9 @@ _INSTALL_ONLY_FLAGS: tuple[tuple[str, str, Any], ...] = (
     ("--no-mcp", "no_mcp", False),
     ("--agree", "agree", False),
     ("--dry-run", "dry_run", False),
+    # --list-agents already prints a table, not the installation report
+    # --json would otherwise reshape, so it is ignored the same way.
+    ("--json", "json", False),
 )
 
 
@@ -822,9 +843,11 @@ def _flags_ignored_by_list_agents(args: argparse.Namespace) -> list[str]:
 def _cmd_install(args: argparse.Namespace) -> None:
     """Install the Skill and register the MCP server with the chosen agents.
 
-    Prints a human-readable report rather than JSON (like ``consent show``),
-    and asks for consent before anything is written; see the module
-    docstring.
+    Prints a human-readable report rather than JSON (like ``consent show``)
+    unless ``--json`` is given, in which case the report is printed as one
+    JSON document and everything else (the notice, its follow-up line, and
+    the consent prompt) moves to stderr instead. Asks for consent before
+    anything is written; see the module docstring.
     """
     if args.list_agents:
         ignored = _flags_ignored_by_list_agents(args)
@@ -856,13 +879,16 @@ def _cmd_install(args: argparse.Namespace) -> None:
         cwd=_cwd(),
         environ=os.environ,
         stdin_is_tty=_stdin_is_tty(),
-        confirm=_confirm,
+        confirm=_confirm_on_stderr if args.json else _confirm,
         prompt_secret=_prompt_secret,
         which=_which,
         runner=None,
-        out=sys.stdout,
+        out=sys.stderr if args.json else sys.stdout,
     )
-    print(installer.format_report(report))
+    if args.json:
+        print(json.dumps(report.to_dict(dry_run=options.dry_run), indent=2, ensure_ascii=False))
+    else:
+        print(installer.format_report(report))
     code = report.exit_code()
     if code != 0:
         raise SystemExit(code)
@@ -1052,6 +1078,14 @@ def _add_install_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     install_parser.add_argument(
         "--list-agents", action="store_true", help="List the known agents and exit"
+    )
+    install_parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print the report as one JSON document instead of text (the notice "
+            "and the consent prompt move to stderr; not combined with --list-agents)"
+        ),
     )
     install_parser.set_defaults(handler=_cmd_install)
 

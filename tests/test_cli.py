@@ -2181,6 +2181,94 @@ def test_install_shows_the_japanese_notice_for_a_japanese_locale(
     assert "重要なお知らせ" in out
 
 
+def test_install_json_prints_one_document_and_keeps_the_notice_off_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json's stdout is the report alone; the notice and its hint move to stderr."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc, data, err = _invoke_with_stderr(
+        ["install", "--json", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 0
+    assert data["format"] == 1
+    assert data["command"] == "install"
+    assert data["dry_run"] is True
+    assert data["agents"] == ["cursor"]
+    assert "Important Notice" in err
+    assert installer.OPERATOR_NOTICE_HINT in err
+
+
+def test_install_json_dry_run_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json combines with --dry-run: the report says so and nothing is written."""
+    _install_env(monkeypatch, tmp_path)
+    before = _files_under(tmp_path)
+
+    rc, data, _err = _invoke_with_stderr(
+        ["install", "--json", "--dry-run", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 0
+    assert data["dry_run"] is True
+    assert _files_under(tmp_path) == before
+
+
+def test_install_json_exit_code_is_one_when_a_step_errors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A broken Skill source is reported through exit_code, not a Python traceback."""
+    _install_env(monkeypatch, tmp_path)
+
+    def broken() -> Path:
+        raise installer.InstallerError("the bundled Skill is missing")
+
+    monkeypatch.setattr("patent_checker.installer.skill_source", broken)
+
+    rc, data, _err = _invoke_with_stderr(
+        ["install", "--json", "--agree", "--agent", "cursor", "--no-mcp"], capsys
+    )
+
+    assert rc == 1
+    assert data["exit_code"] == 1
+    assert data["skill"][0]["outcome"] == "error"
+
+
+def test_install_json_exit_code_is_two_and_prints_nothing_to_stdout_when_aborted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without a terminal and without --agree, install aborts before a report exists."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--json", "--agent", "cursor", "--no-mcp"])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert captured.out == ""
+    # The notice itself also lands on stderr in --json mode (see the module
+    # docstring), so only the closing error line is checked here.
+    assert "error: stdin is not a terminal" in captured.err
+
+
+def test_install_list_agents_with_json_is_ignored_and_warned_about(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--json only formats an installation report; --list-agents warns and ignores it."""
+    _install_env(monkeypatch, tmp_path)
+
+    rc = cli_main.main(["install", "--list-agents", "--json"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "--json" in captured.err
+    assert "warning:" in captured.err
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(captured.out)
+    assert "cursor" in captured.out
+
+
 @pytest.mark.parametrize(
     ("environ", "expected"),
     [
