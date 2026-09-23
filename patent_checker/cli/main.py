@@ -1,14 +1,15 @@
 """Command-line entry point for patent-checker.
 
 Every subcommand prints one JSON object to stdout (``json.dumps(...,
-ensure_ascii=False, indent=2)``); three subcommands are exceptions: like
+ensure_ascii=False, indent=2)``); four subcommands are exceptions: like
 ``consent show``, ``serve --show-operator-notice`` prints the raw notice
 Markdown so it can be shown to a human as-is, ``install`` prints the notice
 and its own report as text (or, with ``--json``, the report alone as one
 JSON document -- see :meth:`~patent_checker.installer.InstallReport.to_dict`
 -- with the notice, its follow-up line and the consent prompt all moved to
 stderr so stdout carries nothing else) and reports a failure as
-``error: <message>`` on stderr (exit code 2), and ``serve`` on success prints
+``error: <message>`` on stderr (exit code 2), ``uninstall`` does the same
+with its own report (``--json`` likewise), and ``serve`` on success prints
 nothing to stdout at all -- its startup banner goes to stderr (stdout is the
 protocol channel of the stdio transport) and it then blocks serving until the
 process is stopped. Errors are reported the same way, as
@@ -71,10 +72,24 @@ from typing import Any
 
 import httpx
 
-from patent_checker import __version__, cleanup, config, consent, installer, ledger, service
+from patent_checker import (
+    __version__,
+    cleanup,
+    config,
+    consent,
+    credentials,
+    installer,
+    ledger,
+    service,
+)
 from patent_checker.cache import KINDS as CACHE_KINDS
 from patent_checker.cache import Cache, CacheEntry, default_cache
 from patent_checker.config import ConfigError, ops_configured
+from patent_checker.installer.uninstall import (
+    UninstallOptions,
+    format_uninstall_report,
+    uninstall,
+)
 from patent_checker.ops.client import OpsClient, OpsServiceBlocked
 from patent_checker.pubnum import parse_pubnum
 from patent_checker.validation import InvalidInput, validate_batch
@@ -609,6 +624,78 @@ def _cmd_consent_record(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+# --- credentials -------------------------------------------------------
+
+
+def _cmd_credentials_set(args: argparse.Namespace) -> dict[str, Any]:
+    """Write the OPS consumer key and secret to the per-user credentials file.
+
+    Interactive by default: run at a terminal, this prompts for the key and
+    the secret without echoing either one. ``--from-env`` instead takes
+    ``PATENT_CHECKER_OPS_KEY``/``PATENT_CHECKER_OPS_SECRET`` straight from
+    the process environment as it stands when this command runs -- which,
+    since :func:`main` reads the nearest project ``.env`` before any
+    subcommand starts, also picks up values such a file sets for them.
+    Neither route ever falls back to the per-user credentials file this
+    command itself writes.
+
+    Raises:
+        ValueError: If ``--from-env`` is given but either variable is not
+            set (names the missing one), if run without a terminal and
+            without ``--from-env``, or if
+            :func:`patent_checker.credentials.set_credentials` rejects a
+            value (empty, a control character, or ``${``).
+    """
+    if args.from_env:
+        key = os.environ.get("PATENT_CHECKER_OPS_KEY", "")
+        secret = os.environ.get("PATENT_CHECKER_OPS_SECRET", "")
+        missing = [
+            name
+            for name, value in (
+                ("PATENT_CHECKER_OPS_KEY", key),
+                ("PATENT_CHECKER_OPS_SECRET", secret),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"--from-env requires {' and '.join(missing)} to be set in the environment"
+            )
+    elif _stdin_is_tty():
+        key = _prompt_secret("EPO OPS consumer key: ")
+        secret = _prompt_secret("EPO OPS consumer secret: ")
+    else:
+        raise ValueError(
+            "credentials set needs a terminal to prompt for the key and secret; "
+            "run it in a terminal, or pass --from-env"
+        )
+    path = credentials.set_credentials(key, secret)
+    return {"path": str(path), "written": True}
+
+
+def _cmd_credentials_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Report whether OPS credentials are configured, and where they come from."""
+    return credentials.credentials_status(cwd=Path.cwd())
+
+
+def _cmd_credentials_clear(args: argparse.Namespace) -> dict[str, Any]:
+    """Delete the per-user credentials file, if one exists."""
+    path = config.credentials_path()
+    return {"path": str(path), "deleted": credentials.clear_credentials(path=path)}
+
+
+# --- status --------------------------------------------------------------
+
+
+def _cmd_status(args: argparse.Namespace) -> dict[str, Any]:
+    """Report local configuration state: OPS credentials, consent, directories, pacing.
+
+    Makes no network request and builds no OPS client, unlike every command
+    above that fetches or searches patent data.
+    """
+    return service.status()
+
+
 # --- cache -------------------------------------------------------------
 
 
@@ -895,6 +982,43 @@ def _cmd_install(args: argparse.Namespace) -> None:
     return None
 
 
+def _cmd_uninstall(args: argparse.Namespace) -> None:
+    """Remove the Skill and unregister the MCP server from the chosen agents.
+
+    Like ``install``: a human-readable report by default, or with
+    ``--json`` the report alone as one JSON document (see
+    :meth:`~patent_checker.installer.uninstall.UninstallReport.to_dict`).
+    There is no notice and no prompt, so nothing else is printed. A report
+    with an error step exits with code 1; a problem that stops the run
+    before a report exists is raised as
+    :class:`~patent_checker.installer.InstallerError` (exit code 2).
+    """
+    options = UninstallOptions(
+        agents=tuple(args.agent) if args.agent else None,
+        scope=args.scope,
+        skill=not args.no_skill,
+        mcp=not args.no_mcp,
+        dry_run=args.dry_run,
+    )
+    report = uninstall(
+        options,
+        home=_home(),
+        cwd=_cwd(),
+        environ=os.environ,
+        which=_which,
+        runner=None,
+        out=sys.stderr if args.json else sys.stdout,
+    )
+    if args.json:
+        print(json.dumps(report.to_dict(dry_run=options.dry_run), indent=2, ensure_ascii=False))
+    else:
+        print(format_uninstall_report(report))
+    code = report.exit_code()
+    if code != 0:
+        raise SystemExit(code)
+    return None
+
+
 # --- argument parser -------------------------------------------------------
 
 
@@ -1020,10 +1144,17 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--lang", default="en", help="Language of the operator notice")
     serve_parser.set_defaults(handler=_cmd_serve)
 
+    status_parser = subparsers.add_parser(
+        "status", help="Report local configuration state (no network request)"
+    )
+    status_parser.set_defaults(handler=_cmd_status)
+
     _add_consent_parser(subparsers)
+    _add_credentials_parser(subparsers)
     _add_cache_parser(subparsers)
     _add_clean_parser(subparsers)
     _add_install_parser(subparsers)
+    _add_uninstall_parser(subparsers)
 
     return parser
 
@@ -1088,6 +1219,41 @@ def _add_install_parser(subparsers: argparse._SubParsersAction) -> None:
         ),
     )
     install_parser.set_defaults(handler=_cmd_install)
+
+
+def _add_uninstall_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``uninstall`` subcommand, mirroring ``install``'s flags."""
+    uninstall_parser = subparsers.add_parser(
+        "uninstall", help="Remove the Agent Skill and unregister the MCP server"
+    )
+    uninstall_parser.add_argument(
+        "--agent",
+        action="append",
+        choices=(*installer.AGENT_KEYS, "all"),
+        default=None,
+        help="Agent to uninstall from (repeatable; default: the detected agents)",
+    )
+    uninstall_parser.add_argument(
+        "--scope",
+        choices=("user", "project"),
+        default="user",
+        help="Uninstall for this user (default) or for the current project",
+    )
+    uninstall_parser.add_argument(
+        "--no-skill", action="store_true", help="Do not remove the Agent Skill"
+    )
+    uninstall_parser.add_argument(
+        "--no-mcp", action="store_true", help="Do not unregister the MCP server"
+    )
+    uninstall_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would happen; delete, write and run nothing",
+    )
+    uninstall_parser.add_argument(
+        "--json", action="store_true", help="Print the report as one JSON document instead of text"
+    )
+    uninstall_parser.set_defaults(handler=_cmd_uninstall)
 
 
 def _add_clean_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -1194,6 +1360,39 @@ def _add_consent_parser(subparsers: argparse._SubParsersAction) -> None:
         "--project", action="store_true", help="Record for this project instead of this user"
     )
     record_parser.set_defaults(handler=_cmd_consent_record)
+
+
+def _add_credentials_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the ``credentials`` subcommand and its ``set``/``status``/``clear`` children."""
+    credentials_parser = subparsers.add_parser(
+        "credentials", help="Manage the per-user EPO OPS credentials file"
+    )
+    credentials_subparsers = credentials_parser.add_subparsers(
+        dest="credentials_command", required=True
+    )
+
+    set_parser = credentials_subparsers.add_parser(
+        "set", help="Store the OPS consumer key and secret for this user"
+    )
+    set_parser.add_argument(
+        "--from-env",
+        action="store_true",
+        help=(
+            "Read PATENT_CHECKER_OPS_KEY/PATENT_CHECKER_OPS_SECRET from the environment "
+            "instead of prompting (required without a terminal)"
+        ),
+    )
+    set_parser.set_defaults(handler=_cmd_credentials_set)
+
+    status_parser = credentials_subparsers.add_parser(
+        "status", help="Report whether OPS credentials are configured, and from where"
+    )
+    status_parser.set_defaults(handler=_cmd_credentials_status)
+
+    clear_parser = credentials_subparsers.add_parser(
+        "clear", help="Delete the per-user credentials file"
+    )
+    clear_parser.set_defaults(handler=_cmd_credentials_clear)
 
 
 # --- entry point -------------------------------------------------------

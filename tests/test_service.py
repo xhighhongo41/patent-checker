@@ -19,7 +19,16 @@ from typing import Any
 import httpx
 import pytest
 
-from patent_checker import pacing, service, validation, watch
+from patent_checker import (
+    __version__,
+    config,
+    consent,
+    credentials,
+    pacing,
+    service,
+    validation,
+    watch,
+)
 from patent_checker.cache import DEFAULT_TTLS, Cache, pub_key, search_key
 from patent_checker.config import ConfigError
 from patent_checker.gp import fetch as gp_fetch
@@ -751,6 +760,144 @@ def test_usage_never_modifies_an_existing_pacing_state_file(
     service.usage(pacer=pacer)
 
     assert pacer.path.read_bytes() == before
+
+
+# --- status ------------------------------------------------------------
+
+
+def _isolate_status_paths(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point every directory ``status()`` reports at this test's own ``tmp_path``.
+
+    The autouse fixtures in ``conftest.py`` already isolate the pacing
+    directory and the per-user credentials file, but ``status()`` also reads
+    the nearest project ``.env`` (cwd-dependent) through
+    :func:`patent_checker.credentials.credentials_status` and the per-user
+    consent record (``HOME``-dependent) through
+    :func:`patent_checker.consent.consent_status`; neither of those must
+    ever read the real developer's own files.
+    """
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.chdir(project_dir)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATENT_CHECKER_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv(config.ENV_CACHE_DIR, str(tmp_path / "cache"))
+
+
+def test_status_reports_the_package_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """status()'s "version" is the installed package version."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    result = service.status()
+
+    assert result["version"] == __version__
+
+
+def test_status_reports_ops_not_configured_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no OPS credentials anywhere, status()'s "ops" reports the "none" source."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    result = service.status()
+
+    assert result["ops"]["configured"] is False
+    assert result["ops"]["source"] == "none"
+
+
+def test_status_reports_ops_configured_via_the_user_credentials_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """OPS credentials written to the per-user file are reflected in status()."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+    target = tmp_path / "user-config" / "credentials.env"
+    monkeypatch.setenv(config.ENV_CREDENTIALS_FILE, str(target))
+    credentials.set_credentials("k3y-value", "s3cret-value", path=target)
+
+    result = service.status()
+
+    assert result["ops"]["configured"] is True
+    assert result["ops"]["source"] == "user-file"
+    assert result["ops"]["path"] == str(target)
+    dumped = json.dumps(result)
+    assert "k3y-value" not in dumped
+    assert "s3cret-value" not in dumped
+
+
+def test_status_reports_consent_not_recorded_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no consent record anywhere, status()'s "consent" reflects that."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    result = service.status()
+
+    assert result["consent"]["consented"] is False
+    assert result["consent"]["record"] is None
+
+
+def test_status_reports_recorded_consent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A previously recorded consent is reflected in status()'s "consent"."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+    consent.record_consent(language="en", scope="user")
+
+    result = service.status()
+
+    assert result["consent"]["consented"] is True
+    assert result["consent"]["record"]["language"] == "en"
+
+
+def test_status_reports_the_configured_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """status()'s directory fields match config.data_base()/cache_base()/pacing_dir()."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    result = service.status()
+
+    assert result["data_dir"] == str(config.data_base())
+    assert result["cache_base"] == str(config.cache_base())
+    assert result["pacing_dir"] == str(config.pacing_dir())
+
+
+def test_status_pacing_matches_what_usage_reports(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """status()'s "pacing" is the same Pacer summary usage() reports under the same key."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+    pacer = pacing.Pacer()
+    pacer.reserve("ops", "search", interval=1.0)
+
+    result = service.status()
+
+    assert result["pacing"]["available"] is True
+    assert "search" in result["pacing"]["upstreams"]["ops"]["last_request_at"]
+
+
+def test_status_never_creates_the_pacing_state_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """status() only reads the shared pacing state; it must never write to it."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    service.status()
+
+    assert not pacing.Pacer().path.exists()
+
+
+def test_status_makes_no_http_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """status() is purely local: it must never construct an HTTP client of any kind."""
+    _isolate_status_paths(monkeypatch, tmp_path)
+
+    def _fail(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("status() must not construct an HTTP client")
+
+    monkeypatch.setattr(httpx.Client, "__init__", _fail)
+
+    service.status()
 
 
 # --- cache integration -----------------------------------------------------

@@ -50,7 +50,7 @@ from typing import Any
 
 import httpx
 
-from patent_checker import pacing, validation
+from patent_checker import __version__, config, consent, credentials, pacing, validation
 from patent_checker.cache import (
     Cache,
     CacheHit,
@@ -930,3 +930,42 @@ def usage(
         report = usage_report(headers_path, **since_kwargs)
     effective_pacer = pacing.Pacer() if pacer is None else pacer
     return {**report, "pacing": effective_pacer.summary()}
+
+
+# --- status ----------------------------------------------------------------
+
+
+def status() -> dict[str, Any]:
+    """Report local configuration state: OPS credentials, consent, directories, pacing.
+
+    Purely local and read-only: unlike every OPS-backed function above, this
+    never builds an OPS (or any other) HTTP client and never makes a
+    request, so it is safe to call before OPS is configured or before
+    consent has been recorded -- indeed that is the point, since either of
+    those is what a caller would use this to find out.
+
+    Returns:
+        ``{"version", "ops", "consent", "data_dir", "cache_base",
+        "pacing_dir", "pacing"}``. ``"version"`` is the installed package
+        version. ``"ops"`` is
+        :func:`patent_checker.credentials.credentials_status`'s report
+        (never a credential value). ``"consent"`` is
+        :func:`patent_checker.consent.consent_status`'s report.
+        ``"data_dir"``, ``"cache_base"`` and ``"pacing_dir"`` are
+        :func:`patent_checker.config.data_base`,
+        :func:`patent_checker.config.cache_base` and
+        :func:`patent_checker.config.pacing_dir`, as strings, without
+        creating any of them. ``"pacing"`` is the shared pacing state
+        across every ``patent-checker`` process of the current user,
+        exactly as :func:`usage` reports it under the same key; reading it
+        never writes to the state file.
+    """
+    return {
+        "version": __version__,
+        "ops": credentials.credentials_status(),
+        "consent": consent.consent_status(),
+        "data_dir": str(config.data_base()),
+        "cache_base": str(config.cache_base()),
+        "pacing_dir": str(config.pacing_dir()),
+        "pacing": pacing.Pacer().summary(),
+    }
