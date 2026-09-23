@@ -249,7 +249,7 @@ def install(
         raise InstallerError(
             f"unknown scope {options.scope!r}: expected one of {', '.join(SCOPES)}"
         )
-    agents = _resolve_agents(options.agents, home=home, which=which)
+    agents = _resolve_agents(options.agents, home=home, which=which, environ=environ)
     consent_line = _consent_step(options, stdin_is_tty=stdin_is_tty, confirm=confirm, out=out)
     # The token is resolved before anything is copied: a run that ends here
     # because no source has the token must not leave a Skill behind, half
@@ -267,7 +267,14 @@ def install(
     if options.mcp:
         for key in agents:
             registrations[key] = _mcp_step(
-                key, options, home=home, cwd=cwd, token=token, which=which, runner=runner
+                key,
+                options,
+                home=home,
+                cwd=cwd,
+                token=token,
+                which=which,
+                runner=runner,
+                environ=environ,
             )
 
     return InstallReport(
@@ -355,7 +362,11 @@ def list_agents(
 
 
 def _resolve_agents(
-    requested: tuple[str, ...] | None, *, home: Path, which: Callable[[str], str | None]
+    requested: tuple[str, ...] | None,
+    *,
+    home: Path,
+    which: Callable[[str], str | None],
+    environ: Mapping[str, str],
 ) -> list[str]:
     """Return the agent keys to install for, in report order.
 
@@ -364,13 +375,14 @@ def _resolve_agents(
             among the keys, or an explicit list.
         home: The user's home directory.
         which: :func:`shutil.which`, or a stand-in.
+        environ: The process environment, passed on to :func:`detect_agents`.
 
     Raises:
         InstallAborted: Nothing was requested and nothing was detected.
         InstallerError: A requested key is not a known agent.
     """
     if not requested:
-        detected = detect_agents(home=home, which=which)
+        detected = detect_agents(home=home, which=which, environ=environ)
         if not detected:
             raise InstallAborted(
                 "no supported agent detected; pass --agent to name one (or --agent all)"
@@ -520,6 +532,7 @@ def _mcp_step(
     token: str,
     which: Callable[[str], str | None],
     runner: Runner | None,
+    environ: Mapping[str, str],
 ) -> Registration:
     """Register the server with one agent, turning a write error into advice."""
     try:
@@ -534,6 +547,7 @@ def _mcp_step(
             which=which,
             runner=runner,
             dry_run=options.dry_run,
+            environ=environ,
         )
     except OSError as error:
         # Manual, not an error: the user can still paste the entry, so the

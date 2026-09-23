@@ -1664,8 +1664,9 @@ def test_banner_lines_show_the_tls_notice_even_for_a_loopback_bind(
 
     joined = "\n".join(lines)
     assert (
-        "TLS: not provided by this server; put a reverse proxy in front if the port is "
-        "reachable from other machines" in joined
+        "TLS: not provided by this server; encryption is up to the network it runs on "
+        "and, ideally, a TLS-terminating reverse proxy in front of it -- see "
+        "docs/deploy-lan.md" in joined
     )
 
 

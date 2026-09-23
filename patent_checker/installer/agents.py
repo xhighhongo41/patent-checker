@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import json
 import tomllib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from .errors import InstallerError
@@ -89,7 +90,12 @@ class Registration:
     snippet: str | None = None
 
 
-def detect_agents(*, home: Path, which: Callable[[str], str | None]) -> list[str]:
+def detect_agents(
+    *,
+    home: Path,
+    which: Callable[[str], str | None],
+    environ: Mapping[str, str] | None = None,
+) -> list[str]:
     """Return the keys of the host applications present on this machine.
 
     An agent counts as present when its CLI is on ``PATH`` or when its
@@ -101,17 +107,35 @@ def detect_agents(*, home: Path, which: Callable[[str], str | None]) -> list[str
         home: The user's home directory.
         which: :func:`shutil.which`, or a stand-in returning the resolved
             program path or ``None``.
+        environ: The process environment, consulted only for OpenCode's
+            ``XDG_CONFIG_HOME`` (see :func:`_opencode_config_dir`).
+            ``None`` is treated as empty, which is the same as the
+            variable being unset.
 
     Returns:
         Keys in :data:`~.skill.AGENT_KEYS` order, so the report is stable
         regardless of how the machine is set up.
     """
+    env = environ if environ is not None else {}
     return [
         key
         for key, spec in AGENTS.items()
         if (spec.cli is not None and which(spec.cli) is not None)
-        or (home / spec.config_dir).exists()
+        or _config_dir(key, spec, home=home, environ=env).exists()
     ]
+
+
+def _config_dir(key: str, spec: AgentSpec, *, home: Path, environ: Mapping[str, str]) -> Path:
+    """Return the directory whose presence marks *key* as installed.
+
+    Every host but OpenCode reads *spec*'s static default as is; OpenCode
+    follows ``XDG_CONFIG_HOME`` when it is set, exactly as
+    :func:`_opencode_path` does for registration, so detection and
+    registration never disagree about which file is OpenCode's.
+    """
+    if key == "opencode":
+        return _opencode_config_dir(home=home, environ=environ)
+    return home / spec.config_dir
 
 
 def register_mcp(
@@ -126,6 +150,7 @@ def register_mcp(
     which: Callable[[str], str | None],
     runner: Runner | None,
     dry_run: bool,
+    environ: Mapping[str, str],
 ) -> Registration:
     """Register the MCP server with the host application *key*.
 
@@ -150,6 +175,8 @@ def register_mcp(
         which: :func:`shutil.which`, or a stand-in.
         runner: Runner for a vendor CLI (see :func:`~.writers.run_vendor_cli`).
         dry_run: When ``True``, run and write nothing.
+        environ: The process environment; consulted only for OpenCode's
+            ``XDG_CONFIG_HOME`` (see :func:`_opencode_config_dir`).
 
     Returns:
         The :class:`Registration` for this host.
@@ -176,6 +203,7 @@ def register_mcp(
         which=which,
         runner=runner,
         dry_run=dry_run,
+        environ=environ,
     )
     return _REGISTRARS[key](request)
 
@@ -186,7 +214,8 @@ def manual_snippet(agent: str, url: str, reference: bool) -> str:
     Pure: nothing is read from or written to the machine, so the caller can
     use it after a write has already failed. Because no directory is looked
     at, the host's configuration file is named relative to the home
-    directory (``~/...``); the snippets produced by :func:`register_mcp`
+    directory (``~/...``) and, for OpenCode, without regard to
+    ``XDG_CONFIG_HOME``; the snippets produced by :func:`register_mcp`
     itself name the real path instead.
 
     Args:
@@ -250,13 +279,15 @@ AGENTS: dict[str, AgentSpec] = {
         key="opencode",
         name="OpenCode",
         cli="opencode",
+        # The default; detection and registration both follow
+        # XDG_CONFIG_HOME instead when it is set (see _opencode_config_dir).
         config_dir=Path(".config") / "opencode",
         reference_style=ReferenceStyle.OPENCODE,
     ),
     "openhands": AgentSpec(
         key="openhands",
         name="OpenHands",
-        cli=None,
+        cli="openhands",
         config_dir=Path(".openhands"),
         reference_style=None,
     ),
@@ -309,6 +340,11 @@ class _Request:
     which: Callable[[str], str | None]
     runner: Runner | None
     dry_run: bool
+    #: The process environment; used only for OpenCode's ``XDG_CONFIG_HOME``
+    #: (see :func:`_opencode_config_dir`). Empty unless the caller wants
+    #: that override honoured, since most callers deal in fictional or
+    #: approximate paths where it would not apply.
+    environ: Mapping[str, str] = MappingProxyType({})
 
     @property
     def base(self) -> Path:
@@ -565,10 +601,23 @@ def _codex_snippet(request: _Request) -> str:
     )
 
 
+def _opencode_config_dir(*, home: Path, environ: Mapping[str, str]) -> Path:
+    """Return the directory OpenCode's user-scope config lives in.
+
+    OpenCode follows the XDG base directory spec: it reads
+    ``$XDG_CONFIG_HOME/opencode`` when ``XDG_CONFIG_HOME`` is set to a
+    non-empty value, and ``~/.config/opencode`` otherwise (the same
+    default every other host without an environment override uses).
+    """
+    xdg = environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg) if xdg else home / ".config"
+    return base / "opencode"
+
+
 def _opencode_path(request: _Request) -> Path:
     """Return the ``opencode.json`` OpenCode reads for this scope."""
     return (
-        request.home / ".config" / "opencode" / "opencode.json"
+        _opencode_config_dir(home=request.home, environ=request.environ) / "opencode.json"
         if request.scope == "user"
         else request.cwd / "opencode.json"
     )
@@ -613,7 +662,7 @@ def _openhands_path(request: _Request) -> Path:
 
 
 def _register_openhands(request: _Request) -> Registration:
-    """Report OpenHands as manual: it has neither a CLI nor a JSON config."""
+    """Register with OpenHands through its CLI when present, else report manual work."""
     path = _openhands_path(request)
     message = f"{path}: OpenHands has no registration command; add the server by hand"
     if request.token_env:
@@ -623,22 +672,51 @@ def _register_openhands(request: _Request) -> Registration:
             f"{message} (--token-env is not supported by OpenHands, which expands no "
             "environment reference)"
         )
+    elif request.which("openhands") is not None:
+        argv = [
+            "openhands",
+            "mcp",
+            "add",
+            SERVER_NAME,
+            "--transport",
+            "http",
+            "--header",
+            f"Authorization: {request.header}",
+            request.url,
+        ]
+        # Follows the OpenHands CLI docs (`openhands mcp add <name> --transport
+        # http --header "Authorization: Bearer <token>" <url>`); not verified
+        # against the real tool. Re-registration when the name already exists
+        # is unverified too, so any failure here falls through to the manual
+        # snippet below instead of retrying with an unconfirmed `mcp remove`.
+        result = _run_cli(request, argv)
+        if result.outcome is not Outcome.MANUAL:
+            return Registration(result)
     return Registration(WriteResult(Outcome.MANUAL, path, message), _openhands_snippet(request))
 
 
 def _openhands_snippet(request: _Request, path: Path | None = None) -> str:
-    """Return OpenHands' ``[mcp]`` table, with the token left for the user to paste."""
+    """Return OpenHands' CLI command and, as an alternative, its ``[mcp]`` table.
+
+    Both forms leave the token out: the CLI form as a placeholder, the
+    ``config.toml`` form with its existing caveat about ``api_key``.
+    """
+    command = (
+        f"openhands mcp add {SERVER_NAME} --transport http --header "
+        f'"Authorization: {request.safe_header}" {request.url}'
+    )
     body = (
         "[mcp]\n"
         f"shttp_servers = [{{ url = {json.dumps(request.url)}, "
         f'api_key = "{TOKEN_PLACEHOLDER}" }}]'
     )
-    return _paste_into(
+    toml_form = _paste_into(
         path if path is not None else _openhands_path(request),
         body,
         "Note: it is not confirmed by the OpenHands documentation that api_key is sent as an "
         "Authorization: Bearer header, and no environment reference is expanded here.",
     )
+    return f"Run (paste your token over {TOKEN_PLACEHOLDER}):\n\n  {command}\n\nOr:\n\n{toml_form}"
 
 
 def _cursor_path(request: _Request) -> Path:
@@ -849,6 +927,7 @@ def unregister_mcp(
     which: Callable[[str], str | None],
     runner: Runner | None,
     dry_run: bool,
+    environ: Mapping[str, str],
 ) -> Registration:
     """Remove the MCP server entry :func:`register_mcp` created for host *key*.
 
@@ -867,6 +946,9 @@ def unregister_mcp(
         which: :func:`shutil.which`, or a stand-in.
         runner: Runner for a vendor CLI (see :func:`~.writers.run_vendor_cli`).
         dry_run: When ``True``, run and write nothing.
+        environ: The process environment; consulted only for OpenCode's
+            ``XDG_CONFIG_HOME`` (see :func:`_opencode_config_dir`), so the
+            same file :func:`register_mcp` wrote is the one taken apart.
 
     Returns:
         The :class:`Registration` describing the removal for this host.
@@ -878,11 +960,15 @@ def unregister_mcp(
             caller (:func:`~.uninstall.uninstall`) turns this into a
             manual step.
     """
-    request = _removal_request(key, scope=scope, home=home, cwd=cwd, which=which, runner=runner)
+    request = _removal_request(
+        key, scope=scope, home=home, cwd=cwd, which=which, runner=runner, environ=environ
+    )
     return _REMOVERS[key](replace(request, dry_run=dry_run))
 
 
-def removal_snippet(agent: str, *, scope: str, home: Path, cwd: Path) -> str:
+def removal_snippet(
+    agent: str, *, scope: str, home: Path, cwd: Path, environ: Mapping[str, str] | None = None
+) -> str:
     """Return what the user has to delete by hand to unregister *agent*.
 
     Pure: nothing is read or written, so the caller can use it after a
@@ -893,6 +979,10 @@ def removal_snippet(agent: str, *, scope: str, home: Path, cwd: Path) -> str:
         scope: ``"user"`` or ``"project"``.
         home: The user's home directory.
         cwd: The project directory.
+        environ: The process environment; consulted only for OpenCode's
+            ``XDG_CONFIG_HOME`` (see :func:`_opencode_config_dir`).
+            ``None`` is treated as empty, which is the same as the
+            variable being unset.
 
     Returns:
         Instructions naming the file (or command) and the entry to delete.
@@ -902,7 +992,13 @@ def removal_snippet(agent: str, *, scope: str, home: Path, cwd: Path) -> str:
             ``"user"`` nor ``"project"``.
     """
     request = _removal_request(
-        agent, scope=scope, home=home, cwd=cwd, which=lambda program: None, runner=None
+        agent,
+        scope=scope,
+        home=home,
+        cwd=cwd,
+        which=lambda program: None,
+        runner=None,
+        environ=environ if environ is not None else {},
     )
     return _REMOVAL_SNIPPETS[agent](request)
 
@@ -915,6 +1011,7 @@ def _removal_request(
     cwd: Path,
     which: Callable[[str], str | None],
     runner: Runner | None,
+    environ: Mapping[str, str],
 ) -> _Request:
     """Return a dry-run :class:`_Request` for removing the server from *key*.
 
@@ -939,6 +1036,7 @@ def _removal_request(
         which=which,
         runner=runner,
         dry_run=True,
+        environ=environ,
     )
 
 
@@ -1162,9 +1260,13 @@ def _remove_openhands(request: _Request) -> Registration:
 
 def _openhands_removal_snippet(request: _Request) -> str:
     """Return which ``shttp_servers`` entry to delete from OpenHands' config."""
+    cli_config = request.home / ".openhands" / "mcp.json"
     return (
         f"Delete the entry with url = {json.dumps(request.url)} (or the URL you registered) "
-        f"from shttp_servers in the [mcp] table of {_openhands_path(request)}."
+        f"from shttp_servers in the [mcp] table of {_openhands_path(request)}. If your "
+        f"version of the OpenHands CLI has it, `openhands mcp remove {SERVER_NAME}` may do "
+        f"this for you instead; it is also worth checking {cli_config}, the CLI's own list "
+        "of servers, if your version keeps one."
     )
 
 

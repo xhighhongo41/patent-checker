@@ -105,10 +105,18 @@ def _unregister(
     which: Callable[[str], str | None] = _no_cli,
     runner: Runner | None = _forbidden_runner,
     dry_run: bool = False,
+    environ: dict[str, str] | None = None,
 ) -> Registration:
     """Call :func:`unregister_mcp` with the defaults these tests share."""
     return unregister_mcp(
-        key, scope=scope, home=home, cwd=cwd, which=which, runner=runner, dry_run=dry_run
+        key,
+        scope=scope,
+        home=home,
+        cwd=cwd,
+        which=which,
+        runner=runner,
+        dry_run=dry_run,
+        environ=environ if environ is not None else {},
     )
 
 
@@ -314,6 +322,21 @@ def test_unregister_never_touches_an_existing_backup(tmp_path: Path) -> None:
     _unregister("cursor", home=home, cwd=cwd)
 
     assert backup.read_text(encoding="utf-8") == '{"the": "original"}\n'
+
+
+def test_unregister_opencode_follows_xdg_config_home_when_set(tmp_path: Path) -> None:
+    home, cwd = _dirs(tmp_path)
+    xdg = tmp_path / "xdg-config"
+    path = xdg / "opencode" / "opencode.json"
+    _write_json(path, {"mcp": {SERVER_NAME: {"url": DEFAULT_URL}}})
+
+    registration = _unregister(
+        "opencode", home=home, cwd=cwd, environ={"XDG_CONFIG_HOME": str(xdg)}
+    )
+
+    assert registration.result.outcome is Outcome.WRITTEN
+    assert registration.result.path == path
+    assert SERVER_NAME not in json.loads(path.read_text(encoding="utf-8"))["mcp"]
 
 
 def test_unregister_opencode_leaves_a_jsonc_file_to_the_user(tmp_path: Path) -> None:
@@ -660,6 +683,18 @@ def test_unregister_openhands_names_the_file_and_the_entry(tmp_path: Path) -> No
     assert registration.snippet is not None
     assert "shttp_servers" in registration.snippet
     assert DEFAULT_URL in registration.snippet
+
+
+def test_unregister_openhands_snippet_also_mentions_the_cli_and_its_own_file(
+    tmp_path: Path,
+) -> None:
+    home, cwd = _dirs(tmp_path)
+
+    registration = _unregister("openhands", home=home, cwd=cwd)
+
+    assert registration.snippet is not None
+    assert f"openhands mcp remove {SERVER_NAME}" in registration.snippet
+    assert str(home / ".openhands" / "mcp.json") in registration.snippet
 
 
 def test_unregister_hermes_names_the_file_and_the_entry(tmp_path: Path) -> None:

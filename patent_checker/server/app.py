@@ -301,8 +301,9 @@ def banner_lines(settings: ServerSettings, *, ops_configured: bool) -> list[str]
         lines.append(f"allowed hosts: {', '.join(http_allowed_hosts(settings))}")
         lines.append("authentication: bearer token (configured value is never printed)")
         lines.append(
-            "TLS: not provided by this server; put a reverse proxy in front if the port is "
-            "reachable from other machines"
+            "TLS: not provided by this server; encryption is up to the network it runs on "
+            "and, ideally, a TLS-terminating reverse proxy in front of it -- see "
+            "docs/deploy-lan.md"
         )
     else:
         lines.append(

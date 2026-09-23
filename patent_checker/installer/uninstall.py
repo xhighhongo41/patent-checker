@@ -163,9 +163,9 @@ def uninstall(
         options: What to remove (see :class:`UninstallOptions`).
         home: The user's home directory.
         cwd: The project directory.
-        environ: The process environment. Nothing is read from it today;
-            it is taken so the call mirrors
-            :func:`~patent_checker.installer.install`.
+        environ: The process environment; consulted only for OpenCode's
+            ``XDG_CONFIG_HOME``, so detection and removal look at the same
+            file :func:`~patent_checker.installer.install` registered.
         which: :func:`shutil.which`, or a stand-in.
         runner: Runner for the vendor CLIs (``None`` uses subprocess).
         out: Stream for progress output. Nothing is written to it today:
@@ -182,12 +182,14 @@ def uninstall(
         raise InstallerError(
             f"unknown scope {options.scope!r}: expected one of {', '.join(SCOPES)}"
         )
-    agents = _resolve_agents(options.agents, home=home, which=which)
+    agents = _resolve_agents(options.agents, home=home, which=which, environ=environ)
     skill_results = _skill_step(agents, options, home=home, cwd=cwd) if options.skill else []
     removals: dict[str, Registration] = {}
     if options.mcp:
         for key in agents:
-            removals[key] = _mcp_step(key, options, home=home, cwd=cwd, which=which, runner=runner)
+            removals[key] = _mcp_step(
+                key, options, home=home, cwd=cwd, which=which, runner=runner, environ=environ
+            )
     return UninstallReport(agents=agents, skill=skill_results, mcp=removals)
 
 
@@ -305,6 +307,7 @@ def _mcp_step(
     cwd: Path,
     which: Callable[[str], str | None],
     runner: Runner | None,
+    environ: Mapping[str, str],
 ) -> Registration:
     """Unregister the server from one agent, turning a write error into advice."""
     try:
@@ -316,11 +319,12 @@ def _mcp_step(
             which=which,
             runner=runner,
             dry_run=options.dry_run,
+            environ=environ,
         )
     except OSError as error:
         # Manual, not an error: the user can still delete the entry by hand.
         message = f"{key}: the configuration could not be written ({error.strerror or error})"
         return Registration(
             WriteResult(Outcome.MANUAL, None, message),
-            removal_snippet(key, scope=options.scope, home=home, cwd=cwd),
+            removal_snippet(key, scope=options.scope, home=home, cwd=cwd, environ=environ),
         )
