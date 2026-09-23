@@ -14,9 +14,11 @@ English: [mcp-clients.md](mcp-clients.md)
 | Cursor | JSON マージ | `~/.cursor/mcp.json` または `.cursor/mcp.json` |
 | OpenCode | JSON マージ | `~/.config/opencode/opencode.json` または `opencode.json` |
 | Codex CLI | `--token-env` のとき `codex mcp add`、それ以外は TOML 追記 | `~/.codex/config.toml` |
-| OpenHands | 貼り付け用スニペット | 作業ディレクトリの `config.toml` |
+| OpenHands | `openhands mcp add`(CLI が無ければ貼り付け用スニペット) | OpenHands の CLI が管理(`~/.openhands/`) |
 | Hermes Agent | 貼り付け用スニペット | `~/.hermes/config.yaml` |
-| Copilot coding agent | 貼り付け用スニペット(GitHub.com のリポジトリ設定) | リポジトリ設定 |
+| Copilot coding agent | 登録しない(GitHub.com で入力) | リポジトリ設定 |
+
+Gemini CLI、Copilot CLI、OpenHands のコマンドは各製品の文書に従っていますが、実物での動作は未確認です。インストーラが書いたものは `patent-checker uninstall` で取り除けます。手で消すものは以下の各節に書いてあります。
 
 ## Claude Code
 
@@ -91,7 +93,7 @@ copilot mcp add --transport http patent-checker http://127.0.0.1:8642/mcp
 
 ## OpenCode
 
-`~/.config/opencode/opencode.json`(ユーザー)または `opencode.json`(プロジェクト)。
+`~/.config/opencode/opencode.json`(ユーザー。`XDG_CONFIG_HOME` が設定されていれば `$XDG_CONFIG_HOME/opencode/`)または `opencode.json`(プロジェクト)。OpenCode の文書にあるのは `~/.config` のパスだけで、Windows では `%USERPROFILE%\.config\opencode\` になると見込まれますが、確認はしていません。OpenCode には `mcp add` コマンドが無いので、ファイルを編集します。
 
 ```json
 {"mcp": {"patent-checker": {"type": "remote", "url": "http://127.0.0.1:8642/mcp",
@@ -100,7 +102,17 @@ copilot mcp add --transport http patent-checker http://127.0.0.1:8642/mcp
 
 ## OpenHands
 
-作業ディレクトリの `config.toml`。OpenHands の文書は `api_key` がどのヘッダで送られるかを述べていないため、ベアラートークンとしてサーバーに届く保証はありません。最初の呼び出しが 401 で拒否されたら、OpenHands CLI の `--header "Authorization: Bearer ..."` オプションを代わりに使ってください。
+OpenHands の CLI は自分でサーバーを登録します(`~/.openhands/mcp.json` に保持)。`openhands` が PATH にあるとき、インストーラは次を実行します。
+
+```sh
+openhands mcp add patent-checker --transport http \
+  --header "Authorization: Bearer ${PATENT_CHECKER_SERVER_TOKEN}" http://127.0.0.1:8642/mcp
+openhands mcp list
+```
+
+取り除くには、お使いの版にあれば `openhands mcp remove patent-checker` を使うか、`~/.openhands/mcp.json` から項目を削除します。
+
+OpenHands の本体アプリ(Web UI や Docker)は、代わりに作業ディレクトリの `config.toml` を読みます。OpenHands の文書は `api_key` がどのヘッダで送られるかを述べていないため、ベアラートークンとしてサーバーに届く保証はありません。最初の呼び出しが 401 で拒否されたら、上の CLI の形を使ってください。
 
 ```toml
 [mcp]
@@ -121,12 +133,14 @@ mcp_servers:
 
 ## GitHub Copilot coding agent
 
-coding agent は GitHub.com 上で動くため、TLS 付きで公開したサーバーにしか到達できません([deploy-lan_ja.md](deploy-lan_ja.md) を参照)。リポジトリの Copilot 設定で MCP 構成を追加し、トークンは `COPILOT_MCP_` 接頭辞の Copilot 環境シークレットとして保存します。
+coding agent は GitHub.com 上で動くため、インターネットに TLS 付きで公開したサーバーにしか到達できません([deploy-lan_ja.md](deploy-lan_ja.md) を参照。tailnet や VPN のアドレスには GitHub から届きません)。MCP の構成は GitHub.com のリポジトリ設定(Settings → Copilot → Coding agent)で入力するもので、インストーラが書き込めるファイルや API はありません。トークンは `COPILOT_MCP_` 接頭辞の Copilot 環境シークレットとして保存し、参照します。
 
 ```json
 {"mcpServers": {"patent-checker": {"type": "http", "url": "https://patents.example.com/mcp",
   "headers": {"Authorization": "Bearer $COPILOT_MCP_PATENT_CHECKER_TOKEN"}, "tools": ["*"]}}}
 ```
+
+リポジトリで定義したカスタムエージェント(`.github/agents/<名前>.md`)も、front matter の `mcp-servers` に同じキーで MCP サーバーを持てます。その構成はそのカスタムエージェントにだけ適用されます。
 
 ## HTTP ではなく stdio を使う
 

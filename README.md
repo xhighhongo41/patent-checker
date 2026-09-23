@@ -30,7 +30,7 @@ Patent Checker **does not decide whether anything infringes a patent**. Its
 reports contain observations, scope statements and open questions, never a
 verdict.
 
-**Status: stable release (v1.2).**
+**Status: stable release (v1.3).**
 
 ## Important notices
 
@@ -84,7 +84,7 @@ your agent ──(Skill: judgment)──► patent-checker MCP server ──► 
    (features, queries, screened families, monitored patents and a snapshot
    of their status). The next run starts from it: the server compares the
    stored snapshots with the current records, and the new report opens with
-   what changed.
+   a plain-language summary followed by what changed.
 
 The server only ever receives public patent data: search expressions,
 publication numbers, family identifiers, dates, and status snapshots it
@@ -96,10 +96,10 @@ never leave your machine: the analysis happens inside your agent.
 - **An AI coding agent** that supports Agent Skills and MCP: Claude Code,
   OpenAI Codex CLI, Cursor, Gemini CLI, GitHub Copilot CLI, OpenCode,
   OpenHands or Hermes Agent.
-- **Python 3.12 or newer and [uv](https://docs.astral.sh/uv/)** for the
-  command-line tool and installer (`pipx` or a plain `pip install` in a
-  virtual environment work too). Python is also the easiest way to generate
-  the bearer token below.
+- **[uv](https://docs.astral.sh/uv/)** for the command-line tool and
+  installer; uv fetches Python 3.12 or newer by itself when your machine
+  has none. Python is also the easiest way to generate the bearer token
+  below.
 - **Docker with Compose v2**, if you run the server in a container
   (recommended). Without Docker the server runs as an ordinary process.
 - **An EPO Open Patent Services account** (recommended). Register at
@@ -219,14 +219,15 @@ configured" (degraded mode). If you run Docker Engine on Linux under an
 account that is not UID 1000, see the note on file ownership in
 [`secrets/README.md`](secrets/README.md).
 
-To serve a LAN or a VPN (several machines, one server), see
-[docs/deploy-lan.md](docs/deploy-lan.md): it adds a TLS-terminating proxy
-in front of the same container.
+To share one server between several machines (a tailnet, a VPN, a LAN),
+see [docs/deploy-lan.md](docs/deploy-lan.md): it covers Tailscale Serve, a
+TLS-terminating proxy in front of the same container, and plain HTTP on a
+private network, and what each leaves to you.
 
 ### Option B: without Docker
 
 ```sh
-uv tool install patent-checker          # or: pipx install patent-checker
+uv tool install patent-checker
 mkdir patent-checker-server && cd patent-checker-server
 curl -fsSLO https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/.env.example
 cp .env.example .env
@@ -279,12 +280,11 @@ curl -LsSf https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/in
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/xhighhongo41/patent-checker/main/install.ps1 | iex"
 ```
 
-How far each script goes differs. The shell script continues into
-`patent-checker install` when it is run from a terminal (after downloading
-it, say); piped into `sh` as above its standard input is the pipe rather
-than a terminal, so it installs uv and the tool and then prints the
-`patent-checker install` command for you to run next. The PowerShell script
-continues into `patent-checker install` in both cases.
+Both scripts install uv and the tool and then continue into
+`patent-checker install`. Piped into `sh` as above, the shell script's
+standard input is the pipe, so it asks its questions on your terminal
+instead; only when there is no terminal at all (a CI job, say) does it
+stop and print the `patent-checker install` command for you to run next.
 
 Prefer to read the script first? Fetch it with `| more` instead of `| sh`,
 or skip it entirely — the two steps it takes are:
@@ -309,8 +309,8 @@ patent-checker install
    command where one exists (Claude Code, Gemini CLI, Copilot CLI, Codex
    CLI with `--token-env`), editing the agent's JSON or TOML configuration
    otherwise (Cursor, OpenCode, Codex CLI), and printing a snippet to paste
-   for the agents whose configuration it will not touch (OpenHands, Hermes
-   Agent);
+   for the agents whose configuration it will not touch (Hermes Agent, and
+   OpenHands when its CLI is not installed);
 5. prints a table of what it did per agent. The exit code is non-zero if
    any step failed; a printed snippet is not a failure.
 
@@ -322,7 +322,13 @@ patent-checker install
 | Cursor | edited in place | `~/.cursor/mcp.json` |
 | OpenCode | edited in place | `~/.config/opencode/opencode.json` |
 | Codex CLI | `codex mcp add` / appended | `~/.codex/config.toml` |
-| OpenHands, Hermes Agent | snippet to paste | `config.toml`, `~/.hermes/config.yaml` |
+| OpenHands | `openhands mcp add` (snippet to paste without the CLI) | managed by the OpenHands CLI |
+| Hermes Agent | snippet to paste | `~/.hermes/config.yaml` |
+
+OpenCode's file follows `XDG_CONFIG_HOME` when it is set. The Gemini CLI,
+Copilot CLI and OpenHands commands are used as their documentation
+describes but have not been tried against the real tools; when one fails,
+the installer falls back to editing the file or to a snippet, and says so.
 
 Useful options: `--list-agents` (what would be installed where),
 `--dry-run` (do everything except write), `--agent claude-code --agent cursor`
@@ -330,7 +336,8 @@ Useful options: `--list-agents` (what would be installed where),
 `--scope project` (install into the current project instead of your home
 directory), `--lang ja` (Japanese notice), `--agree` (agree to the notice
 without being asked — required when there is no terminal to ask at),
-`--no-skill` / `--no-mcp`.
+`--no-skill` / `--no-mcp`, `--json` (print the report as one JSON document,
+for scripts; the notice and questions then go to standard error).
 Re-running the installer is safe: it refreshes the Skill copies and updates
 the server entry in place, and it never overwrites the backup (`.bak`) it
 made of your original configuration file on the first run. The one
@@ -435,10 +442,13 @@ proposes one of two kinds of run:
   (new queries cover new features), screens only families it has not seen
   before, re-checks every monitored patent, and re-reads a document only if
   your feature, its claims, or an earlier reading changed. The report
-  describes the current state of everything and opens with **"Changes since
-  the previous exploration"**: changes of your project, new documents,
-  changes of legal status and of claims, observations that changed and why,
-  and the documents that were checked and found unchanged.
+  describes the current state of everything. It opens with a short
+  summary, **"In plain terms"**, that says without patent vocabulary which
+  parts of your project came near which patents and where the report
+  treats them, and continues with **"Changes since the previous
+  exploration"**: changes of your project, new documents, changes of legal
+  status and of claims, observations that changed and why, and the
+  documents that were checked and found unchanged.
 - A **monitoring run** only re-checks the monitored patents and writes a
   short `update-<target>-<YYYYMMDD-HHMM>.md`. It costs a small fraction of
   an exploration, and says plainly that nothing was searched.
@@ -454,6 +464,28 @@ were re-checked with about fifty upstream requests; a monitoring run made
 the same day needed none. If you explored a project with an earlier version, the Skill
 offers to import the latest report into a ledger first.
 
+### Without the MCP server
+
+If the server cannot be reached, the Skill carries on with the
+`patent-checker` command-line tool on your machine, which offers the same
+operations (see the command reference below). It asks before anything is
+installed. To prepare a machine for that, or to run the commands yourself:
+
+```sh
+uv tool install patent-checker
+patent-checker credentials set      # asks for the EPO OPS key and secret without echoing them
+patent-checker status               # what is configured, and where from; no network
+```
+
+`credentials set` stores the key and secret for your user in
+`~/.config/patent-checker/credentials.env` (readable by you only), so the
+tool finds them from any project. Values in the environment or in a
+project's `.env` take precedence over that file; `patent-checker credentials
+status` tells which one is used, and `credentials clear` deletes the file.
+Without OPS credentials the Skill offers the degraded mode. Update and
+remove the tool with `uv tool upgrade patent-checker` and `uv tool
+uninstall patent-checker`.
+
 ## Configuration
 
 Environment variables read by the server (`patent-checker serve`) and,
@@ -463,10 +495,11 @@ comments. The CLI's `--host` and `--port` options override
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PATENT_CHECKER_OPS_KEY`, `PATENT_CHECKER_OPS_SECRET` | unset | EPO OPS consumer key and secret. Either the value, or the path to a file holding it via the `_FILE` variants (`PATENT_CHECKER_OPS_KEY_FILE`, …); never both. Empty files mean "not configured" (degraded mode). |
+| `PATENT_CHECKER_OPS_KEY`, `PATENT_CHECKER_OPS_SECRET` | unset | EPO OPS consumer key and secret. Either the value, or the path to a file holding it via the `_FILE` variants (`PATENT_CHECKER_OPS_KEY_FILE`, …); never both. Empty files mean "not configured" (degraded mode). When none of the four is set, the per-user credentials file is read. |
+| `PATENT_CHECKER_CREDENTIALS_FILE` | `~/.config/patent-checker/credentials.env` | The per-user credentials file written by `patent-checker credentials set`. Only the four OPS variables are taken from it; a file others can read is used after a warning. |
 | `PATENT_CHECKER_OPERATOR_CONSENT` | unset (required) | Version of the operator notice you acknowledged (`1.0`). The server refuses to start otherwise. |
 | `PATENT_CHECKER_SERVER_TOKEN` (`_FILE`) | unset (required for http) | The bearer token clients must present. |
-| `PATENT_CHECKER_SERVER_HOST`, `PATENT_CHECKER_SERVER_PORT` | `127.0.0.1`, `8642` | Bind address. Binding beyond loopback additionally requires `PATENT_CHECKER_SERVER_ALLOWED_HOSTS` and TLS in front. |
+| `PATENT_CHECKER_SERVER_HOST`, `PATENT_CHECKER_SERVER_PORT` | `127.0.0.1`, `8642` | Bind address. Binding beyond loopback additionally requires `PATENT_CHECKER_SERVER_ALLOWED_HOSTS`; encryption is up to the network or a proxy ([docs/deploy-lan.md](docs/deploy-lan.md)). |
 | `PATENT_CHECKER_SERVER_ALLOWED_HOSTS` | unset | Comma-separated host names clients will use in the Host header. Names only: wildcards are rejected, and an IPv6 address is written without brackets. |
 | `PATENT_CHECKER_SERVER_RPS`, `PATENT_CHECKER_SERVER_BURST` | `5`, `10` | Limit on incoming MCP requests (a guard against runaway agent loops; upstream pacing is separate). |
 | `PATENT_CHECKER_DATA_DIR` | per-user data directory (server), `./.patent-checker` (CLI) | Search cache, request log and, when set, the shared document cache (`<dir>/cache`). The server keeps its data with the user that runs it; the CLI keeps it with the project it is run from. The container image sets it to `/data`. |
@@ -487,10 +520,11 @@ its default from `LC_ALL` or `LANG`.
 
 `.env` is read by every `patent-checker` command from the directory it runs
 in or a parent of it, never from your home directory or the filesystem
-root. With Compose, the credentials come from the files under `secrets/`,
+root. OPS credentials are looked up in the environment first, then in that
+`.env`, then in the per-user credentials file. With Compose, the credentials come from the files under `secrets/`,
 and the `.env` next to `compose.yaml` provides `PATENT_CHECKER_OPERATOR_CONSENT`
-(plus, optionally, `PATENT_CHECKER_IMAGE`, `PATENT_CHECKER_PORT` and
-`PATENT_CHECKER_LOG_LEVEL`). Other variables can be added under
+(plus, optionally, `PATENT_CHECKER_IMAGE`, `PATENT_CHECKER_PORT`,
+`PATENT_CHECKER_SERVER_ALLOWED_HOSTS` and `PATENT_CHECKER_LOG_LEVEL`). Other variables can be added under
 `environment:` in `compose.yaml`.
 
 <details>
@@ -547,7 +581,7 @@ shell, one command per tool:
 
 | MCP tool | CLI command | What it is for |
 |---|---|---|
-| `server_status` | — (`patent-checker --version`, plus any OPS command to see whether it is configured) | version, mode and cache locations of the server |
+| `server_status` | `patent-checker status` | version, whether OPS is configured (and where from), data locations, consent and pacing; the CLI form uses no network |
 | `ops_search` | `patent-checker search "<cql>"` | a CQL search of published data |
 | `ops_search_biblio` | `patent-checker search-biblio "<cql>"` | the same search, with the bibliographic record of every hit |
 | `search_plan_check` | `patent-checker plan-check "<q1>" "<q2>" …` | hit counts of several queries before searching |
@@ -564,14 +598,16 @@ shell, one command per tool:
 | — | `patent-checker cache status` / `cache clear` | what is cached, and deleting part of it |
 | — | `patent-checker clean` | remove this project's traces |
 | — | `patent-checker consent status` / `consent show` / `consent record` | the user notice and its consent record |
-| — | `patent-checker install` | place the Skill and register the server with your agents |
+| — | `patent-checker install [--json]` | place the Skill and register the server with your agents |
+| — | `patent-checker uninstall [--json]` | remove the Skill and the server registrations again |
+| — | `patent-checker credentials set` / `credentials status` / `credentials clear` | the per-user OPS credentials file |
 | — | `patent-checker serve` | run the MCP server |
 
 The fetching commands (`search`, `search-biblio`, `plan-check`, `biblio`,
 `claims`, `legal`, `family`, `watch`) accept `--refresh`, which bypasses the
-cache for that one call. The six commands without an MCP counterpart are
-that way by design: the server never reads or deletes the files of your
-project.
+cache for that one call. The commands without an MCP counterpart are that
+way by design: the server never reads or deletes the files of your project,
+and never handles your credentials.
 
 ## Security model
 
@@ -594,17 +630,23 @@ project.
   hammer the data sources.
 - `GET /health` is unauthenticated for container health checks and returns
   only a status, the version and the transport.
-- Credentials are read from the environment or from files, are never
-  logged, and never appear in the startup banner or in error messages.
+- Credentials are read from the environment, a project `.env`, files
+  named by `_FILE` variables or the per-user credentials file; they are
+  never logged, never printed by `status` or `credentials status`, and
+  never appear in the startup banner or in error messages. The per-user
+  file is written readable by you only, and a warning is shown if others
+  can read it.
 - The container runs as an unprivileged user on a read-only filesystem with
   all capabilities dropped; only `/data` is writable.
 - `--transport stdio` has no authentication: use it only for a single local
   client, aware that the server then runs with your permissions.
-- Serving a LAN or the internet is possible but is your responsibility:
-  the transport is plain HTTP, so put a TLS-terminating reverse proxy in
-  front ([docs/deploy-lan.md](docs/deploy-lan.md)), set
-  `PATENT_CHECKER_SERVER_ALLOWED_HOSTS`, and treat the token as the only
-  thing between the network and your OPS quota.
+- Serving other machines is possible and is your responsibility. The
+  transport is plain HTTP and the server provides no TLS: the token is
+  protected only by what the network (a tailnet, a VPN) or a
+  TLS-terminating proxy in front provides, and a proxy is recommended
+  wherever you can have one ([docs/deploy-lan.md](docs/deploy-lan.md)).
+  Set `PATENT_CHECKER_SERVER_ALLOWED_HOSTS`, and treat the token as the
+  only thing between the network and your OPS quota.
 - The Skill treats everything the server returns, patent text included, as
   data to analyze, not as instructions to follow.
 - Releases are built and published by CI from a version tag; dependencies
@@ -661,7 +703,7 @@ project.
 **Without Docker**: stop the running server, then
 
 ```sh
-uv tool upgrade patent-checker      # or: pipx upgrade patent-checker
+uv tool upgrade patent-checker
 patent-checker serve
 ```
 
@@ -674,14 +716,15 @@ have.
 
 ## Uninstalling
 
-- **Agents**: remove the `patent-checker` entry from each agent's MCP
-  configuration (`claude mcp remove patent-checker`, `gemini mcp remove
-  patent-checker`, or delete the entry from the file in the table above),
-  and delete the Skill directories `~/.agents/skills/patent-checker/`,
-  `~/.claude/skills/patent-checker/`, `~/.openhands/skills/patent-checker/`,
-  `~/.hermes/skills/patent-checker/` (and their `.agents/skills/` and
-  `.claude/skills/` counterparts in projects where you used
-  `--scope project`).
+- **Agents**: `patent-checker uninstall` removes the server registration
+  and the Skill copies that `patent-checker install` made (add
+  `--scope project` in a project where you installed that way; `--dry-run`
+  shows what it would do). It edits the JSON configurations, runs the
+  agents' own `mcp remove` commands where they exist, and deletes a Skill
+  directory only if it holds this Skill. What it leaves for you, it lists:
+  the Codex CLI table `[mcp_servers.patent-checker]` when the `codex`
+  command is not available, the OpenHands and Hermes Agent entries, and the
+  `.bak` backups of your original configuration files.
 - **Server**: `docker compose down -v` (container, cache and all) or
   `uv tool uninstall patent-checker` (plus the per-user data directory,
   `~/.local/share/patent-checker` or `%LOCALAPPDATA%\patent-checker`, if
@@ -689,10 +732,23 @@ have.
 - **Records**: `patent-checker clean --yes --include-artifacts --include-consent`
   in a project removes its reports, notes and consent record (run it before
   uninstalling the tool); `~/.config/patent-checker/consent.json` holds the
-  per-user consent record.
+  per-user consent record, and `patent-checker credentials clear` deletes
+  the per-user credentials file.
 
 ## Changelog
 
+- **v1.3** (2026-09): reports open with **"In plain terms"**, a summary
+  without patent vocabulary that says which parts of your project came near
+  which patents and where the report treats them, adding no judgment of its
+  own. The command-line tool works on its own: `patent-checker credentials
+  set` keeps the OPS key and secret for your user, `patent-checker status`
+  shows the configuration without touching the network, and the Skill
+  switches to the CLI when the server cannot be reached. New `patent-checker
+  uninstall`, `install --json`, OpenHands registration through its CLI,
+  OpenCode's configuration under `XDG_CONFIG_HOME`, and the shell bootstrap
+  asks its questions on the terminal when piped. The network guide now
+  covers Tailscale Serve and plain HTTP on a private network beside the
+  Caddy example; TLS is recommended and left to the operator.
 - **v1.2** (2026-09): pacing that holds across processes. The minimum
   interval per OPS service, cool-downs and tightened intervals now live in a
   small per-user state file guarded by a file lock, so CLI commands run one
