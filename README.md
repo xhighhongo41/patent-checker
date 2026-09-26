@@ -30,7 +30,7 @@ Patent Checker **does not decide whether anything infringes a patent**. Its
 reports contain observations, scope statements and open questions, never a
 verdict.
 
-**Status: stable release (v1.3).**
+**Status: stable release (v1.4).**
 
 ## Important notices
 
@@ -72,8 +72,9 @@ your agent ──(Skill: judgment)──► patent-checker MCP server ──► 
 ```
 
 1. The Skill reads your codebase, lists the technical features that could be
-   claimed, translates them into patent vocabulary and builds search
-   queries.
+   claimed, keeps common technique (what a standard, a library or the
+   platform ships as is) out of the search and says so in the report,
+   translates the rest into patent vocabulary and builds search queries.
 2. The MCP server runs the queries against EPO OPS, fetches the candidate
    documents (claims from Google Patents, bibliography and legal status
    from OPS) and caches every document so nothing is fetched twice.
@@ -737,6 +738,15 @@ have.
 
 ## Changelog
 
+- **v1.4** (2026-09): the report's opening summary is now headed
+  **"Summary without patent terms"** (in Japanese 「特許用語を使わない要約」).
+  Before any search, the Skill keeps features that are common technique —
+  what a standard, a widely used library, the runtime or the platform ships
+  as is, textbook methods, toolchain internals, configuration — out of the
+  search, with a category and a reason for each, and lists them in the
+  report right after the feature table; when in doubt a feature stays in.
+  The ledger records such features with the status `excluded`, so a later
+  run does not screen them again, and `ledger check` asks for the reason.
 - **v1.3** (2026-09): reports open with **"Summary without patent terms"**, a summary
   without patent vocabulary that says which parts of your project came near
   which patents and where the report treats them, adding no judgment of its
