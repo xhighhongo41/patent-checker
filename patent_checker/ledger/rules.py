@@ -206,6 +206,14 @@ def _check_feature(
         check_run_ref(ctx, ff, line, record["since_run"], '"since_run"')
     if has_value(record, "changed_run"):
         check_run_ref(ctx, ff, line, record["changed_run"], '"changed_run"')
+    _check_reason(
+        ff,
+        line,
+        record,
+        record.get("status") == "excluded",
+        "an excluded feature",
+        "the next run needs to know why it was not searched",
+    )
 
 
 # --- check: queries.jsonl ---------------------------------------------------
@@ -237,7 +245,14 @@ def _check_query(
         check_feature_list(ctx, ff, line, record["features"], '"features"')
     if require(ff, line, record, "runs"):
         _check_query_runs(ctx, ff, line, record["runs"])
-    _check_reason(ff, line, record, status_value)
+    _check_reason(
+        ff,
+        line,
+        record,
+        status_value in ("rejected", "dropped"),
+        f"a {status_value} query",
+        "the next run needs to know why it is not worth running again",
+    )
 
 
 def _check_cql(ff: FileFindings, line: int, value: Any) -> None:
@@ -252,20 +267,25 @@ def _check_cql(ff: FileFindings, line: int, value: Any) -> None:
 
 
 def _check_reason(
-    ff: FileFindings, line: int, record: Mapping[str, Any], status_value: Any
+    ff: FileFindings,
+    line: int,
+    record: Mapping[str, Any],
+    applies: bool,
+    label: str,
+    continuation: str,
 ) -> None:
-    """Warn when a query that is not run says nothing about why."""
-    if status_value not in ("rejected", "dropped"):
+    """Warn when *record* carries no usable "reason" although *applies* calls for one.
+
+    Shared by a query that is not run (``rejected`` / ``dropped``) and a
+    feature kept out of every search (``excluded``); both say nothing about
+    why unless a non-blank "reason" is there.
+    """
+    if not applies:
         return
     reason = record.get("reason")
     if isinstance(reason, str) and reason.strip():
         return
-    ff.warning(
-        line,
-        "reason-missing",
-        f'"reason" is not there on a {status_value} query; the next run needs to know '
-        "why it is not worth running again",
-    )
+    ff.warning(line, "reason-missing", f'"reason" is not there on {label}; {continuation}')
 
 
 def _check_query_runs(ctx: Ledger, ff: FileFindings, line: int, value: Any) -> None:
