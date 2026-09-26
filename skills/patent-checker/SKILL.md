@@ -266,7 +266,7 @@ symbol alone hits too much.
 
 ### 9. Report
 Write the report per `references/report-template.md`. Required elements:
-disclaimer, **"In plain terms"** (the picture of §5–§9 in everyday words
+disclaimer, **"Summary without patent terms"** (the picture of §5–§9 in everyday words
 without patent vocabulary, each item pointing to its section, no rating
 and no judgment of its own), changes since the previous exploration, feature table,
 translation-table reference, scope and limitations (say explicitly what

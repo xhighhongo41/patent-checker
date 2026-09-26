@@ -184,7 +184,7 @@ them indefinitely: nothing is downloaded twice.
 
 ### F9. Report
 Write the full report from `references/report-template.md` — the current
-state of everything, not a delta — with **"In plain terms"** right after
+state of everything, not a delta — with **"Summary without patent terms"** right after
 the disclaimer and **"Changes since the previous exploration"** right after
 that. Carry the response
 record of §8 forward **verbatim**, including lines the user added by hand,

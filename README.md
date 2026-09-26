@@ -84,7 +84,7 @@ your agent ──(Skill: judgment)──► patent-checker MCP server ──► 
    (features, queries, screened families, monitored patents and a snapshot
    of their status). The next run starts from it: the server compares the
    stored snapshots with the current records, and the new report opens with
-   a plain-language summary followed by what changed.
+   a summary without patent terms followed by what changed.
 
 The server only ever receives public patent data: search expressions,
 publication numbers, family identifiers, dates, and status snapshots it
@@ -443,7 +443,7 @@ proposes one of two kinds of run:
   before, re-checks every monitored patent, and re-reads a document only if
   your feature, its claims, or an earlier reading changed. The report
   describes the current state of everything. It opens with a short
-  summary, **"In plain terms"**, that says without patent vocabulary which
+  summary, **"Summary without patent terms"**, that says without patent vocabulary which
   parts of your project came near which patents and where the report
   treats them, and continues with **"Changes since the previous
   exploration"**: changes of your project, new documents, changes of legal
@@ -737,7 +737,7 @@ have.
 
 ## Changelog
 
-- **v1.3** (2026-09): reports open with **"In plain terms"**, a summary
+- **v1.3** (2026-09): reports open with **"Summary without patent terms"**, a summary
   without patent vocabulary that says which parts of your project came near
   which patents and where the report treats them, adding no judgment of its
   own. The command-line tool works on its own: `patent-checker credentials

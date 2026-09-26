@@ -31,8 +31,8 @@ and never overwrite an earlier file.
 > This update and the report it belongs to are records of the user's
 > awareness of the documents listed, and of the review that followed.
 
-## In plain terms
-[The short form of the full report's "In plain terms", under the same
+## Summary without patent terms
+[The short form of the full report's "Summary without patent terms", under the same
 rules (everyday words, no patent vocabulary, degree only through the
 three observations, the sections and counts, each item pointing to where
 the detail is). One bullet per part of the target whose picture changed in

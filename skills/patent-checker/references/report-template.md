@@ -12,7 +12,7 @@ report replaces the earlier one as the document to read, and the earlier
 one stays on disk as the record of what was known then. What differs from
 the previous run goes into "Changes since the previous exploration".
 
-The report opens with the disclaimer, then "In plain terms" — the same
+The report opens with the disclaimer, then "Summary without patent terms" — the same
 picture as §5–§9 told without patent vocabulary, each item pointing to the
 section that holds the detail — and only then the changes and the numbered
 sections.
@@ -50,8 +50,10 @@ sections.
 > [In degraded mode, add the four-item limitation notice here — SKILL.md
 > step 11.]
 
-## In plain terms
-[Write this for a reader who knows neither patents nor law, but do not say
+## Summary without patent terms
+[When the report is written in Japanese, the heading is 「特許用語を使わない要約」;
+in any other language, use a heading with the same meaning in the same place.
+Write this for a reader who knows neither patents nor law, but do not say
 so in the report. Use everyday words and no patent vocabulary: not
 "claim", "element", "family", "kind code" or "prior art" — say "what the
 patent protects", "the mechanism the patent describes", "the same

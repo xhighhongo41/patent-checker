@@ -299,10 +299,10 @@ def test_report_template_puts_the_plain_summary_between_disclaimer_and_changes()
     """The plain-language summary follows the disclaimer and precedes the changes."""
     text = (SKILL_DIR / "references" / "report-template.md").read_text(encoding="utf-8")
     disclaimer = text.index("> **Disclaimer")
-    plain = text.index("## In plain terms")
+    plain = text.index("## Summary without patent terms")
     changes = text.index("## Changes since the previous exploration")
     assert disclaimer < plain < changes < text.index("## 1. Technical features")
-    body = _section(text, "## In plain terms")
+    body = _section(text, "## Summary without patent terms")
     for word in _PLAIN_TERMS_FORBIDDEN:
         assert word not in body.lower(), f"plain summary mentions {word!r}"
     # Every item points to where the detail is, and the degree stays in the
@@ -314,9 +314,9 @@ def test_report_template_puts_the_plain_summary_between_disclaimer_and_changes()
 def test_update_report_template_has_the_short_plain_summary() -> None:
     """The monitoring update carries the short form right after its disclaimer."""
     text = (SKILL_DIR / "references" / "update-report-template.md").read_text(encoding="utf-8")
-    plain = text.index("## In plain terms")
+    plain = text.index("## Summary without patent terms")
     assert text.index("> **Disclaimer") < plain < text.index("## Scope and limitations")
-    body = _section(text, "## In plain terms")
+    body = _section(text, "## Summary without patent terms")
     for word in _PLAIN_TERMS_FORBIDDEN:
         assert word not in body.lower(), f"plain summary mentions {word!r}"
     assert "Nothing changed" in body
