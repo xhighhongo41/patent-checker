@@ -75,6 +75,15 @@ changed (set `changed_run` to this run; a `design` feature that now has
 code becomes `basis: code` and counts as changed), or gone (`retired`).
 New features get the next free `F` number. Never renumber.
 
+`excluded` features are carried forward as they are: compare newly
+extracted features with the excluded list before giving out a number, and
+never create a second entry for one of them. Bring one back (`active`,
+`changed_run` set to this run, `reason` removed) only when the target's
+code changed so that the feature now has an element of its own, or when
+the user asks; it is then a changed feature. Screen new features with the
+same categories (`references/feature-screening.md`), and list the features
+brought back and newly excluded under "Target" in the changes section.
+
 ### F3. Vocabulary and queries
 Carry `translation.md` forward and extend it; redo the synonym expansion
 for new and changed features. Then:

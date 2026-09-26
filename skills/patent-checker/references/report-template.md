@@ -106,8 +106,9 @@ observations that changed, and corrections of the previous report are three
 different things — keep them apart.]
 
 ### Target
-[Version and commit then → now. Features added / changed / retired
-(F-numbers), and what the stage of the target is now.]
+[Version and commit then → now. Features added / changed / retired,
+newly excluded / brought back into the search (F-numbers), and what the
+stage of the target is now.]
 
 ### New documents
 [Documents that entered the element tables or the monitoring list in this
@@ -152,14 +153,20 @@ the changes are.]
 May reference features.md for detail. Retired features are listed once, in
 the run that retired them.]
 
+[Then a short table headed **Excluded before searching**: F-number,
+one-line feature, category (standard / textbook / toolchain / usage), why
+it is not searched — see `references/feature-screening.md`. When nothing
+was excluded, one line saying so instead of the table.]
+
 ## 2. Search-query design
 [Reference to the translation table. Number of adopted queries and raw
 hits. State any known vocabulary gaps explicitly.]
 
 ## 3. Scope and limitations
 [Table: search channel / full-text source / legal-status source / family
-expansion / countries covered / claims read in full / areas not searched /
-known miss patterns / **what could not be checked in this run and why**.
+expansion / countries covered / claims read in full / areas not searched
+(including how many features were excluded before searching, pointing to
+§1) / known miss patterns / **what could not be checked in this run and why**.
 In a follow-up run, say which part of the picture was carried over from
 which run and which part was searched anew, and for which publication
 window. End with the fixed sentence:]
