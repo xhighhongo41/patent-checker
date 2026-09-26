@@ -48,7 +48,8 @@ clean` keeps it, and `patent-checker clean --include-artifacts` removes it.
   per-run working directories.
 - Identifiers are stable. An `F` or `Q` number is never reused or
   renumbered; a feature that disappeared is marked `retired`, a query no
-  longer run is marked `dropped`.
+  longer run is marked `dropped`, and a feature kept out of the search is
+  marked `excluded` and keeps its number.
 - Dates are `YYYY-MM-DD`, a day alone. Timestamps are a full ISO 8601 date
   and time, normally with a UTC offset (`2026-03-01T09:30:00+00:00`),
   copied from tool results where they come from one (`fetched_at`); a date
@@ -109,9 +110,10 @@ One line per run, appended when the run starts and completed when it ends.
 | `title` | yes | One-line description in general technical vocabulary |
 | `basis` | yes | `code` (read from the implementation) or `design` (taken from design documents or the user's description; nothing to point at yet) |
 | `priority` | yes | `high`, `medium` or `low` |
-| `status` | yes | `active` or `retired` |
+| `status` | yes | `active`, `retired` or `excluded` (kept out of every search as common technique; see `references/feature-screening.md`) |
 | `since_run` | yes | `run_id` of the run that introduced the feature |
 | `changed_run` | no | `run_id` of the latest run in which the feature's behaviour was found changed (including `design` becoming `code`) |
+| `reason` | no | Expected on an `excluded` feature: the category and one line, for example `"standard: uses the zip module as shipped"` |
 | `pointers` | no | Array of code pointers (`path:line`) |
 | `note` | no | Free text |
 
@@ -120,6 +122,10 @@ run; that is what triggers re-reading the documents mapped to it.
 
 ```json
 {"id": "F3", "title": "Repairs a damaged archive by rebuilding its central directory", "basis": "code", "priority": "high", "status": "active", "since_run": "20260301-0930", "changed_run": "20260901-1015", "pointers": ["src/repair/archive.py:120"]}
+```
+
+```json
+{"id": "F5", "title": "Retries a failed download with exponential backoff", "basis": "code", "priority": "low", "status": "excluded", "reason": "textbook: plain exponential backoff, no target-specific element", "since_run": "20260301-0930"}
 ```
 
 ## queries.jsonl

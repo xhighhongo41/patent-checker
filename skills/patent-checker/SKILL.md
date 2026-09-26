@@ -146,6 +146,19 @@ them `basis: design`.
 Follow-up: read what changed since the last explored commit, keep the
 F-numbers stable, mark changed and retired features.
 
+**Screening before any search.** Then ask of every feature whether it is
+a specific technical means the target's own code takes for a specific
+problem. A feature that merely calls what a standard, a widely used
+library, the runtime or the OS ships (`standard`), applies a textbook
+technique as described (`textbook`), lives inside a toolchain the target
+only uses (`toolchain`), or is configuration or procedure (`usage`) is
+marked `excluded` with its category and one line of reason, and is not
+searched. Common parts combined in the target's own way stay in; when in
+doubt, keep it. Exclusion is a scope decision, not an assessment. Excluded
+features keep their F-number, go into the ledger as `excluded`, and are
+listed in the report (§1 table, §3 count). You screen; sub-agents only
+propose. Details: `references/feature-screening.md`.
+
 ### 2. Translation into patent vocabulary
 Build a table translating implementation vocabulary into patent-literature
 vocabulary. **Systematic synonym expansion is mandatory**: list at least
@@ -266,10 +279,10 @@ symbol alone hits too much.
 
 ### 9. Report
 Write the report per `references/report-template.md`. Required elements:
-disclaimer, **"In plain terms"** (the picture of §5–§9 in everyday words
+disclaimer, **"Summary without patent terms"** (the picture of §5–§9 in everyday words
 without patent vocabulary, each item pointing to its section, no rating
-and no judgment of its own), changes since the previous exploration, feature table,
-translation-table reference, scope and limitations (say explicitly what
+and no judgment of its own), changes since the previous exploration, feature table
+with the features excluded before searching, translation-table reference, scope and limitations (say explicitly what
 was NOT searched), screening record, element tables, findings with the
 dated response record, **design boundaries** (extensions that would
 require re-exploration), professional consultation candidates, monitoring

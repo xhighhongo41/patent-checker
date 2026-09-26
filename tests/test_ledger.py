@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from patent_checker.ledger import check, status
+from patent_checker.ledger.layout import FEATURE_STATUSES
 
 _TARGET = "sample-app"
 _FIRST_RUN = "20260301-0930"
@@ -401,6 +402,37 @@ def test_check_accepts_a_null_snapshot_from_a_degraded_run(tmp_path: Path) -> No
     assert result["targets"][0]["warnings"] == []
 
 
+def test_check_accepts_an_excluded_feature_that_names_a_reason(tmp_path: Path) -> None:
+    """An excluded feature naming the category and why it was not searched raises nothing."""
+    base = _build_ledger(tmp_path)
+    directory = base / "ledger" / _TARGET
+    _edit(
+        "features.jsonl",
+        1,
+        lambda record: record.update(
+            {"status": "excluded", "reason": "standard: uses the zip module as shipped"}
+        ),
+    )(directory)
+
+    result = check(base, target=_TARGET)
+
+    report = result["targets"][0]
+    assert report["errors"] == []
+    assert report["warnings"] == []
+    assert result["ok"] is True
+
+
+def test_check_does_not_ask_active_or_retired_features_for_a_reason(tmp_path: Path) -> None:
+    """Only an excluded feature is asked for a "reason"; active and retired are not."""
+    base = _build_ledger(tmp_path)
+
+    result = check(base, target=_TARGET)
+
+    warnings = result["targets"][0]["warnings"]
+    assert _finding(warnings, "reason-missing", "features.jsonl", 1) is None
+    assert _finding(warnings, "reason-missing", "features.jsonl", 2) is None
+
+
 # --- check: every error rule ------------------------------------------------
 
 _ERROR_CASES = [
@@ -767,6 +799,24 @@ _WARNING_CASES = [
         id="reason-missing",
     ),
     pytest.param(
+        _edit("features.jsonl", 1, lambda record: record.update({"status": "excluded"})),
+        "reason-missing",
+        "features.jsonl",
+        2,
+        id="reason-missing-excluded-feature",
+    ),
+    pytest.param(
+        _edit(
+            "features.jsonl",
+            1,
+            lambda record: record.update({"status": "excluded", "reason": "   "}),
+        ),
+        "reason-missing",
+        "features.jsonl",
+        2,
+        id="reason-missing-excluded-feature-blank",
+    ),
+    pytest.param(
         _edit(
             "watch.jsonl",
             0,
@@ -1024,7 +1074,7 @@ def test_status_summarizes_a_complete_ledger(tmp_path: Path) -> None:
     assert entry["target"] == _TARGET
     assert entry["format"] == 1
     assert entry["runs"] == 2
-    assert entry["features"] == {"active": 1, "retired": 1}
+    assert entry["features"] == {"active": 1, "retired": 1, "excluded": 0}
     assert entry["queries"] == {"adopted": 1, "rejected": 1, "dropped": 0}
     assert entry["families"] == 2
     assert entry["watch"] == {
@@ -1254,3 +1304,11 @@ def test_reading_a_data_base_that_does_not_exist_creates_nothing(tmp_path: Path)
     check(base)
 
     assert list(tmp_path.iterdir()) == []
+
+
+# --- layout: accepted feature statuses ---------------------------------------
+
+
+def test_feature_statuses_list_active_retired_then_excluded() -> None:
+    """The 1.4 addition, "excluded", extends the tuple after the two earlier statuses."""
+    assert FEATURE_STATUSES == ("active", "retired", "excluded")

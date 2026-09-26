@@ -241,6 +241,7 @@ def test_skill_stays_an_entry_point_and_links_every_reference() -> None:
         "report-template.md",
         "update-report-template.md",
         "legal-status-codes.md",
+        "feature-screening.md",
     ):
         assert (SKILL_DIR / "references" / name).is_file(), f"missing reference: {name}"
         assert f"references/{name}" in text, f"SKILL.md never points at references/{name}"
@@ -299,10 +300,10 @@ def test_report_template_puts_the_plain_summary_between_disclaimer_and_changes()
     """The plain-language summary follows the disclaimer and precedes the changes."""
     text = (SKILL_DIR / "references" / "report-template.md").read_text(encoding="utf-8")
     disclaimer = text.index("> **Disclaimer")
-    plain = text.index("## In plain terms")
+    plain = text.index("## Summary without patent terms")
     changes = text.index("## Changes since the previous exploration")
     assert disclaimer < plain < changes < text.index("## 1. Technical features")
-    body = _section(text, "## In plain terms")
+    body = _section(text, "## Summary without patent terms")
     for word in _PLAIN_TERMS_FORBIDDEN:
         assert word not in body.lower(), f"plain summary mentions {word!r}"
     # Every item points to where the detail is, and the degree stays in the
@@ -314,9 +315,9 @@ def test_report_template_puts_the_plain_summary_between_disclaimer_and_changes()
 def test_update_report_template_has_the_short_plain_summary() -> None:
     """The monitoring update carries the short form right after its disclaimer."""
     text = (SKILL_DIR / "references" / "update-report-template.md").read_text(encoding="utf-8")
-    plain = text.index("## In plain terms")
+    plain = text.index("## Summary without patent terms")
     assert text.index("> **Disclaimer") < plain < text.index("## Scope and limitations")
-    body = _section(text, "## In plain terms")
+    body = _section(text, "## Summary without patent terms")
     for word in _PLAIN_TERMS_FORBIDDEN:
         assert word not in body.lower(), f"plain summary mentions {word!r}"
     assert "Nothing changed" in body
@@ -335,6 +336,46 @@ def test_update_report_template_keeps_the_safeguards_of_the_full_report() -> Non
         "no verdict",
     ):
         assert marker.lower() in text.lower(), f"missing mandatory element: {marker}"
+
+
+_SCREENING_CATEGORIES = ("standard", "textbook", "toolchain", "usage")
+
+
+def test_skill_screens_features_before_searching_and_records_the_exclusions() -> None:
+    """Common technique is kept out of the search before any query, with a reason.
+
+    The screening is a scope decision: it must be recorded in the report and
+    in the ledger, and it must never read as an assessment.
+    """
+    skill = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+    step_one = skill[skill.index("### 1. Feature extraction") : skill.index("### 2. ")]
+    assert "Screening before any search" in step_one
+    assert "references/feature-screening.md" in step_one
+    for category in _SCREENING_CATEGORIES:
+        assert f"`{category}`" in step_one, f"step 1 never names the category {category}"
+    assert "when in doubt, keep it" in " ".join(step_one.split()).lower()
+
+    screening = (SKILL_DIR / "references" / "feature-screening.md").read_text(encoding="utf-8")
+    for category in _SCREENING_CATEGORIES:
+        assert f"`{category}`" in screening
+    for phrase in ("Excluded before searching", '"excluded"', "reason", "changed_run"):
+        assert phrase in screening, f"feature-screening.md never mentions {phrase}"
+    for forbidden in (*_PLAIN_TERMS_FORBIDDEN, "patentable"):
+        assert forbidden not in screening.lower(), f"feature-screening.md says {forbidden!r}"
+
+    report = (SKILL_DIR / "references" / "report-template.md").read_text(encoding="utf-8")
+    features = _section(report, "## 1. Technical features of the target")
+    assert "Excluded before searching" in features
+    assert "references/feature-screening.md" in features
+    scope = _section(report, "## 3. Scope and limitations")
+    assert "excluded before searching" in scope
+    for forbidden in (*_PLAIN_TERMS_FORBIDDEN, "patentable"):
+        assert forbidden not in features.lower(), f"the feature table says {forbidden!r}"
+
+    follow_up = (SKILL_DIR / "references" / "follow-up-runs.md").read_text(encoding="utf-8")
+    f2 = follow_up[follow_up.index("### F2.") : follow_up.index("### F3.")]
+    assert "`excluded`" in f2
+    assert "references/feature-screening.md" in f2
 
 
 def test_ledger_format_has_no_room_for_a_legal_conclusion() -> None:

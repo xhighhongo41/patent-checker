@@ -47,7 +47,8 @@ RUN_STAGES: tuple[str, ...] = ("concept", "development", "pre-release", "release
 RUN_MODES: tuple[str, ...] = ("standard", "degraded")
 FEATURE_BASES: tuple[str, ...] = ("code", "design")
 FEATURE_PRIORITIES: tuple[str, ...] = ("high", "medium", "low")
-FEATURE_STATUSES: tuple[str, ...] = ("active", "retired")
+# "excluded" is a common-technique feature kept out of every search.
+FEATURE_STATUSES: tuple[str, ...] = ("active", "retired", "excluded")
 QUERY_STATUSES: tuple[str, ...] = ("adopted", "rejected", "dropped")
 FAMILY_STAGE1_VALUES: tuple[str, ...] = ("A", "B", "C")
 FAMILY_STAGE2_VALUES: tuple[str, ...] = ("close-read", "boundary", "lacks")
