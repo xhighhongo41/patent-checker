@@ -191,9 +191,10 @@ def test_docdb_roundtrip_shrinks_pre_2026_google_style_number() -> None:
 
 
 # (Google-style input, expected docdb spelling)
-# DOCDB spells US A-kind publications with 10 digits through 2025 and 11
-# digits from 2026 (verified against EPO OPS, 2026-09), so parse_pubnum's
-# 11-to-10-digit shrink only applies to years before 2026.
+# DOCDB decides the 10/11-digit spelling of a US A-kind number per
+# document (measured against EPO OPS, 2026-10), so parse_pubnum's
+# 11-to-10-digit shrink is a year-based approximation that only applies to
+# years before 2026.
 US_APPLICATION_YEAR_ROUNDTRIP_CASES = [
     ("US20070016547A1", "US.2007016547.A1", "US2007016547A1", "US20070016547A1"),
     ("US20260024003A1", "US.20260024003.A1", "US20260024003A1", "US20260024003A1"),
@@ -416,3 +417,58 @@ def test_parse_pubnum_does_not_shrink_a_letter_bearing_us_application_number() -
     result = parse_pubnum("US.20A00123456.A1")
     assert result.number == "20A00123456"
     assert result.docdb() == "US.20A00123456.A1"
+
+
+# --- Alternate DOCDB spelling (v1.4.1) --------------------------------------
+#
+# DOCDB decides the 10/11-digit spelling of a year-prefixed US number per
+# document, so a retrieval that gets a 404 for one spelling retries the
+# other. alternate_docdb() returns that other spelling: the mirror of
+# google()'s padding, applied to digit-only year-prefixed US numbers of
+# exactly 10 or 11 digits. The year and the kind are not checked, because
+# the result is only used after a 404.
+ALTERNATE_DOCDB_CASES = [
+    ("US.2024111636.A1", "US.20240111636.A1"),
+    ("US.2007016547.A1", "US.20070016547.A1"),
+    ("US.2026009947.A1", "US.20260009947.A1"),  # the year is not checked
+    ("US.2024111636.B2", "US.20240111636.B2"),  # the kind is not checked
+    ("US.2024111636", "US.20240111636"),  # no kind at all
+    ("US.20260099470.A1", "US.2026099470.A1"),
+    ("US2007016547A1", "US.20070016547.A1"),  # parsed from the epodoc spelling
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), ALTERNATE_DOCDB_CASES)
+def test_alternate_docdb_swaps_the_ten_eleven_digit_spelling(text: str, expected: str) -> None:
+    """alternate_docdb() returns the other DOCDB spelling of a year-prefixed US number."""
+    result = parse_pubnum(text)
+    assert result.alternate_docdb() == expected
+
+
+# Each case fails exactly one of the conditions required to have an
+# alternate spelling, so the answer is None: a guess would send the OPS
+# retry to a wrong number.
+ALTERNATE_DOCDB_NONE_CASES = [
+    "US.11468338.B2",  # not year-prefixed
+    "US.1234567890.A1",  # leading two digits not "19"/"20"
+    "US.2020DE1234.A1",  # letters in the number
+    "US.20261116361.A1",  # 11 digits, 5th digit not "0"
+    "US.202418774328.A",  # 12 digits
+    "US.202411163.A1",  # 9 digits
+    "KR.20160004285.A",  # non-US office
+]
+
+
+@pytest.mark.parametrize("text", ALTERNATE_DOCDB_NONE_CASES)
+def test_alternate_docdb_returns_none_without_an_alternate(text: str) -> None:
+    """Shapes without a 10/11-digit alternate spelling get None, not a guess."""
+    result = parse_pubnum(text)
+    assert result.alternate_docdb() is None
+
+
+def test_alternate_docdb_round_trips_through_parse_pubnum() -> None:
+    """The alternate spelling parses back to the canonical spelling."""
+    original = parse_pubnum("US.2024111636.A1")
+    alternate = original.alternate_docdb()
+    assert alternate is not None
+    assert parse_pubnum(alternate).docdb() == original.docdb()
