@@ -486,6 +486,42 @@ class OpsClient:
             block_reason=reason,
         )
 
+    def _get_publication(
+        self,
+        parsed: PubNumber,
+        *,
+        service: str,
+        kind: str,
+        path_template: str,
+    ) -> bytes:
+        """GET one publication endpoint, retrying the alternate DOCDB spelling on 404.
+
+        OPS stores pre-2026 US application publications under both the
+        10-digit and the 11-digit DOCDB spelling, document by document, so
+        the canonical spelling from :meth:`PubNumber.docdb` can miss. When
+        such a request answers 404 and the number has an alternate
+        spelling (10 <-> 11 digits, see :meth:`PubNumber.alternate_docdb`),
+        exactly one retry is made with that spelling. A 404 on the retry
+        propagates, and every other error status raises on the first call.
+        """
+        try:
+            return self._get(
+                path_template.format(ref=parsed.docdb()),
+                service=service,
+                kind=kind,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != httpx.codes.NOT_FOUND:
+                raise
+            alternate = parsed.alternate_docdb()
+            if alternate is None:
+                raise
+            return self._get(
+                path_template.format(ref=alternate),
+                service=service,
+                kind=kind,
+            )
+
     # -- endpoints ---------------------------------------------------------
 
     def search(self, cql: str, *, begin: int = 1, end: int = 25) -> bytes:
@@ -524,16 +560,23 @@ class OpsClient:
         )
 
     def biblio(self, pub: str) -> bytes:
-        """Fetch bibliographic data (docdb reference); returns the raw XML."""
-        ref = parse_pubnum(pub).docdb()
-        return self._get(
-            f"published-data/publication/docdb/{ref}/biblio",
+        """Fetch bibliographic data (docdb reference); returns the raw XML.
+
+        A 404 for a US application publication is retried once with the
+        alternate DOCDB spelling (see :meth:`_get_publication`).
+        """
+        return self._get_publication(
+            parse_pubnum(pub),
             service="retrieval",
             kind="biblio",
+            path_template="published-data/publication/docdb/{ref}/biblio",
         )
 
     def legal(self, pub: str) -> bytes:
         """Fetch INPADOC legal data (docdb reference); returns the raw XML.
+
+        A 404 for a US application publication is retried once with the
+        alternate DOCDB spelling (see :meth:`_get_publication`).
 
         GB A publications frequently answer with an event-less body while the
         matching B publication carries the events (measured in v0.1: legal
@@ -545,11 +588,11 @@ class OpsClient:
         the A response untouched.
         """
         parsed = parse_pubnum(pub)
-        ref = parsed.docdb()
-        body = self._get(
-            f"legal/publication/docdb/{ref}",
+        body = self._get_publication(
+            parsed,
             service="inpadoc",
             kind="legal",
+            path_template="legal/publication/docdb/{ref}",
         )
         if parsed.country != "GB" or not parsed.kind.startswith("A"):
             return body
@@ -575,23 +618,29 @@ class OpsClient:
 
         A 404 is *not* swallowed here: OPS has no full text for many offices,
         and the caller needs to see that in order to fall back to another
-        source (Google Patents).
+        source (Google Patents). A 404 for a US application publication is
+        retried once with the alternate DOCDB spelling (see
+        :meth:`_get_publication`) before it raises.
 
         Raises:
             httpx.HTTPStatusError: If OPS has no claims for *pub*.
         """
-        ref = parse_pubnum(pub).docdb()
-        return self._get(
-            f"published-data/publication/docdb/{ref}/claims",
+        return self._get_publication(
+            parse_pubnum(pub),
             service="retrieval",
             kind="claims",
+            path_template="published-data/publication/docdb/{ref}/claims",
         )
 
     def family(self, pub: str) -> bytes:
-        """Fetch the simple patent family (docdb reference); returns the raw XML."""
-        ref = parse_pubnum(pub).docdb()
-        return self._get(
-            f"family/publication/docdb/{ref}",
+        """Fetch the simple patent family (docdb reference); returns the raw XML.
+
+        A 404 for a US application publication is retried once with the
+        alternate DOCDB spelling (see :meth:`_get_publication`).
+        """
+        return self._get_publication(
+            parse_pubnum(pub),
             service="other",
             kind="family",
+            path_template="family/publication/docdb/{ref}",
         )
