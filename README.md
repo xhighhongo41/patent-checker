@@ -740,6 +740,11 @@ have.
 
 ## Changelog
 
+- **v1.4.1** (2026-10): EPO OPS stores the same US pre-grant publication
+  under either the 10-digit or the 11-digit DOCDB spelling, decided per
+  document. When one spelling gets a 404, the publication endpoints (biblio,
+  claims, legal, family) now retry once with the other spelling, so a
+  retrieval no longer fails on the spelling alone.
 - **v1.4** (2026-09): the report's opening summary is now headed
   **"Summary without patent terms"** (in Japanese 「特許用語を使わない要約」).
   Before any search, the Skill keeps features that are common technique —
