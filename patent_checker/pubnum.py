@@ -17,18 +17,17 @@ padding a 10-digit docdb/epodoc number by inserting a ``0`` right after the
 docdb() and epodoc() are never padded, and non-US offices and US granted
 patents (whose serial is not year-prefixed) are passed through unchanged.
 
-For US A-kind (published-application) numbers, this padding is
-year-dependent and reversible: DOCDB stores the same year-prefixed number
-under both the 10-digit and the 11-digit spelling, decided per document
-(measured against EPO OPS, 2026-10). ``parse_pubnum`` normalizes an
-11-digit, year-prefixed, zero-padded US A-kind number back down to the
-10-digit docdb form whenever the year is before 2026, so a Google Patents
-spelling round-trips through ``parse_pubnum(...).docdb()`` back to the
-10-digit docdb spelling for those years; from 2026 onward docdb/epodoc and
-Google Patents agree on 11 digits, so no shrinking happens. The canonical
-spelling is only a best guess, though: ``PubNumber.alternate_docdb()``
-returns the other spelling, and the OPS retrieval layer retries it once on
-404 (ops/client.py).
+For US A-kind (published-application) numbers, this padding is reversible:
+DOCDB stores the same year-prefixed number under both the 10-digit and the
+11-digit spelling, decided per document (measured against EPO OPS,
+2026-10). ``parse_pubnum`` normalizes an 11-digit, year-prefixed,
+zero-padded US A-kind number back down to the 10-digit docdb form whenever
+the year is before 2026, so a Google Patents spelling round-trips through
+``parse_pubnum(...).docdb()`` back to the 10-digit docdb spelling for those
+years; 11-digit numbers whose year is 2026 or later keep their spelling,
+so no shrinking happens. The canonical spelling is only a best guess,
+though: ``PubNumber.alternate_docdb()`` returns the other spelling, and
+the OPS retrieval layer retries it once on 404 (ops/client.py).
 
 The number part is not always digits. OPS reports publication numbers whose
 number part carries letters, and since v1.2 they parse and round-trip like
@@ -141,10 +140,8 @@ class PubNumber:
         the year to produce the 11-digit Google Patents spelling. All other
         cases (11-digit numbers, US granted patents, non-US offices, and
         10-digit numbers that are not year-prefixed) are passed through
-        as-is. Publications from 2026 onward already arrive as 11 digits
-        (see ``parse_pubnum``), so they never reach this padding step. A
-        number part carrying letters is never padded either: the year/serial
-        reading only applies to a digit-only number.
+        as-is. A number part carrying letters is never padded either: the
+        year/serial reading only applies to a digit-only number.
         """
         if (
             self.country == "US"

@@ -683,14 +683,16 @@ and never handles your credentials.
 
 ## Notes
 
-- **US publication numbers changed length in 2026.** EPO's DOCDB
-  representation of US pre-grant publications is 10 digits up to 2025
-  (`US2007016547A1`) and 11 digits from 2026 (`US20260024003A1`). Google
-  Patents spells all years with 11 digits. The tools normalize both spellings,
-  and also accept numbers whose number part carries letters, as OPS spells
-  some Japanese, Indian, Taiwanese, Hungarian and Brazilian publications
-  (`JP.H0218652.A` or `JPH0218652A`);
-  when you type a number by hand, either form is accepted.
+- **US publication numbers have two DOCDB spellings.** EPO's DOCDB data
+  stores the same US pre-grant publication under a 10-digit
+  (`US2007016547A1`) or an 11-digit spelling (`US20260024003A1`), decided
+  per document — both spellings occur in the same years (measured 2026-10).
+  Google Patents spells all years with 11 digits. The tools normalize both
+  spellings and, when OPS answers 404 for one spelling, retry once with the
+  other. They also accept numbers whose number part carries letters, as OPS
+  spells some Japanese, Indian, Taiwanese, Hungarian and Brazilian
+  publications (`JP.H0218652.A` or `JPH0218652A`); when you type a number
+  by hand, either form is accepted.
 - A document whose legal status comes back with no events at all is
   reported as such (`events: []` with a note), which is not the same as
   "not found".

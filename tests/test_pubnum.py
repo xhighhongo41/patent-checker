@@ -182,9 +182,10 @@ def test_google_does_not_pad_non_year_looking_ten_digit_number() -> None:
 def test_docdb_roundtrip_shrinks_pre_2026_google_style_number() -> None:
     """Parsing a pre-2026 Google-style 11-digit number shrinks it back to 10 digits.
 
-    DOCDB spells US A-kind publications with 10 digits through 2025, so
-    parse_pubnum removes the "0" Google Patents inserts after the year,
-    restoring the 10-digit docdb form.
+    DOCDB decides the 10/11-digit spelling of a US A-kind publication per
+    document, so the shrink is a year-based approximation: for years
+    before 2026, parse_pubnum removes the "0" Google Patents inserts after
+    the year, restoring the 10-digit docdb form.
     """
     result = parse_pubnum("US20240111636A1")
     assert result.docdb() == "US.2024111636.A1"
