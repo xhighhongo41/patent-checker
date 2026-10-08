@@ -304,9 +304,9 @@ summarizes the server's request log from that moment on; cached results do
 not appear in it) in the exploration artifacts.
 `normalize_pubnum(text)` returns every spelling of a publication number
 when you need to reconcile identifiers across sources (US published
-applications are spelled with 10 digits through 2025 and 11 digits from
-2026 on the OPS side; Google Patents always uses 11 — the tool reconciles
-both, so compare the `docdb` spelling).
+applications exist in a 10-digit and an 11-digit DOCDB spelling, decided
+per document; Google Patents always uses 11 — the tool reconciles both, so
+compare the `docdb` spelling).
 
 When the exploration is over and the developer wants its traces gone,
 `patent-checker clean` (local CLI; deliberately not an MCP tool — the

@@ -223,8 +223,8 @@ which run added it. The checker only warns when the file is missing.
 ## Common mistakes
 
 - Re-typing a publication number instead of copying it (US published
-  applications are spelled with 10 digits through 2025 and 11 from 2026 on
-  the DOCDB side).
+  applications exist in a 10-digit and an 11-digit DOCDB spelling, decided
+  per document — copy the spelling from the source you are reading).
 - A `watch` entry without a kind code: `EP.9999999` names whatever kind is
   current, which changes when the patent is granted.
 - Watching the application (`CN.999999999.A`) after the patent was granted:

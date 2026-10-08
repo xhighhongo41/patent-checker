@@ -365,6 +365,126 @@ def test_gb_b_publication_legal_is_never_retried() -> None:
     assert len(recorder.api_requests) == 1
 
 
+# --- 404 alternate-spelling retry (v1.4.1) -----------------------------------
+#
+# DOCDB decides the 10/11-digit spelling of a year-prefixed US number per
+# document, so the canonical spelling can 404 while the other spelling
+# answers 200. Every publication endpoint retries that other spelling
+# exactly once on a 404; only a second 404 (or any other error status)
+# reaches the caller. GB numbers are unaffected: they have no alternate
+# spelling, and the GB A -> B retry above keeps working as before.
+
+
+def _spelling_responder(ok_ref: str, body: bytes) -> Callable[[httpx.Request], httpx.Response]:
+    """Answer 200 with *body* when *ok_ref* is a path segment, 404 otherwise."""
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if ok_ref in request.url.path.split("/"):
+            return httpx.Response(200, content=body)
+        return httpx.Response(404, content=b"<fault/>")
+
+    return responder
+
+
+@pytest.mark.parametrize(
+    "fetch", [OpsClient.biblio, OpsClient.claims, OpsClient.legal, OpsClient.family]
+)
+def test_publication_retries_the_eleven_digit_spelling_on_404(
+    fetch: Callable[[OpsClient, str], bytes], ops_env: Path
+) -> None:
+    """A 404 for the canonical 10-digit spelling retries the 11-digit spelling."""
+    body = b"<ok/>"
+    client, recorder = _make_client(_spelling_responder("US.20240111636.A1", body))
+    with client:
+        result = fetch(client, "US2024111636A1")
+
+    assert result == body
+    paths = [req.url.path for req in recorder.api_requests]
+    assert len(paths) == 2
+    assert "US.2024111636.A1" in paths[0].split("/")
+    assert "US.20240111636.A1" in paths[1].split("/")
+    # The retry is real upstream usage, so both requests are logged.
+    assert [record["kind"] for record in _header_records(ops_env)] == [
+        "token",
+        fetch.__name__,
+        fetch.__name__,
+    ]
+
+
+@pytest.mark.parametrize(
+    "fetch", [OpsClient.biblio, OpsClient.claims, OpsClient.legal, OpsClient.family]
+)
+def test_publication_retries_the_ten_digit_spelling_on_404(
+    fetch: Callable[[OpsClient, str], bytes],
+) -> None:
+    """A 404 for the canonical 11-digit spelling retries the 10-digit spelling.
+
+    ``US20240111636B2`` keeps its 11 digits: the parse-time shrink applies
+    to A kinds only.
+    """
+    body = b"<ok/>"
+    client, recorder = _make_client(_spelling_responder("US.2024111636.B2", body))
+    with client:
+        result = fetch(client, "US20240111636B2")
+
+    assert result == body
+    paths = [req.url.path for req in recorder.api_requests]
+    assert len(paths) == 2
+    assert "US.20240111636.B2" in paths[0].split("/")
+    assert "US.2024111636.B2" in paths[1].split("/")
+
+
+@pytest.mark.parametrize(
+    "fetch", [OpsClient.biblio, OpsClient.claims, OpsClient.legal, OpsClient.family]
+)
+def test_publication_raises_when_both_spellings_are_missing(
+    fetch: Callable[[OpsClient, str], bytes],
+) -> None:
+    """A second 404 reaches the caller; the retry is exactly one."""
+    client, recorder = _make_client(lambda request: httpx.Response(404, content=b"<fault/>"))
+    with client, pytest.raises(httpx.HTTPStatusError):
+        fetch(client, "US2024111636A1")
+
+    assert len(recorder.api_requests) == 2
+
+
+# Each case fails a different condition of the alternate-spelling rule, so
+# the 404 must reach the caller after exactly one request.
+NO_ALTERNATE_PUBS = [
+    "EP4645156A1",  # non-US office
+    "US11468338B2",  # not year-prefixed
+    "US.2020DE1234.A1",  # letters in the number
+]
+
+
+@pytest.mark.parametrize("pub", NO_ALTERNATE_PUBS)
+def test_publication_without_an_alternate_spelling_is_never_retried(pub: str) -> None:
+    """A 404 for a number without an alternate spelling is not retried."""
+    client, recorder = _make_client(lambda request: httpx.Response(404, content=b"<fault/>"))
+    with client, pytest.raises(httpx.HTTPStatusError):
+        client.biblio(pub)
+
+    assert len(recorder.api_requests) == 1
+
+
+def test_publication_error_other_than_404_is_not_retried() -> None:
+    """Only a 404 triggers the alternate-spelling retry."""
+    client, recorder = _make_client(lambda request: httpx.Response(500, content=b"<fault/>"))
+    with client, pytest.raises(httpx.HTTPStatusError):
+        client.biblio("US2024111636A1")
+
+    assert len(recorder.api_requests) == 1
+
+
+def test_gb_legal_404_raises_without_a_retry() -> None:
+    """GB numbers have no alternate spelling, so a 404 raises after one request."""
+    client, recorder = _make_client(lambda request: httpx.Response(404, content=b"<fault/>"))
+    with client, pytest.raises(httpx.HTTPStatusError):
+        client.legal("GB2553053A")
+
+    assert len(recorder.api_requests) == 1
+
+
 # --- throttling -------------------------------------------------------------
 
 

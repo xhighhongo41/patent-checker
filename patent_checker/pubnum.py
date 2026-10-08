@@ -17,15 +17,17 @@ padding a 10-digit docdb/epodoc number by inserting a ``0`` right after the
 docdb() and epodoc() are never padded, and non-US offices and US granted
 patents (whose serial is not year-prefixed) are passed through unchanged.
 
-For US A-kind (published-application) numbers, this padding is
-year-dependent and reversible: DOCDB spells them with 10 digits through
-publication year 2025 and with 11 digits from 2026 onward (verified against
-EPO OPS, 2026-09). ``parse_pubnum`` normalizes an 11-digit, year-prefixed,
+For US A-kind (published-application) numbers, this padding is reversible:
+DOCDB stores the same year-prefixed number under both the 10-digit and the
+11-digit spelling, decided per document (measured against EPO OPS,
+2026-10). ``parse_pubnum`` normalizes an 11-digit, year-prefixed,
 zero-padded US A-kind number back down to the 10-digit docdb form whenever
 the year is before 2026, so a Google Patents spelling round-trips through
-``parse_pubnum(...).docdb()`` back to the original docdb spelling for those
-years. From 2026 onward, docdb/epodoc and Google Patents already agree on
-11 digits, so no shrinking happens.
+``parse_pubnum(...).docdb()`` back to the 10-digit docdb spelling for those
+years; 11-digit numbers whose year is 2026 or later keep their spelling,
+so no shrinking happens. The canonical spelling is only a best guess,
+though: ``PubNumber.alternate_docdb()`` returns the other spelling, and
+the OPS retrieval layer retries it once on 404 (ops/client.py).
 
 The number part is not always digits. OPS reports publication numbers whose
 number part carries letters, and since v1.2 they parse and round-trip like
@@ -42,7 +44,7 @@ case (implementation plan section 4.2).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # Longest number part accepted in a publication number, counted in
 # characters (letters included, see the module docstring). Real numbers use
@@ -91,8 +93,11 @@ _PUBNUM_RE = re.compile(
     rf"(?:[.\- ]?(?P<kind>[A-Z]\d?))?$"
 )
 
-# DOCDB spells US A-kind publications with 10 digits through 2025 and 11
-# digits from 2026 (verified against EPO OPS, 2026-09).
+# US A-kind publications are stored in DOCDB under both the 10-digit and
+# the 11-digit spelling of the same year, decided per document (measured
+# against EPO OPS, 2026-10). This constant only picks the canonical
+# spelling candidate; the OPS retrieval layer retries the other spelling on
+# 404.
 US_APPLICATION_ELEVEN_DIGITS_FROM_YEAR: int = 2026
 
 
@@ -127,15 +132,16 @@ class PubNumber:
         US published applications are spelled with an 11-digit number on
         Google Patents (4-digit year + 7-digit serial), while docdb/epodoc
         may carry the same publication as a 10-digit number (4-digit year +
-        6-digit serial). When that 10-digit, year-prefixed shape is
-        detected, a ``0`` is inserted right after the year to produce the
-        11-digit Google Patents spelling. All other cases (11-digit numbers,
-        US granted patents, non-US offices, and 10-digit numbers that are
-        not year-prefixed) are passed through as-is. Publications from 2026
-        onward already arrive as 11 digits (see ``parse_pubnum``), so they
-        never reach this padding step. A number part carrying letters is
-        never padded either: the year/serial reading only applies to a
-        digit-only number.
+        6-digit serial). Which of the two spellings a DOCDB document uses
+        is decided per document, so this 10-digit reading is only a best
+        guess: :meth:`alternate_docdb` returns the other spelling, and the
+        OPS retrieval layer retries it on 404. When that 10-digit,
+        year-prefixed shape is detected, a ``0`` is inserted right after
+        the year to produce the 11-digit Google Patents spelling. All other
+        cases (11-digit numbers, US granted patents, non-US offices, and
+        10-digit numbers that are not year-prefixed) are passed through
+        as-is. A number part carrying letters is never padded either: the
+        year/serial reading only applies to a digit-only number.
         """
         if (
             self.country == "US"
@@ -146,6 +152,35 @@ class PubNumber:
             padded_number = f"{self.number[:4]}0{self.number[4:]}"
             return f"{self.country}{padded_number}{self.kind}"
         return self.epodoc()
+
+    def alternate_docdb(self) -> str | None:
+        """Return the other DOCDB spelling of a year-prefixed US number.
+
+        DOCDB stores the same year-prefixed US number under both the
+        10-digit and the 11-digit spelling, decided per document, so a
+        retrieval that gets a 404 for one spelling retries the other
+        (ops/client.py). This method returns that other spelling: the
+        mirror of :meth:`google`'s padding rule, applied to a digit-only
+        year-prefixed US number of exactly 10 or 11 digits. The year and
+        the kind are not checked, because the result is only used after a
+        404.
+
+        Returns:
+            The alternate DOCDB spelling, or ``None`` when the number has
+            no 10/11-digit alternate: a non-US office, a number part
+            carrying letters, a number not prefixed by ``"19"``/``"20"``,
+            an 11-digit number whose 5th digit is not ``"0"``, or any
+            length other than 10 or 11.
+        """
+        if self.country != "US" or not self.number.isdigit() or self.number[:2] not in ("19", "20"):
+            return None
+        if len(self.number) == 10:
+            alternate_number = f"{self.number[:4]}0{self.number[4:]}"
+        elif len(self.number) == 11 and self.number[4] == "0":
+            alternate_number = f"{self.number[:4]}{self.number[5:]}"
+        else:
+            return None
+        return replace(self, number=alternate_number).docdb()
 
 
 def parse_pubnum(text: str) -> PubNumber:

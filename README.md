@@ -683,14 +683,16 @@ and never handles your credentials.
 
 ## Notes
 
-- **US publication numbers changed length in 2026.** EPO's DOCDB
-  representation of US pre-grant publications is 10 digits up to 2025
-  (`US2007016547A1`) and 11 digits from 2026 (`US20260024003A1`). Google
-  Patents spells all years with 11 digits. The tools normalize both spellings,
-  and also accept numbers whose number part carries letters, as OPS spells
-  some Japanese, Indian, Taiwanese, Hungarian and Brazilian publications
-  (`JP.H0218652.A` or `JPH0218652A`);
-  when you type a number by hand, either form is accepted.
+- **US publication numbers have two DOCDB spellings.** EPO's DOCDB data
+  stores the same US pre-grant publication under a 10-digit
+  (`US2007016547A1`) or an 11-digit spelling (`US20260024003A1`), decided
+  per document — both spellings occur in the same years (measured 2026-10).
+  Google Patents spells all years with 11 digits. The tools normalize both
+  spellings and, when OPS answers 404 for one spelling, retry once with the
+  other. They also accept numbers whose number part carries letters, as OPS
+  spells some Japanese, Indian, Taiwanese, Hungarian and Brazilian
+  publications (`JP.H0218652.A` or `JPH0218652A`); when you type a number
+  by hand, either form is accepted.
 - A document whose legal status comes back with no events at all is
   reported as such (`events: []` with a note), which is not the same as
   "not found".
@@ -738,6 +740,11 @@ have.
 
 ## Changelog
 
+- **v1.4.1** (2026-10): EPO OPS stores the same US pre-grant publication
+  under either the 10-digit or the 11-digit DOCDB spelling, decided per
+  document. When one spelling gets a 404, the publication endpoints (biblio,
+  claims, legal, family) now retry once with the other spelling, so a
+  retrieval no longer fails on the spelling alone.
 - **v1.4** (2026-09): the report's opening summary is now headed
   **"Summary without patent terms"** (in Japanese 「特許用語を使わない要約」).
   Before any search, the Skill keeps features that are common technique —
